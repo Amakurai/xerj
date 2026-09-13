@@ -2473,10 +2473,25 @@ mod ampm_twelve_hour_tests {
     fn twelve_hour_clock_converts_to_24h_like_elasticsearch() {
         // java.time `h` (clock-hour-of-am-pm) with the `a` marker:
         // AM 12 -> 00, AM 1-11 unchanged, PM 12 -> 12, PM 1-11 -> +12.
-        assert_eq!(resolve("12:30 AM").as_deref(), Some("1970-01-01T00:30:00.000Z"));
-        assert_eq!(resolve("01:30 AM").as_deref(), Some("1970-01-01T01:30:00.000Z"));
-        assert_eq!(resolve("11:30 AM").as_deref(), Some("1970-01-01T11:30:00.000Z"));
-        assert_eq!(resolve("12:30 PM").as_deref(), Some("1970-01-01T12:30:00.000Z"));
-        assert_eq!(resolve("01:30 PM").as_deref(), Some("1970-01-01T13:30:00.000Z"));
+        assert_eq!(
+            resolve("12:30 AM").as_deref(),
+            Some("1970-01-01T00:30:00.000Z")
+        );
+        assert_eq!(
+            resolve("01:30 AM").as_deref(),
+            Some("1970-01-01T01:30:00.000Z")
+        );
+        assert_eq!(
+            resolve("11:30 AM").as_deref(),
+            Some("1970-01-01T11:30:00.000Z")
+        );
+        assert_eq!(
+            resolve("12:30 PM").as_deref(),
+            Some("1970-01-01T12:30:00.000Z")
+        );
+        assert_eq!(
+            resolve("01:30 PM").as_deref(),
+            Some("1970-01-01T13:30:00.000Z")
+        );
     }
 }
