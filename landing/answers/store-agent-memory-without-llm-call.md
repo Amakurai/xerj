@@ -2,7 +2,7 @@
 ---
 title: "Stop agent memory filling with duplicate notes"
 canonical: "https://xerj.org/answers/store-agent-memory-without-llm-call"
-updated: "2026-08-23"
+updated: "2026-09-13"
 source: "content/answers/store-agent-memory-without-llm-call.md"
 ---
 

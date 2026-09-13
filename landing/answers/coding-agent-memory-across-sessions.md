@@ -2,7 +2,7 @@
 ---
 title: "Store user preferences an agent can recall later"
 canonical: "https://xerj.org/answers/coding-agent-memory-across-sessions"
-updated: "2026-08-23"
+updated: "2026-09-13"
 source: "content/answers/coding-agent-memory-across-sessions.md"
 ---
 
