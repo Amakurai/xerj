@@ -268,8 +268,8 @@
   </table>
   <p>Durability comes from the storage layer, not from a memory subsystem. Each memory is an ordinary document, and our capture found the backing directory <code class="inline">.xerj-memory-agentmem</code> at the top level of the node data directory.</p>
   <h2>What recall actually runs</h2>
-  <p>Recall picks one mode in strict order and never blends them. A supplied <code class="inline">vector</code> runs pure kNN, <code class="inline">semantic: true</code> embeds the query on the server, and a plain <code class="inline">query</code> runs <code class="inline">{"match":{"text":q}}</code>, which is BM25.</p>
-  <p>There is no fusion in <code class="inline">_recall</code>. To fuse BM25 and kNN, use the <code class="inline">hybrid</code> query type on an ordinary index instead.</p>
+  <p>Recall picks one mode in strict order and does not blend them unless you ask. A supplied <code class="inline">vector</code> runs pure kNN, <code class="inline">semantic: true</code> embeds the query on the server, and a plain <code class="inline">query</code> runs <code class="inline">{"match":{"text":q}}</code>, which is BM25.</p>
+  <p>Fusion is opt-in. <code class="inline">hybrid: true</code> runs the BM25 leg and the server-side semantic leg over the same <code class="inline">query</code> and fuses the two rankings by reciprocal rank (<code class="inline">fusion: "linear"</code> sums min-max-normalised scores instead). A <code class="inline">filter</code> narrows both legs, and <code class="inline">recency_weight</code> re-ranks the fused pool exactly as it does for a single mode. Sending <code class="inline">vector</code> or <code class="inline">semantic: true</code> beside <code class="inline">hybrid: true</code> is a 400, so a request never silently falls back to one leg.</p>
   <p>The two modes disagree on our fixture, which is the point of naming them. The plain query put the deploy memory first at 1.4581499. The same question with <code class="inline">semantic: true</code> put the latency memory first at 0.627885, because the default embedder is lexical feature hashing rather than a neural model.</p>
   <h2>A misspelled key fails loudly</h2>
   <p>Recall uses strict field parsing, so an unknown key is a hard 400 rather than a silent match-all at score 1.0. The strictness matters for an agent that trusts whatever recall hands back.</p>
@@ -303,7 +303,7 @@
   <h3>How do I delete one memory?</h3>
   <p>Send <code class="inline">DELETE /_memory/{namespace}/{id}</code>. Our capture got <code class="inline">{"forgotten": true}</code> and the next recall returned only the remaining memory.</p>
   <h3>Does recall use vectors?</h3>
-  <p>Only if you ask. Plain <code class="inline">query</code> runs BM25, <code class="inline">semantic: true</code> embeds server-side, and a supplied <code class="inline">vector</code> runs pure kNN. There is no fusion in <code class="inline">_recall</code>.</p>
+  <p>Only if you ask. Plain <code class="inline">query</code> runs BM25, <code class="inline">semantic: true</code> embeds server-side, and a supplied <code class="inline">vector</code> runs pure kNN. <code class="inline">hybrid: true</code> runs the BM25 and the server-side semantic leg over the same <code class="inline">query</code> and fuses them by reciprocal rank inside <code class="inline">_recall</code>; it is off unless you set it.</p>
   <h2>Related</h2>
   <ul>
     <li><a href="/answers/agent-memory-without-postgres-qdrant">What's a simple way to give an agent long-term memory on my laptop without Qdrant?</a></li>

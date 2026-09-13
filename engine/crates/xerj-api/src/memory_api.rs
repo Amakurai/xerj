@@ -9,7 +9,7 @@
 //! Endpoints (mounted on the ES-compat router):
 //! ```text
 //! POST   /_memory/{namespace}            store   — {text, metadata?, vector?, id?, dedup?, dedup_threshold?} → {id, created} | {id, created:false, deduplicated:true}
-//! POST   /_memory/{namespace}/_recall    recall  — {query?, vector?, semantic?, k?, filter?, recency_weight?} → {hits:[…]}
+//! POST   /_memory/{namespace}/_recall    recall  — {query?, vector?, semantic?, hybrid?, fusion?, k?, filter?, recency_weight?} → {hits:[…]}
 //! GET    /_memory/{namespace}?from&size  list    — {count, entries:[…], next} (paged, recent first)
 //! DELETE /_memory/{namespace}/{id}       forget  — delete one entry
 //! DELETE /_memory/{namespace}            drop    — drop the whole namespace
@@ -38,13 +38,18 @@
 //! access control depends on the deferred RBAC enforcement (see
 //! `xerj_engine::rbac`).
 //!
-//! Recall has three modes, tried in order: an explicit query `vector` (kNN over
-//! a caller-supplied embedding) → `semantic: true` (the server embeds `query`
-//! with the same embedder used at store time and recalls by vector similarity)
-//! → plain `query` text (BM25 relevance). All three are offline-testable with
-//! NO external embedding service — memories are stored in a `semantic_text`
-//! field, so the built-in deterministic embedder vectorises both the stored
-//! text and the recall query. Namespaces isolate — a recall in namespace A
+//! Recall has three single modes, tried in order: an explicit query `vector`
+//! (kNN over a caller-supplied embedding) → `semantic: true` (the server embeds
+//! `query` with the same embedder used at store time and recalls by vector
+//! similarity) → plain `query` text (BM25 relevance). `hybrid: true` (#918) is
+//! the opt-in fourth: the BM25 and the server-side semantic leg run over the
+//! same `query` and are fused by the engine's `hybrid` query type (reciprocal
+//! rank fusion by default, `fusion: "linear"` on request), so an agent gets
+//! fused recall without leaving `/_memory` for a raw `_search` on the backing
+//! index. All of them are offline-testable with NO external embedding service
+//! — memories are stored in a `semantic_text` field, so the built-in
+//! deterministic embedder vectorises both the stored text and the recall
+//! query. Namespaces isolate — a recall in namespace A
 //! never sees namespace B's entries because they live in physically distinct
 //! backing indices.
 
@@ -455,6 +460,20 @@ pub struct RecallBody {
     /// BM25 text-relevance recall. Ignored when an explicit `vector` is given.
     #[serde(default)]
     pub semantic: Option<bool>,
+    /// When `true`, run BM25 and server-side semantic recall over `query`
+    /// together and fuse the two rankings — the engine's `hybrid` query type
+    /// lifted into `_recall` (#918). Requires a non-empty `query`; a
+    /// caller-supplied `vector` or `semantic: true` beside it is a 400, so a
+    /// request never silently picks one leg. Default (`false`/absent) keeps
+    /// the single-mode behaviour bit-for-bit.
+    #[serde(default)]
+    pub hybrid: Option<bool>,
+    /// Fusion strategy for `hybrid: true`: `"rrf"` (default; reciprocal rank
+    /// fusion, k=60) or `"linear"` (min-max-normalised score sum). Anything
+    /// else — including `"learned"`, which the engine does not implement — is
+    /// a 400. Only meaningful with `hybrid: true`; a 400 otherwise.
+    #[serde(default)]
+    pub fusion: Option<String>,
     /// Number of memories to return. Defaults to 10.
     #[serde(default)]
     pub k: Option<usize>,
@@ -567,6 +586,49 @@ pub async fn recall(
             "`vector` must be a non-empty array of numbers",
         );
     }
+    // Hybrid recall (#918) fuses the two `query`-driven legs; it cannot take a
+    // caller-supplied `vector` (nothing lexical to fuse it with) and it already
+    // contains the semantic leg, so both combinations are refused rather than
+    // silently resolved to one mode.
+    let hybrid = body.hybrid == Some(true);
+    if hybrid && body.vector.is_some() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "hybrid recall fuses BM25 and server-side semantic recall over \
+             `query`; it cannot take a caller-supplied `vector`",
+        );
+    }
+    if hybrid && body.semantic == Some(true) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "`hybrid: true` already runs the semantic leg; drop `semantic`",
+        );
+    }
+    let fusion = match body.fusion.as_deref() {
+        None => "rrf",
+        Some(_) if !hybrid => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "`fusion` only applies with `hybrid: true`",
+            );
+        }
+        Some("rrf") => "rrf",
+        Some("linear") => "linear",
+        // Mirror the `hybrid` query type: learned fusion is not implemented,
+        // and substituting RRF would misrepresent the ranking asked for.
+        Some("learned") => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "hybrid fusion learned is not yet supported; use rrf or linear",
+            );
+        }
+        Some(other) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("unknown hybrid fusion strategy `{other}`; use rrf or linear"),
+            );
+        }
+    };
     let k = body.k.unwrap_or(DEFAULT_K).max(1);
     // Recency blending needs a wider candidate pool than the final k so the
     // re-rank can actually promote recent-but-slightly-less-relevant memories.
@@ -680,8 +742,37 @@ pub async fn recall(
                 search_body.knn = Some(knn);
             }
         }
+    } else if hybrid {
+        // (2) Hybrid recall (#918): BM25 and server-side semantic recall over
+        // the same `query`, run as the two legs of the engine's `hybrid` query
+        // and fused by rank (RRF, k=60) or by min-max-normalised score
+        // (`linear`). Each leg keeps the filter shape its single-mode
+        // counterpart uses: the BM25 leg wraps in `bool.must` + `bool.filter`,
+        // the semantic leg carries `filter` inside the `semantic` node —
+        // a `semantic` clause nested under a `bool` is not dispatched to the
+        // vector path (#395), whereas `hybrid.queries` are dispatched leg by
+        // leg (`dispatching_vector_fields`). Both legs fetch `fetch` (the
+        // recency/graph over-fetch width, not the caller's `k`), so the fused
+        // pool the re-rankers see is as deep as it is in single mode.
+        let q = body.query.as_deref().unwrap_or_default(); // validated non-empty above
+        let lexical = match &filter_opt {
+            Some(filter) => json!({
+                "bool": { "must": [ { "match": { "text": q } } ], "filter": [ filter ] }
+            }),
+            None => json!({ "match": { "text": q } }),
+        };
+        let mut semantic = json!({ "field": "text", "query": q, "k": fetch });
+        if let Some(filter) = filter_opt {
+            semantic["filter"] = filter;
+        }
+        search_body.query = Some(json!({
+            "hybrid": {
+                "queries": [ { "query": lexical }, { "query": { "semantic": semantic } } ],
+                "fusion": fusion
+            }
+        }));
     } else if body.semantic == Some(true) {
-        // (2) Server-side semantic recall: embed `query` with the same embedder
+        // (3) Server-side semantic recall: embed `query` with the same embedder
         // used at store time (via the `semantic` query over the `text`
         // semantic_text field) and recall by vector similarity. No client-side
         // embedding required.
@@ -704,7 +795,7 @@ pub async fn recall(
         }
         search_body.query = Some(json!({ "semantic": semantic }));
     } else {
-        // (3) Text recall (BM25). Empty/absent query → match_all (recent memories).
+        // (4) Text recall (BM25). Empty/absent query → match_all (recent memories).
         let inner = match body.query.as_deref() {
             Some(q) if !q.is_empty() => json!({ "match": { "text": q } }),
             _ => json!({ "match_all": {} }),
@@ -1547,6 +1638,184 @@ mod tests {
             hits.iter().all(|h| h["id"] == "i4"),
             "only the high-sev memory passes the filter"
         );
+    }
+
+    /// #918: `hybrid: true` runs the BM25 leg and the server-side semantic
+    /// leg over the same `query` and fuses them inside `_recall` — no raw
+    /// `_search` on the backing index. Memories are stored text-only (the
+    /// `semantic_text` field auto-embeds them), exactly as for `semantic`.
+    #[tokio::test]
+    async fn store_recall_hybrid_fuses_lexical_and_semantic() {
+        let state = test_state();
+        for (id, text) in [
+            (
+                "i1",
+                "host 1.2.3.4 brute forced ssh with hundreds of failed passwords",
+            ),
+            ("i2", "nightly database backup completed without errors"),
+            (
+                "i3",
+                "repeated ssh authentication failures from an unknown attacker",
+            ),
+        ] {
+            let (s, _) = store_mem(&state, "soc", json!({"text": text, "id": id})).await;
+            assert_eq!(s, StatusCode::CREATED);
+        }
+
+        let (s, body) = recall_mem(
+            &state,
+            "soc",
+            json!({"query": "ssh brute force attack", "hybrid": true, "k": 2}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        let hits = body["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2, "hybrid k=2 → exactly 2 hits");
+        let ids: Vec<&str> = hits.iter().map(|h| h["id"].as_str().unwrap()).collect();
+        assert!(
+            ids.contains(&"i1") && ids.contains(&"i3"),
+            "both ssh incidents must surface, got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"i2"),
+            "the backup note must not, got {ids:?}"
+        );
+        // Teeth: the scores are reciprocal-rank-fusion sums, not BM25 or
+        // cosine. With k=60 and two legs a document contributes at most
+        // 1/61 per leg, so no fused score can exceed 2/61 — a BM25 or
+        // cosine score for this query would be well above that.
+        for h in hits {
+            let score = h["score"].as_f64().unwrap();
+            assert!(
+                score > 0.0 && score <= 2.0 / 61.0 + 1e-6,
+                "hybrid recall must return RRF-fused scores, got {score}"
+            );
+        }
+        // The top memory is within the top-2 of BOTH legs, so its fused score
+        // is at least 1/61 + 1/62 — a single-leg document never exceeds 1/61.
+        let top = hits[0]["score"].as_f64().unwrap();
+        assert!(
+            top >= 1.0 / 61.0 + 1.0 / 62.0 - 1e-6,
+            "the top memory must be fused from both legs, got {top}"
+        );
+
+        // `fusion: "linear"` is the other supported combiner: each leg is
+        // min-max-normalised to [0, 1] and summed, so the top hit scores 2.0
+        // when both legs agree on it and 1.0 when they disagree — either way
+        // it is >= 1.0, which no RRF sum can reach.
+        let (s, body) = recall_mem(
+            &state,
+            "soc",
+            json!({"query": "ssh brute force attack", "hybrid": true, "fusion": "linear", "k": 2}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        let hits = body["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2);
+        let top = hits[0]["score"].as_f64().unwrap();
+        assert!(
+            (1.0 - 1e-6..=2.0 + 1e-6).contains(&top),
+            "linear fusion sums normalised leg scores, got {top}"
+        );
+
+        // A metadata filter narrows BOTH legs (it is applied per leg, in the
+        // shape each leg dispatches with).
+        store_mem(
+            &state,
+            "soc",
+            json!({"text":"ssh attack from host 9.9.9.9","id":"i4","metadata":{"sev":"high"}}),
+        )
+        .await;
+        let (s, body) = recall_mem(
+            &state,
+            "soc",
+            json!({"query":"ssh attack","hybrid":true,"k":10,"filter":{"term":{"metadata.sev":"high"}}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        let hits = body["hits"].as_array().unwrap();
+        assert!(
+            !hits.is_empty(),
+            "filtered hybrid recall returns the high-sev memory"
+        );
+        assert!(
+            hits.iter().all(|h| h["id"] == "i4"),
+            "only the high-sev memory passes the filter on both legs"
+        );
+
+        // Composes with the recency re-rank (over-fetch + blend + truncate).
+        let (s, body) = recall_mem(
+            &state,
+            "soc",
+            json!({"query":"ssh brute force attack","hybrid":true,"k":2,"recency_weight":0.5}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(body["hits"].as_array().unwrap().len(), 2);
+    }
+
+    /// #918: hybrid recall keeps the fail-loud contract — every ambiguous or
+    /// unsupported combination is a 400 with a specific reason, never a
+    /// silent fallback to one leg.
+    #[tokio::test]
+    async fn recall_hybrid_rejects_ambiguous_requests() {
+        let state = test_state();
+        store_mem(
+            &state,
+            "soc",
+            json!({"text": "ssh brute force", "id": "i1"}),
+        )
+        .await;
+
+        let cases: [(Value, &str); 6] = [
+            (json!({"hybrid": true}), "hybrid without a query"),
+            (
+                json!({"query": "", "hybrid": true}),
+                "hybrid with an empty query",
+            ),
+            (
+                json!({"vector": [1.0, 0.0, 0.0], "hybrid": true}),
+                "hybrid with a caller-supplied vector",
+            ),
+            (
+                json!({"query": "ssh", "semantic": true, "hybrid": true}),
+                "hybrid beside semantic",
+            ),
+            (
+                json!({"query": "ssh", "fusion": "rrf"}),
+                "fusion without hybrid",
+            ),
+            (
+                json!({"query": "ssh", "hybrid": true, "fusion": "learned"}),
+                "learned fusion",
+            ),
+        ];
+        for (body, what) in cases {
+            let (s, resp) = recall_mem(&state, "soc", body).await;
+            assert_eq!(
+                s,
+                StatusCode::BAD_REQUEST,
+                "{what} must be a 400, got {resp}"
+            );
+        }
+        let (s, resp) = recall_mem(
+            &state,
+            "soc",
+            json!({"query": "ssh", "hybrid": true, "fusion": "bogus"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(
+            resp.to_string()
+                .contains("unknown hybrid fusion strategy `bogus`"),
+            "{resp}"
+        );
+
+        // `hybrid: false` is the documented default — plain BM25, byte-identical.
+        let (s, off) = recall_mem(&state, "soc", json!({"query": "ssh", "hybrid": false})).await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, plain) = recall_mem(&state, "soc", json!({"query": "ssh"})).await;
+        assert_eq!(off, plain, "hybrid:false must not change the BM25 path");
     }
 
     async fn count_of(state: &AppState, ns: &str) -> u64 {

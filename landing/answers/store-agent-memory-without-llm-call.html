@@ -277,7 +277,7 @@
 </code></pre>
   <p>Read that number as written. The harness sampled a loopback-bound node rather than denying it a network. A connection that opens and closes inside one 50 ms gap escapes the sampler.</p>
   <h2>Which recall mode invokes an embedder</h2>
-  <p>Recall chooses exactly one mode, in a strict order, and never blends them. There is no fusion in <code class="inline">_recall</code>.</p>
+  <p>Recall chooses exactly one mode, in a strict order, unless you set <code class="inline">hybrid: true</code>. That mode runs the BM25 leg and the server-side semantic leg over the same <code class="inline">query</code> and fuses them by reciprocal rank. It is the only fusion in <code class="inline">_recall</code>, and it is off by default.</p>
   <table>
     <thead><tr><th>request field</th><th>what runs</th><th>embedder involved</th></tr></thead>
     <tbody>
