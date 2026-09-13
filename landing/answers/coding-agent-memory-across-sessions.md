@@ -2,7 +2,7 @@
 ---
 title: "Store user preferences an agent can recall later"
 canonical: "https://xerj.org/answers/coding-agent-memory-across-sessions"
-updated: "2026-08-23"
+updated: "2026-09-13"
 source: "content/answers/coding-agent-memory-across-sessions.md"
 ---
 
@@ -65,9 +65,9 @@ Durability comes from the storage layer, not from a memory subsystem. Each memor
 
 ## What recall actually runs
 
-Recall picks one mode in strict order and never blends them. A supplied `vector` runs pure kNN, `semantic: true` embeds the query on the server, and a plain `query` runs `{"match":{"text":q}}`, which is BM25.
+Recall picks one mode in strict order and does not blend them unless you ask. A supplied `vector` runs pure kNN, `semantic: true` embeds the query on the server, and a plain `query` runs `{"match":{"text":q}}`, which is BM25.
 
-There is no fusion in `_recall`. To fuse BM25 and kNN, use the `hybrid` query type on an ordinary index instead.
+Fusion is opt-in. `hybrid: true` runs the BM25 leg and the server-side semantic leg over the same `query` and fuses the two rankings by reciprocal rank (`fusion: "linear"` sums min-max-normalised scores instead). A `filter` narrows both legs, and `recency_weight` re-ranks the fused pool exactly as it does for a single mode. Sending `vector` or `semantic: true` beside `hybrid: true` is a 400, so a request never silently falls back to one leg.
 
 The two modes disagree on our fixture, which is the point of naming them. The plain query put the deploy memory first at 1.4581499. The same question with `semantic: true` put the latency memory first at 0.627885, because the default embedder is lexical feature hashing rather than a neural model.
 
@@ -133,7 +133,7 @@ Send `DELETE /_memory/{namespace}/{id}`. Our capture got `{"forgotten": true}` a
 
 ### Does recall use vectors?
 
-Only if you ask. Plain `query` runs BM25, `semantic: true` embeds server-side, and a supplied `vector` runs pure kNN. There is no fusion in `_recall`.
+Only if you ask. Plain `query` runs BM25, `semantic: true` embeds server-side, and a supplied `vector` runs pure kNN. `hybrid: true` runs the BM25 and the server-side semantic leg over the same `query` and fuses them by reciprocal rank inside `_recall`; it is off unless you set it.
 
 ## Related
 

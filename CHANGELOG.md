@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`hybrid: true` in `POST /_memory/{ns}/_recall` fuses BM25 and server-side
+  semantic recall inside the memory API**
+  ([#918](https://github.com/xerj-org/xerj/issues/918)). Recall used to pick
+  exactly one mode — `vector`, `semantic: true`, or plain `query` — so an agent
+  that wanted fused recall over a namespace had to bypass `/_memory` and issue
+  a raw `hybrid` `_search` against the backing index, losing the memory hit
+  shape, the `recency_weight` blend, the graph coupling and the namespace
+  authorization path. `hybrid: true` now runs the BM25 leg and the semantic
+  leg over the same `query` as the two legs of the engine's `hybrid` query
+  (reciprocal rank fusion, `fusion: "linear"` opt-in), each leg keeping the
+  filter shape it dispatches with and fetching the same over-fetch width the
+  re-rankers already use. Off by default; `vector` or `semantic: true` beside
+  it, `fusion` without it, and `fusion: "learned"` are 400s, so a request
+  never silently degrades to one leg. The MCP `xerj_memory_recall` tool
+  exposes the same two parameters. Raised by @Vinz2168 from a shared-memory
+  agent integration where neither single mode was enough.
+
 ## [1.0.0-rc.74] - 2026-09-08
 
 ### Added

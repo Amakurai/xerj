@@ -65,7 +65,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-08-21",
-  "dateModified": "2026-08-23",
+  "dateModified": "2026-09-13",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -227,7 +227,7 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I STOP AN AGENT MEMORY STORE FROM FILLING WITH NEAR-DUPLICATE NOTES?</div>
   <div class="kicker"><span>ANSWERS · AGENT MEMORY: MODEL DEPENDENCY</span></div>
   <h1>How do I stop an agent memory store from filling with near-duplicate notes?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-08-23</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-08-21 · UPDATED · 2026-09-13</div>
   <p><strong>TL;DR</strong> — Send <code class="inline">dedup: true</code> on the store call and XERJ returns the existing id with <code class="inline">"deduplicated": true</code> instead of writing a second document. The check compares against the memories the namespace already holds, at a default cosine threshold of 0.95. No model and no summarization runs on the write path.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
@@ -277,7 +277,7 @@
 </code></pre>
   <p>Read that number as written. The harness sampled a loopback-bound node rather than denying it a network. A connection that opens and closes inside one 50 ms gap escapes the sampler.</p>
   <h2>Which recall mode invokes an embedder</h2>
-  <p>Recall chooses exactly one mode, in a strict order, and never blends them. There is no fusion in <code class="inline">_recall</code>.</p>
+  <p>Recall chooses exactly one mode, in a strict order, unless you set <code class="inline">hybrid: true</code>. That mode runs the BM25 leg and the server-side semantic leg over the same <code class="inline">query</code> and fuses them by reciprocal rank. It is the only fusion in <code class="inline">_recall</code>, and it is off by default.</p>
   <table>
     <thead><tr><th>request field</th><th>what runs</th><th>embedder involved</th></tr></thead>
     <tbody>

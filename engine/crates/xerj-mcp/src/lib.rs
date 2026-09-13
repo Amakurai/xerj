@@ -517,7 +517,8 @@ pub fn tool_specs() -> Value {
             "description":
                 "Recall the most relevant memories from a namespace. Default is BM25 text \
                  recall; set `semantic:true` to embed the query server-side and recall by \
-                 meaning; supply `vector` for pure vector recall. Proxies \
+                 meaning; set `hybrid:true` to run both over the same `query` and fuse them \
+                 by reciprocal rank; supply `vector` for pure vector recall. Proxies \
                  POST /_memory/{namespace}/_recall.",
             "inputSchema": {
                 "type": "object",
@@ -525,6 +526,18 @@ pub fn tool_specs() -> Value {
                     "namespace": { "type": "string" },
                     "query": { "type": "string", "description": "Query text (BM25, or embedded when semantic:true)." },
                     "semantic": { "type": "boolean", "description": "Embed `query` server-side and recall by meaning." },
+                    "hybrid": {
+                        "type": "boolean",
+                        "description":
+                            "Run BM25 and server-side semantic recall over `query` and fuse the \
+                             two rankings (reciprocal rank fusion). Off by default; cannot be \
+                             combined with `vector` or `semantic`."
+                    },
+                    "fusion": {
+                        "type": "string",
+                        "enum": ["rrf", "linear"],
+                        "description": "Fusion for hybrid:true — `rrf` (default) or `linear`."
+                    },
                     "vector": {
                         "type": "array",
                         "items": { "type": "number" },
@@ -965,6 +978,8 @@ fn build_memory_recall(args: &Value) -> Result<BuiltRequest, String> {
         "query",
         "vector",
         "semantic",
+        "hybrid",
+        "fusion",
         "k",
         "filter",
         "recency_weight",
