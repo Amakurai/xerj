@@ -82,7 +82,7 @@ Read that number as written. The harness sampled a loopback-bound node rather th
 
 ## Which recall mode invokes an embedder
 
-Recall chooses exactly one mode, in a strict order, and never blends them. There is no fusion in `_recall`.
+Recall chooses exactly one mode, in a strict order, unless you set `hybrid: true`. That mode runs the BM25 leg and the server-side semantic leg over the same `query` and fuses them by reciprocal rank. It is the only fusion in `_recall`, and it is off by default.
 
 | request field | what runs | embedder involved |
 | --- | --- | --- |

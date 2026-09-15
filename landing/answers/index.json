@@ -44,7 +44,7 @@
       "canonical_url": "https://xerj.org/answers/store-agent-memory-without-llm-call",
       "markdown_url": "https://xerj.org/answers/store-agent-memory-without-llm-call.md",
       "cluster": "Agent memory: model dependency",
-      "updated": "2026-08-23",
+      "updated": "2026-09-13",
       "summary": "Send dedup true on the store call and XERJ returns the existing id instead of a second document. The write path runs no model and made no outbound call."
     },
     {
@@ -71,7 +71,7 @@
       "canonical_url": "https://xerj.org/answers/coding-agent-memory-across-sessions",
       "markdown_url": "https://xerj.org/answers/coding-agent-memory-across-sessions.md",
       "cluster": "Agent memory: setup",
-      "updated": "2026-08-23",
+      "updated": "2026-09-13",
       "summary": "XERJ keeps agent memory in a reserved index inside the data directory. We stored two memories, restarted the node, recalled both, then forgot one by id."
     },
     {

@@ -45,13 +45,17 @@ paths that serve the rest of the engine. That means:
 | Verb + path | What it does | Body / result |
 |---|---|---|
 | `POST /_memory/{ns}` | store a memory | `{text, vector?, metadata?, id?}` → `{id, namespace, created}` |
-| `POST /_memory/{ns}/_recall` | recall top-k | `{vector? \| query?, k?, filter?}` → `{hits:[{id,text,metadata,score}]}` |
+| `POST /_memory/{ns}/_recall` | recall top-k | `{vector? \| query?, semantic?, hybrid?, fusion?, k?, filter?, recency_weight?}` → `{hits:[{id,text,metadata,score}]}` |
 | `GET /_memory/{ns}` | list recent (bounded) | → `{count, entries:[…]}` |
 | `DELETE /_memory/{ns}/{id}` | forget one | → `{id, forgotten}` |
 | `DELETE /_memory/{ns}` | drop the namespace | → `{namespace, dropped}` |
 
-`_recall` picks the path from the body: a `vector` runs kNN; otherwise `query`
-runs BM25 over the text; an empty body returns recent memories (`match_all`).
+`_recall` picks the path from the body: a `vector` runs kNN; `semantic: true`
+embeds `query` on the server and runs kNN; otherwise `query` runs BM25 over the
+text. `hybrid: true` runs the BM25 and the server-side semantic leg over the same
+`query` and fuses them by reciprocal rank (`fusion: "linear"` for a normalised
+score sum) — the `hybrid` query type without leaving `/_memory`. It is off by
+default, and `vector` or `semantic: true` beside it is a 400.
 `filter` is a normal ES query clause applied as a `bool` filter, so it narrows
 without affecting the score. Recall of an unknown namespace returns `{"hits": []}` —
 that is how isolation stays clean.
