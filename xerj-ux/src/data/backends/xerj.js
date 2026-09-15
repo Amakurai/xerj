@@ -487,8 +487,11 @@ async function liveAiOverview(baseUrl, ctx, signal) {
   base.metrics.queries  = { value: total,        formatted: fmt(total),       delta: null, hint: 'live · xerj' };
   base.metrics.tokens   = { value: totalTokens,  formatted: fmt(totalTokens), delta: null, hint: 'live · xerj' };
   base.metrics.cost     = { value: totalCost,    formatted: '$' + totalCost.toFixed(0), delta: null, hint: 'live · xerj' };
+  // ESTIMATE, not a measured figure: assumes a 5.2× stack cost (ES+Pinecone+
+  // Splunk) applied to the live spend. Labeled as an estimate in the UI so it
+  // is never read as a measured saving.
   const costES = totalCost * 5.2;
-  base.metrics.savings  = { value: costES - totalCost, formatted: '$' + (costES - totalCost).toFixed(0), note: 'vs ES+Pinecone+Splunk' };
+  base.metrics.savings  = { value: costES - totalCost, formatted: '~$' + (costES - totalCost).toFixed(0), note: 'estimate · assumes 5.2× ES+Pinecone+Splunk stack' };
   base.metrics.latency  = { value: avgLatency, formatted: String(avgLatency), delta: null, hint: 'live · xerj' };
   base.metrics.cacheHit = { value: Math.round(cacheRate), formatted: String(Math.round(cacheRate)), delta: null, hint: 'live · xerj' };
   base.models  = (a.models?.buckets  || []).map((b) => ({ label: b.key.toUpperCase(), value: b.doc_count }));
