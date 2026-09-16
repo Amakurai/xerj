@@ -26,6 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exposes the same two parameters. Raised by @Vinz2168 from a shared-memory
   agent integration where neither single mode was enough.
 
+### Fixed
+
+- **`xc.py --json` emits JSON for empty search results.** Previously, a query
+  with no hits printed the human-readable no-match message before reaching the
+  JSON output branch, breaking callers that parse stdout. Empty results now
+  preserve the JSON response and still exit `1`; matching results exit `0`, and
+  a corpus with no live indices retains its distinct exit `3` diagnostic.
+
 ## [1.0.0-rc.74] - 2026-09-08
 
 ### Added
