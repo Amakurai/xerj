@@ -6,6 +6,7 @@ with file:line provenance, and it refuses to answer from a stale index rather
 than handing back code that no longer exists.
 """
 import argparse
+import http.client
 import json
 import os
 import re
@@ -233,7 +234,7 @@ def resolve_fields(prefix):
 
 
 def post(path, body, fatal=True):
-    """POST a search body. With fatal=False, an HTTP error is returned, not fatal.
+    """POST a search body; fatal=False returns HTTP/transport errors as data.
 
     The non-fatal path exists for the vector arm of hybrid retrieval: a corpus
     where no index supports `semantic` must degrade to BM25, not abort.
@@ -247,12 +248,25 @@ def post(path, body, fatal=True):
         with urllib.request.urlopen(req, timeout=60) as resp:
             return json.load(resp)
     except urllib.error.HTTPError as e:
-        msg = e.read()[:200].decode(errors="replace")
         if not fatal:
-            return {"_xc_error": f"{e.code}: {msg}"}
+            # The status already means fallback. Reading an optional error
+            # body can itself time out or fail on an interrupted response.
+            e.close()
+            return {"_xc_error": f"{e.code}: {e.reason}"}
+        try:
+            msg = e.read()[:200].decode(errors="replace")
+        except (OSError, http.client.HTTPException) as read_error:
+            msg = f"{e.reason}; error response could not be read: {read_error}"
+        finally:
+            e.close()
         die(f"search failed ({e.code}): {msg}")
-    except urllib.error.URLError as e:
-        die(f"cannot reach XERJ at {URL}: {e.reason}")
+    except (OSError, http.client.HTTPException) as e:
+        # URLError is an OSError; response reads can also raise socket or
+        # HTTP errors directly, without urllib wrapping them.
+        msg = f"cannot reach XERJ at {URL}: {getattr(e, 'reason', str(e))}"
+        if not fatal:
+            return {"_xc_error": msg}
+        die(msg)
 
 
 def bm25_query(query, lang, fields=None):
@@ -281,7 +295,7 @@ def search(prefix, query, k, lang, highlight=False):
     return post(f"{prefix}*/_search", body)
 
 
-def semantic_indices(prefix, field="body"):
+def semantic_indices(prefix, field="body", fatal=False):
     """Indices under `prefix*` whose `field` is mapped as semantic_text.
 
     A `semantic` query against an index where the field is plain `text` does not
@@ -292,13 +306,18 @@ def semantic_indices(prefix, field="body"):
     arm is aimed only at those indices.
 
     Returns (capable, total). An unreachable or unparseable mapping yields an
-    empty capable set, which degrades to BM25 rather than failing.
+    empty capable set, which degrades to BM25 rather than failing. Standalone
+    semantic retrieval uses fatal=True because it has no BM25 result to keep.
     """
     req = urllib.request.Request(f"{URL}/{prefix}*/_mapping")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             mapping = json.load(resp)
-    except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
+    except (OSError, http.client.HTTPException, ValueError) as e:
+        if isinstance(e, urllib.error.HTTPError):
+            e.close()
+        if fatal:
+            die(f"semantic mapping lookup failed at {URL}: {e}")
         return [], 0
     if not isinstance(mapping, dict):
         return [], 0
@@ -310,14 +329,14 @@ def semantic_indices(prefix, field="body"):
     return capable, len(mapping)
 
 
-def semantic_search(indices, query, k, lang, field="body"):
-    """The vector arm. Returns [] on any error — the caller degrades to BM25."""
+def semantic_search(indices, query, k, lang, field="body", fatal=False):
+    """Vector search; errors are optional only when BM25 fallback is allowed."""
     if not indices:
         return []
     q = {"semantic": {"field": field, "query": query}}
     if lang:
         q = {"bool": {"must": [q, {"match": {"language": lang}}]}}
-    res = post(f"{','.join(indices)}/_search", {"size": k, "query": q}, fatal=False)
+    res = post(f"{','.join(indices)}/_search", {"size": k, "query": q}, fatal=fatal)
     if "_xc_error" in res:
         return []
     return res.get("hits", {}).get("hits", [])
@@ -386,11 +405,11 @@ def hybrid_search(prefix, query, k, lang, depth=None):
                     "are not evidence of a match, so this is reported as a miss")
     capable, total = semantic_indices(prefix)
     if not capable:
-        return bm[:k], (f"BM25 only — no index under '{prefix}*' maps `body` as "
-                        f"semantic_text, so the vector arm cannot run")
+        return bm[:k], (f"BM25 only — no usable semantic_text mapping for `body` "
+                        f"could be discovered under '{prefix}*'")
     sem = semantic_search(capable, query, depth, lang)
     if not sem:
-        return bm[:k], (f"BM25 only — the vector arm returned nothing from the "
+        return bm[:k], (f"BM25 only — vector search failed or returned no hits from the "
                         f"{len(capable)} semantic_text index(es)")
     note = (f"hybrid RRF(k={RRF_K}) — BM25 over {total} index(es), vector over "
             f"{len(capable)} of {total}")
@@ -638,8 +657,8 @@ def main():
         hits, note = hybrid_search(state["prefix"], args.query, args.k, args.lang)
         res = {"hits": {"hits": hits}}
     elif args.mode == "semantic":
-        capable, total = semantic_indices(state["prefix"])
-        hits = semantic_search(capable, args.query, args.k, args.lang)
+        capable, total = semantic_indices(state["prefix"], fatal=True)
+        hits = semantic_search(capable, args.query, args.k, args.lang, fatal=True)
         res = {"hits": {"hits": hits}}
         note = (f"vector only over {len(capable)} of {total} index(es)" if capable
                 else f"no index under '{state['prefix']}*' maps `body` as semantic_text")
@@ -652,6 +671,14 @@ def main():
     if note and not args.json:
         print(f'@mode {note}' if args.meatl else f"[{note}]")
 
+    if args.json:
+        # Empty results must remain machine-readable without turning a miss
+        # into a successful retrieval (the exit-code contract is unchanged).
+        print(json.dumps(res, indent=1))
+        if not hits:
+            sys.exit(1)
+        return
+
     if not hits:
         # Say so explicitly. A silent miss makes the next agent re-run the same
         # dead query; this is the line that stops the loop.
@@ -660,10 +687,6 @@ def main():
                    f"The corpus is likely wrong for this task — fall back to "
                    f"normal work rather than forcing a bad match.")
         sys.exit(1)
-
-    if args.json:
-        print(json.dumps(res, indent=1))
-        return
 
     licences = {}
     man = os.path.join(ROOT, "corpora", args.corpus, "corpus.json")
