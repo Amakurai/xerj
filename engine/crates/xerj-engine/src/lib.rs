@@ -38,6 +38,7 @@ pub mod segment_cache_estimates;
 pub mod slow_query;
 pub mod sql;
 pub mod turbo_ingest;
+mod vector_column;
 pub mod wal_tap;
 mod write_publication;
 
