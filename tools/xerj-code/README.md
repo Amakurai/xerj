@@ -88,6 +88,16 @@ already knows, it is overhead. `SKILL.md` and
 [`docs/case-studies/reference-coding/`](../../docs/case-studies/reference-coding/)
 carry the measured numbers, including the cases where this loses.
 
+## Passage windows
+
+When no matching symbol is available, or with `--no-symbol`, `xc.py` selects a
+window of source around query terms, capped at 800 characters by default.
+It aligns the window to whole lines only when doing so preserves
+the selected window's term score; a partial line is preferable to dropping the
+match. Window offsets refer to the original source, including when Unicode
+lowercasing changes its length. `--full N` changes the character limit, and
+`--full 0` keeps the explicit file-head mode.
+
 ## Hybrid retrieval fallback
 
 With `--mode hybrid`, the optional vector arm falls back to the already
@@ -109,6 +119,8 @@ an empty `hits.hits` array exits `1`. A corpus with no live indices still exits
 
 ```sh
 tools/xerj-code/tests/test_xc_corpus.sh      # offline; local git fixtures over file://
+python3 tools/xerj-code/tests/test_passage_window.py  # offline passage extraction regressions
+
 python3 tools/xerj-code/tests/test_hybrid_fallback.py  # offline; simulated HTTP failures
 
 python3 tools/xerj-code/tests/test_state_ledger.py  # offline; mocked HTTP responses

@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Reference-code passage windows preserve their match score.** `xc.py`
+  could select relevant source and then discard its matches while aligning
+  the excerpt to line boundaries, including on long source lines. Line
+  alignment now keeps the selected term score or falls back to the bounded
+  original window. Window scoring also uses original-source offsets when
+  Unicode lowercasing expands characters. This affects the fallback when no
+  matching symbol is available and explicit `--no-symbol` output.
+
 - **`xc.py --mode hybrid` keeps BM25 results when the optional vector arm has
   a transport failure.** Connection failures, read timeouts, and interrupted
   HTTP responses during semantic mapping discovery or search now take the
