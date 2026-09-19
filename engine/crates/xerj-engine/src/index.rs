@@ -35993,11 +35993,11 @@ fn collect_filter_root_keys(filter: &QueryNode, out: &mut Vec<String>) -> bool {
             match minimum_should_match {
                 // Runs Painless over the whole document.
                 Some(MinShouldMatch::Script { .. }) => return false,
-                // `terms_set`: the required count is read from this field.
-                Some(MinShouldMatch::Field(name)) => {
-                    if !push_field_root_keys(name, out) {
-                        return false;
-                    }
+                // `terms_set`: the required count is read from this field, so
+                // its root keys join the projection (the guard pushes them);
+                // a pattern field cannot be projected and declines.
+                Some(MinShouldMatch::Field(name)) if !push_field_root_keys(name, out) => {
+                    return false;
                 }
                 _ => {}
             }
@@ -53452,13 +53452,13 @@ mod exact_scan_hydration_tests {
             rng.vector()
         };
         let mut doc = serde_json::json!({
-            "title": format!("doc {id} {}", if id % 4 == 0 { "cell" } else { "other" }),
+            "title": format!("doc {id} {}", if id.is_multiple_of(4) { "cell" } else { "other" }),
             "tag": format!("t{}", id % 5),
             "n": (id * 37) % 1000,
             "body": format!("body text {id}"),
             "body_vector": as_json(&pooled),
         });
-        if id % 3 == 0 {
+        if id.is_multiple_of(3) {
             let passages: Vec<Value> = (0..2 + id % 4).map(|_| as_json(&rng.vector())).collect();
             doc["body_vector_chunks"] = Value::Array(passages);
         }
