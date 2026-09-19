@@ -25170,6 +25170,7 @@ pub async fn nodes_stats(State(state): State<AppState>) -> impl IntoResponse {
                 "row_sequences": { "current_in_bytes": gauge.category_current[5], "peak_in_bytes": gauge.category_peak[5], "map_capacity": capacities[5] },
                 "decoded_stored": { "current_in_bytes": gauge.category_current[6], "peak_in_bytes": gauge.category_peak[6], "map_capacity": capacities[6] },
                 "fts_reader": { "current_in_bytes": gauge.category_current[7], "peak_in_bytes": gauge.category_peak[7], "map_capacity": capacities[7] },
+                "vector_column": { "current_in_bytes": gauge.category_current[8], "peak_in_bytes": gauge.category_peak[8], "map_capacity": capacities[8] },
             }
         })
     });
