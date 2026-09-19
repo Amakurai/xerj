@@ -26,6 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exposes the same two parameters. Raised by @Vinz2168 from a shared-memory
   agent integration where neither single mode was enough.
 
+### Fixed
+
+- **Reference-code passage windows preserve their match score.** `xc.py`
+  could select relevant source and then discard its matches while aligning
+  the excerpt to line boundaries, including on long source lines. Line
+  alignment now keeps the selected term score or falls back to the bounded
+  original window. Window scoring also uses original-source offsets when
+  Unicode lowercasing expands characters. This affects the fallback when no
+  matching symbol is available and explicit `--no-symbol` output.
+
 ## [1.0.0-rc.74] - 2026-09-08
 
 ### Added

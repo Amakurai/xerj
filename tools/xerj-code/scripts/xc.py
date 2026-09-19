@@ -470,7 +470,7 @@ def symbol_passage(body, src, query, width):
 
 
 def best_window(body, query, width):
-    """The `width`-char slice of `body` densest in query terms, snapped to lines.
+    """The densest sampled `width`-char slice, snapped to lines when safe.
 
     Taking the HEAD of the file instead is the single worst bug this tool had.
     Measured on a real valkey+memcached corpus: retrieval ranked the correct
@@ -492,23 +492,29 @@ def best_window(body, query, width):
     terms = [t.lower() for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", query)]
     if not terms:
         return body[:width], 0, total
-    low = body.lower()
     # Score every candidate start on a coarse stride: dense term hits win. The
     # stride keeps this linear-ish on multi-hundred-KB sources.
     stride = max(1, width // 8)
     best_start, best_score = 0, -1
     for start in range(0, total - width + stride, stride):
-        chunk = low[start:start + width]
+        # Slice before lowercasing: Unicode lowercase can expand a character,
+        # so offsets in a lowercased copy need not be offsets in the source.
+        chunk = body[start:start + width].lower()
         score = sum(chunk.count(t) for t in terms)
         if score > best_score:
             best_start, best_score = start, score
     if best_score <= 0:
         return body[:width], 0, total
-    # Snap to line boundaries so the excerpt is readable code, not a torn line.
+    # Prefer complete lines, but never discard query evidence just to align
+    # them. The final partial line may hold the match, or the previous newline
+    # may be far away in a source line longer than the requested width.
     nl = body.rfind("\n", 0, best_start)
     start = nl + 1 if nl != -1 else best_start
     end = body.rfind("\n", start, start + width)
     end = end if end > start else min(total, start + width)
+    snapped = body[start:end].lower()
+    if sum(snapped.count(t) for t in terms) < best_score:
+        return body[best_start:best_start + width], best_start, total
     return body[start:end], start, total
 
 

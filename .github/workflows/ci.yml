@@ -96,6 +96,9 @@ jobs:
       - name: Corpus manifest round-trip
         run: tools/xerj-code/tests/test_xc_corpus.sh
 
+      - name: Matching passage window regressions
+        run: python3 tools/xerj-code/tests/test_passage_window.py
+
       - name: Vetted hub manifests validate
         run: python3 tools/xerj-code/tests/validate_manifest.py --hub tools/xerj-code/hub/*.json
 
