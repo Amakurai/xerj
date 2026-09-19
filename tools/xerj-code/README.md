@@ -88,8 +88,16 @@ already knows, it is overhead. `SKILL.md` and
 [`docs/case-studies/reference-coding/`](../../docs/case-studies/reference-coding/)
 carry the measured numbers, including the cases where this loses.
 
+## Machine-readable retrieval
+
+Pass `--json` to return the search result as JSON, including when no passages
+match. Check both stdout and the exit status: matching results exit `0`, while
+an empty `hits.hits` array exits `1`. A corpus with no live indices still exits
+`3` with a diagnostic on stderr; it is not an empty search result.
+
 ## Tests
 
 ```sh
 tools/xerj-code/tests/test_xc_corpus.sh      # offline; local git fixtures over file://
+python3 tools/xerj-code/tests/test_state_ledger.py  # offline; mocked HTTP responses
 ```

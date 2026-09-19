@@ -646,6 +646,14 @@ def main():
     if note and not args.json:
         print(f'@mode {note}' if args.meatl else f"[{note}]")
 
+    if args.json:
+        # Empty results must remain machine-readable without turning a miss
+        # into a successful retrieval (the exit-code contract is unchanged).
+        print(json.dumps(res, indent=1))
+        if not hits:
+            sys.exit(1)
+        return
+
     if not hits:
         # Say so explicitly. A silent miss makes the next agent re-run the same
         # dead query; this is the line that stops the loop.
@@ -654,10 +662,6 @@ def main():
                    f"The corpus is likely wrong for this task — fall back to "
                    f"normal work rather than forcing a bad match.")
         sys.exit(1)
-
-    if args.json:
-        print(json.dumps(res, indent=1))
-        return
 
     licences = {}
     man = os.path.join(ROOT, "corpora", args.corpus, "corpus.json")
