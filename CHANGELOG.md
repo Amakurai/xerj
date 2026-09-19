@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`xc.py --mode hybrid` keeps BM25 results when the optional vector arm has
+  a transport failure.** Connection failures, read timeouts, and interrupted
+  HTTP responses during semantic mapping discovery or search now take the
+  existing BM25-only fallback instead of aborting and discarding valid hits.
+  Primary BM25 failures still exit with an error. Standalone `--mode semantic`
+  now reports mapping/search HTTP and transport failures as errors (exit `2`)
+  instead of treating failed requests as empty search results (exit `1`).
+
 - **`xc.py --json` emits JSON for empty search results.** Previously, a query
   with no hits printed the human-readable no-match message before reaching the
   JSON output branch, breaking callers that parse stdout. Empty results now
