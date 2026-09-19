@@ -26,6 +26,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exposes the same two parameters. Raised by @Vinz2168 from a shared-memory
   agent integration where neither single mode was enough.
 
+### Fixed
+
+- **A `hybrid` query returns the same page on every run and after a
+  restart** ([#940](https://github.com/xerj-org/xerj/issues/940)).
+  `fusion: "rrf"` and `fusion: "linear"` drained their accumulator from a
+  hash map into a score-only sort, so documents with an identical fused
+  score came back in hash-iteration order, which is seeded per process.
+  Under RRF such ties are structural (one leg's rank *r* and the other
+  leg's rank *r* score the same), and on BEIR SciFact 21 of 40 queries
+  changed their top 10 after a restart on unchanged data. Fused results now
+  use the order every score-ranked page uses since #270: score descending,
+  then arrival (`_seq_no`), then `_id`; a NaN fused score sorts last
+  instead of making the sort panic. Measured on the fixed build, lexical
+  embedder: the 300 SciFact test queries (1,509 tied adjacent pairs in
+  their top 100) returned identical result lists across a flush and two
+  restarts. The hybrid recipe's worked example was also re-run and its
+  numbers reconciled with the current engine.
+
 ## [1.0.0-rc.74] - 2026-09-08
 
 ### Added
