@@ -88,8 +88,19 @@ already knows, it is overhead. `SKILL.md` and
 [`docs/case-studies/reference-coding/`](../../docs/case-studies/reference-coding/)
 carry the measured numbers, including the cases where this loses.
 
+## Hybrid retrieval fallback
+
+With `--mode hybrid`, the optional vector arm falls back to the already
+retrieved BM25 passages if its mapping lookup or search has a transport error:
+connection failures, read timeouts, and interrupted HTTP responses. Prose and
+MEATL output label the fallback as `BM25 only`; `--json` keeps its existing hits
+format. A failed primary BM25 search still exits with an error. In standalone
+`--mode semantic`, mapping and search HTTP/transport failures exit `2`, rather
+than reporting no match; there are no BM25 results to fall back to.
+
 ## Tests
 
 ```sh
 tools/xerj-code/tests/test_xc_corpus.sh      # offline; local git fixtures over file://
+python3 tools/xerj-code/tests/test_hybrid_fallback.py  # offline; simulated HTTP failures
 ```

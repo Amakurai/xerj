@@ -99,6 +99,9 @@ jobs:
       - name: Vetted hub manifests validate
         run: python3 tools/xerj-code/tests/validate_manifest.py --hub tools/xerj-code/hub/*.json
 
+      - name: Hybrid retrieval transport fallback
+        run: python3 tools/xerj-code/tests/test_hybrid_fallback.py
+
   # #489: this script existed, worked, and had been failing locally for three
   # releases — the version footer, headline and narrative on landing/index.html
   # stayed pinned to rc.15 through rc.16 and rc.17 because nothing ran it. It is
