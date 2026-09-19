@@ -35984,11 +35984,7 @@ fn fuse_finish(mut entries: Vec<FusedEntry>) -> Vec<Hit> {
 /// OpenSearch / TREC convention) and is small enough that the top
 /// few ranks still dominate. Output is in THE FUSED ORDER (#940);
 /// `seq_no_of` resolves a document's arrival `seq_no` for the tie-break.
-fn fuse_rrf(
-    sub_results: &[(Vec<Hit>, f32)],
-    k: u32,
-    seq_no_of: &dyn Fn(&str) -> u64,
-) -> Vec<Hit> {
+fn fuse_rrf(sub_results: &[(Vec<Hit>, f32)], k: u32, seq_no_of: &dyn Fn(&str) -> u64) -> Vec<Hit> {
     let kf = k as f32;
     let mut entries: Vec<FusedEntry> = Vec::new();
     let mut slot_by_id: HashMap<String, usize> = HashMap::new();

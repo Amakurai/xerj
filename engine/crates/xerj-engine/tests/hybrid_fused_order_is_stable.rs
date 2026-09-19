@@ -101,7 +101,11 @@ async fn symmetric_corpus(idx: &Arc<Index>) -> HashMap<String, usize> {
             .unwrap();
         arrival.insert(id, pos);
     }
-    assert_eq!(arrival.len(), n, "the permutation must visit every document");
+    assert_eq!(
+        arrival.len(),
+        n,
+        "the permutation must visit every document"
+    );
     arrival
 }
 
@@ -204,7 +208,10 @@ async fn assert_fused_pages(label: &str, idx: &Arc<Index>, arrival: &HashMap<Str
             walked.extend(page(idx, from, size, &rrf()).await);
             from += size;
         }
-        assert_eq!(walked, full, "{label}: paging by {size} reorders the corpus");
+        assert_eq!(
+            walked, full,
+            "{label}: paging by {size} reorders the corpus"
+        );
     }
 
     // ── Linear ───────────────────────────────────────────────────────────
