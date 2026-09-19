@@ -36,6 +36,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **`llms.txt` proposals, revised and fact-checked**
+  (`docs/research/llms-txt-2026-09/proposals/`). A proposed `llms.txt`, an
+  `llms-install.md` and ten paste-ready install prompts, following the study's
+  twelve rules: three complete entry paths (shell, MCP-only, HTTP-only), the
+  lexical-by-default correction first, per-client MCP registration with the
+  key, a verify line after every step, and a feedback ask that is optional
+  and needs no git. Every quote is re-fetched (259 claims, 258 confirmed, the
+  one failure removed) and the XERJ commands the proposals print were run on
+  Linux against v1.0.0-rc.74, except the ones the record's own "Not run" list
+  names — the `curl | sh` installer, macOS and Windows, `--embed-mode neural`,
+  `claude mcp add --scope local` and the per-client registration lines, which
+  are quoted from each client's own documentation with a fact-check id. Two product findings came out of it:
+  `xerj feedback --open-pr` branches, commits and pushes in whatever
+  repository it is run from, and `xerj init` writes an MCP entry without
+  `XERJ_AUTH`, so against a default node every tool call returns 401. The
+  live `landing/llms.txt` is unchanged; the report's ship checklist says what
+  has to exist first.
+
 - **ROADMAP: the zero-token direction, with every status checked against the
   tree** ([#941](https://github.com/xerj-org/xerj/issues/941)). A new roadmap
   section and [docs/ZERO_TOKEN_DIRECTION.md](./docs/ZERO_TOKEN_DIRECTION.md)
