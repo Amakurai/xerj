@@ -2,7 +2,7 @@
 ---
 title: "How do I rerank search results with a relevance judge?"
 canonical: "https://xerj.org/answers/rerank-search-results-calibrated-judge"
-updated: "2026-09-19"
+updated: "2026-09-20"
 source: "content/answers/rerank-search-results-calibrated-judge.md"
 ---
 

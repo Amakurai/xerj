@@ -2,7 +2,7 @@
 ---
 title: "Can I route or spam-filter text without an LLM call?"
 canonical: "https://xerj.org/answers/classify-text-from-labelled-history-without-llm"
-updated: "2026-09-18"
+updated: "2026-09-20"
 source: "content/answers/classify-text-from-labelled-history-without-llm.md"
 ---
 

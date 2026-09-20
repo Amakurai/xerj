@@ -125,7 +125,7 @@
       "canonical_url": "https://xerj.org/answers/classify-text-from-labelled-history-without-llm",
       "markdown_url": "https://xerj.org/answers/classify-text-from-labelled-history-without-llm.md",
       "cluster": "Decisions as retrieval",
-      "updated": "2026-09-18",
+      "updated": "2026-09-20",
       "summary": "Index labelled examples and classify new text by its nearest neighbours. Measured: 0.933 accuracy on 77-way intent routing, 0.983 on SMS spam, no LLM or API call."
     },
     {
@@ -440,7 +440,7 @@
       "canonical_url": "https://xerj.org/answers/hybrid-search-quality-measured-ndcg",
       "markdown_url": "https://xerj.org/answers/hybrid-search-quality-measured-ndcg.md",
       "cluster": "Hybrid retrieval: quality",
-      "updated": "2026-09-19",
+      "updated": "2026-09-20",
       "summary": "XERJ measured BM25, vectors and hybrid RRF on two public BEIR datasets. Hybrid won both: nDCG@10 0.6993 against 0.6572 on SciFact, with a neural embedder."
     },
     {
@@ -449,7 +449,7 @@
       "canonical_url": "https://xerj.org/answers/rerank-search-results-calibrated-judge",
       "markdown_url": "https://xerj.org/answers/rerank-search-results-calibrated-judge.md",
       "cluster": "Hybrid retrieval: reranking",
-      "updated": "2026-09-19",
+      "updated": "2026-09-20",
       "summary": "Add a rerank block to a XERJ search: the top 30 hits go to an external judge, a 0 to 1 probability replaces the score, and min_score becomes a real cut-off."
     },
     {

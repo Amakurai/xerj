@@ -65,7 +65,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-09-18",
-  "dateModified": "2026-09-19",
+  "dateModified": "2026-09-20",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -235,7 +235,7 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>HOW DO I RERANK SEARCH RESULTS WITH A CALIBRATED RELEVANCE JUDGE?</div>
   <div class="kicker"><span>ANSWERS · HYBRID RETRIEVAL: RERANKING</span></div>
   <h1>How do I rerank search results with a calibrated relevance judge?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-09-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-09-20</div>
   <p><strong>TL;DR</strong> — Add <code class="inline">"rerank": {}</code> to a XERJ <code class="inline">_search</code> body. The top 30 hits go to an external judge, which returns a 0 to 1 relevance probability per document. That probability replaces <code class="inline">_score</code>, so <code class="inline">min_score</code> becomes a real cut-off. It sends document text off the machine. XERJ has not verified ranking quality with the real model.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>
