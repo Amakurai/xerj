@@ -35,8 +35,20 @@ pub struct GenerationCatalogMetadata {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogProjection {
     pub generation_id: String,
-    /// Complete desired managed document set, keyed by catalog `_id`.
+    /// Managed documents this generation must WRITE, keyed by catalog `_id`.
+    ///
+    /// #971: a document whose desired content is identical to the prior
+    /// generation's publication except for `run_id` is deliberately absent —
+    /// it stays live under the run_id of the generation that last touched it,
+    /// so a one-file change rewrites O(changed) catalog documents instead of
+    /// the whole corpus. Publication is convergent either way: ids are
+    /// content-derived and upserted in place, so re-sending a skipped document
+    /// (a retry that cannot prove it unchanged) reproduces the same live set.
     pub documents: BTreeMap<String, Value>,
+    /// Complete desired managed id set — written plus intentionally kept.
+    /// The publication sweep's authority for "which prior-generation documents
+    /// are allowed to remain".
+    pub managed_ids: BTreeSet<String>,
     /// IDs managed by the previous generation which no longer exist.
     pub stale_ids: BTreeSet<String>,
 }
@@ -124,18 +136,26 @@ fn describe_field_diff(expected: &Value, actual: &Value) -> String {
     }
 }
 
-/// Build the complete catalog projection for `desired`.
+/// Build the catalog projection for `desired`.
 ///
 /// `dataset_stats` must be exact, generation-bound values obtained from the
 /// sealed prepared artifacts or from a refreshed exact read-back. Supplying
 /// sampled estimates here would make the data map lie.
 ///
-/// `prior_managed_ids` is the exact set observed through the authenticated
-/// catalog endpoint for the prior committed catalog generation. The manifest
-/// cannot derive correlation IDs, so callers must query or durably persist
-/// this set.
+/// `prior_managed_ids` is the set of ids observed for the prior committed
+/// catalog generation that the manifest cannot derive — correlation IDs are
+/// the case in point, which is why callers must query or durably persist
+/// them. The prior generation's own file/junk/duplicate/dataset ids and run
+/// document are derived from `base` here.
+///
+/// #971: the projection is incremental. A managed document whose desired
+/// content equals the prior generation's publication except for `run_id` is
+/// NOT returned in `documents` — it stays live untouched, keeping the run_id
+/// of the generation that last wrote it. Dataset and run documents are always
+/// written (few per corpus, and their content is live-derived); everything
+/// else is compared against `base`.
 pub fn project_generation(
-    _base: &CommittedManifest,
+    base: &CommittedManifest,
     desired: &GenerationManifest,
     metadata: &GenerationCatalogMetadata,
     dataset_stats: &BTreeMap<String, DatasetCatalogStats>,
@@ -151,9 +171,47 @@ pub fn project_generation(
         .as_ref()
         .context("catalog generation has no execution identity")?;
     let mut documents = BTreeMap::new();
+    let mut managed_ids = BTreeSet::new();
     // #294 tripwire: counted from the sealed manifest, so a resumed or no-op
     // generation republishes the same coverage instead of an empty one.
     let mut code = crate::CodeCoverage::default();
+
+    // #971 change-detection indexes over the prior generation. A group that is
+    // wholly equal to its committed self produced a byte-identical file
+    // document except for `run_id` (same content id, digest, size, records,
+    // aliases — `ManifestGroup` carries every field `file_doc` embeds), so it
+    // is kept, not rewritten. Equality is also exactly the condition under
+    // which `sync::plan_operations` plans no operation for the group: nothing
+    // this generation does touches its live records or its document.
+    let base_group_by_id: BTreeMap<&str, &crate::sync::ManifestGroup> = base
+        .groups
+        .iter()
+        .map(|group| (group.group_id.as_str(), group))
+        .collect();
+    let base_prefix = base
+        .execution
+        .as_ref()
+        .map_or(execution.prefix.as_str(), |prior| prior.prefix.as_str());
+    let mut base_junk_by_key: BTreeMap<&str, Value> = BTreeMap::new();
+    for junk in &base.plan.junk_files {
+        base_junk_by_key.insert(junk.file_key.as_str(), serde_json::to_value(junk)?);
+    }
+    let base_duplicate_by_id: BTreeMap<String, &crate::state::DuplicateFile> = base
+        .plan
+        .duplicate_files
+        .iter()
+        .map(|alias| {
+            (
+                catalog::duplicate_file_id(
+                    base_prefix,
+                    &alias.file_key,
+                    &alias.rel,
+                    &alias.path_id,
+                ),
+                alias,
+            )
+        })
+        .collect();
 
     for group in &desired.groups {
         let assignment = desired.plan.files.get(&group.content_id).with_context(|| {
@@ -164,6 +222,7 @@ pub fn project_generation(
         })?;
         let format = assignment_format(assignment.family.as_str(), assignment.gzip);
         code.observe(&format, group.expected_records);
+        let group_unchanged = base_group_by_id.get(group.group_id.as_str()).copied() == Some(group);
         let (id, doc) = catalog::file_doc(
             &execution.prefix,
             &group.content_id,
@@ -176,7 +235,10 @@ pub fn project_generation(
             group.content_size,
             &metadata.generation_id,
         );
-        insert_unique(&mut documents, id, doc)?;
+        managed_ids.insert(id.clone());
+        if !group_unchanged {
+            insert_unique(&mut documents, id, doc)?;
+        }
         for alias in &group.aliases {
             let (id, doc) = catalog::duplicate_file_doc(
                 &execution.prefix,
@@ -187,7 +249,13 @@ pub fn project_generation(
                 group.content_size,
                 &metadata.generation_id,
             );
-            insert_unique(&mut documents, id, doc)?;
+            managed_ids.insert(id.clone());
+            // The alias document embeds the group's canonical rel and size, so
+            // it is only unchanged when the group is AND the prior generation
+            // published this very alias id.
+            if !(group_unchanged && base_duplicate_by_id.contains_key(&id)) {
+                insert_unique(&mut documents, id, doc)?;
+            }
         }
     }
 
@@ -207,7 +275,10 @@ pub fn project_generation(
             junk.bytes,
             &metadata.generation_id,
         );
-        insert_unique(&mut documents, id, doc)?;
+        managed_ids.insert(id.clone());
+        if base_junk_by_key.get(junk.file_key.as_str()) != Some(&serde_json::to_value(junk)?) {
+            insert_unique(&mut documents, id, doc)?;
+        }
     }
 
     let mut total_records = 0u64;
@@ -248,6 +319,10 @@ pub fn project_generation(
             notes: stats.notes.clone(),
             run_id: &metadata.generation_id,
         });
+        // Dataset documents are always written: their numbers are read back
+        // live from the index, not derivable from the plan comparison, and
+        // there is one per dataset, not one per file.
+        managed_ids.insert(id.clone());
         insert_unique(&mut documents, id, doc)?;
     }
 
@@ -258,6 +333,7 @@ pub fn project_generation(
             "catalog correlation {id} has the wrong doc_kind"
         );
         correlation["run_id"] = Value::String(metadata.generation_id.clone());
+        managed_ids.insert(id.clone());
         insert_unique(&mut documents, id.clone(), correlation)?;
     }
 
@@ -300,6 +376,7 @@ pub fn project_generation(
     for (key, value) in desired.plan.refused_run_fields() {
         run_doc[key] = value;
     }
+    managed_ids.insert(format!("run:{}", metadata.generation_id));
     insert_unique(
         &mut documents,
         format!("run:{}", metadata.generation_id),
@@ -310,19 +387,52 @@ pub fn project_generation(
         documents.values().all(|doc| {
             doc.get("run_id").and_then(Value::as_str) == Some(metadata.generation_id.as_str())
         }),
-        "every desired catalog document must carry the current generation run_id"
+        "every catalog document this generation writes must carry the current generation run_id \
+         (kept-unchanged documents keep the prior generation's, #971)"
     );
 
-    let desired_ids: BTreeSet<String> = documents.keys().cloned().collect();
-    let stale_ids = prior_managed_ids
-        .difference(&desired_ids)
-        .filter(|id| !desired_ids.contains(*id))
-        .cloned()
-        .collect();
+    // The prior generation's own managed ids, derived from its committed plan
+    // and its run document, plus whatever the caller observed beyond the
+    // manifest's knowledge (correlations). Everything in that universe that
+    // the desired generation no longer manages is stale and must be deleted.
+    let mut prior_ids = prior_managed_ids.clone();
+    prior_ids.extend(
+        base.plan
+            .files
+            .keys()
+            .map(|key| catalog::file_id(base_prefix, key)),
+    );
+    prior_ids.extend(
+        base.plan
+            .junk_files
+            .iter()
+            .map(|junk| catalog::file_id(base_prefix, &junk.file_key)),
+    );
+    prior_ids.extend(base_duplicate_by_id.keys().cloned());
+    prior_ids.extend(
+        base.plan
+            .datasets
+            .iter()
+            .map(|dataset| format!("ds:{}:{}", base_prefix, dataset.slug)),
+    );
+    if let Some(prior_tx) =
+        base.execution
+            .as_ref()
+            .and_then(|execution| match &execution.source_policy {
+                crate::sync::SourceExecutionPolicy::DurableSnapshot { reference, .. } => {
+                    reference.strip_prefix("sync-snapshots/").map(str::to_owned)
+                }
+                crate::sync::SourceExecutionPolicy::AbortOnSourceChange { .. } => None,
+            })
+    {
+        prior_ids.insert(format!("run:{}", prior_tx));
+    }
+    let stale_ids = prior_ids.difference(&managed_ids).cloned().collect();
 
     Ok(CatalogProjection {
         generation_id: metadata.generation_id.clone(),
         documents,
+        managed_ids,
         stale_ids,
     })
 }
@@ -598,8 +708,15 @@ mod tests {
         );
     }
 
+    /// #971: this was `every_current_document_moves_to_latest_catalog_generation`
+    /// — the invariant that made a one-file change rewrite the whole corpus's
+    /// catalog documents. The contract inverted: an unchanged file's document
+    /// is KEPT under the prior generation's run_id (still visible in the data
+    /// map — ids are content-derived and never deleted, the map is
+    /// prefix-scoped now), and only the documents that actually moved carry
+    /// the new generation's run_id.
     #[test]
-    fn every_current_document_moves_to_latest_catalog_generation() {
+    fn a_one_file_change_writes_only_that_file_and_the_small_shared_documents() {
         let mut base_plan = Plan {
             datasets: vec![dataset()],
             ..Plan::default()
@@ -621,10 +738,62 @@ mod tests {
         );
         let base = committed(base_generation);
 
+        // One file changed: its group moved (new digest, new record count).
+        let mut changed_group = group("change", "change.csv", vec![]);
+        changed_group.content_digest = "digest-2".into();
+        changed_group.expected_records = 7;
         let desired = manifest(
             2,
             "generation-2",
             base_plan,
+            vec![group("keep", "keep.csv", vec![]), changed_group],
+        );
+        let projection = project_generation(
+            &base,
+            &desired,
+            &metadata("generation-2"),
+            &stats(),
+            &BTreeMap::new(),
+            &managed_non_run_ids("ax", &base.plan),
+        )
+        .unwrap();
+
+        // Exactly the changed file plus the two per-corpus documents that are
+        // always written. The unchanged peer is NOT re-sent.
+        assert_eq!(
+            projection.documents.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "ds:ax:reports".to_string(),
+                "file:ax:change".to_string(),
+                "run:generation-2".to_string(),
+            ]
+        );
+        assert!(projection
+            .documents
+            .values()
+            .all(|doc| { doc.get("run_id").and_then(Value::as_str) == Some("generation-2") }));
+        // The unchanged peer is still a managed id — the sweep's authority
+        // allows it to remain under the prior generation's run_id — and it is
+        // not stale, so nothing deletes it.
+        assert!(projection.managed_ids.contains("file:ax:keep"));
+        assert!(!projection.stale_ids.contains("file:ax:keep"));
+        // The prior generation's run document IS stale: superseded by
+        // run:generation-2.
+        assert!(projection.stale_ids.contains("run:generation-1"));
+
+        // The same projection with nothing changed at all writes only the two
+        // per-corpus documents — an incremental generation never touches the
+        // corpus's file documents wholesale.
+        let mut plan = Plan {
+            datasets: vec![dataset()],
+            ..Plan::default()
+        };
+        plan.files.insert("keep".into(), assignment("keep.csv"));
+        plan.files.insert("change".into(), assignment("change.csv"));
+        let desired = manifest(
+            2,
+            "generation-2",
+            plan,
             vec![
                 group("keep", "keep.csv", vec![]),
                 group("change", "change.csv", vec![]),
@@ -639,16 +808,18 @@ mod tests {
             &managed_non_run_ids("ax", &base.plan),
         )
         .unwrap();
-
-        assert!(projection.documents.len() >= 4);
-        assert!(projection
-            .documents
-            .values()
-            .all(|doc| { doc.get("run_id").and_then(Value::as_str) == Some("generation-2") }));
         assert_eq!(
-            projection.documents["file:ax:keep"]["run_id"], "generation-2",
-            "an unchanged peer remains visible in the latest data map"
+            projection.documents.keys().cloned().collect::<Vec<_>>(),
+            vec!["ds:ax:reports".to_string(), "run:generation-2".to_string(),]
         );
+        for id in [
+            "file:ax:keep",
+            "file:ax:change",
+            "ds:ax:reports",
+            "run:generation-2",
+        ] {
+            assert!(projection.managed_ids.contains(id), "missing {id}");
+        }
     }
 
     #[test]

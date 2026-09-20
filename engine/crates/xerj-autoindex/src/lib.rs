@@ -48,7 +48,7 @@ pub mod watch;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Seek, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1309,6 +1309,17 @@ fn begin_non_graph_generation(
         .clone();
     let tx_id = format!("{}-g{}", journal.run_id, base.generation + 1);
     let preparation_contract = preparation_contract_digest(cfg, &plan)?;
+    // #971: the prior committed generation's snapshot is the reuse source for
+    // sealing. A file whose content digest and preparation identity match its
+    // entry there is hardlinked instead of re-copied and re-extracted, so the
+    // snapshot pass of a one-file change costs O(changed), not O(corpus). An
+    // execution-less base (pre-execution journal) simply seals in full.
+    let prior_snapshot = base
+        .execution
+        .as_ref()
+        .map(|_| sync_executor::open_committed_snapshot(state_dir, &base))
+        .transpose()?;
+    let chunker_identity = prepared_records_identity(cfg)?;
     let snapshot = sync_executor::create_prepared_snapshot_reporting(
         state_dir,
         &tx_id,
@@ -1317,6 +1328,8 @@ fn begin_non_graph_generation(
         &preparation_contract,
         cfg.snapshot_max_bytes,
         pr,
+        prior_snapshot.as_ref(),
+        &chunker_identity,
     )?;
     // #381: the per-file record cap dropped a file's tail during preparation.
     // The generated path seals before the graph worker loop runs, so report it
@@ -1328,7 +1341,6 @@ fn begin_non_graph_generation(
         .filter_map(|f| plan.files.get(&f.content_id).map(|a| a.rel.clone()))
         .collect();
     note_truncated_files(pr, &truncated);
-    let chunker_identity = prepared_records_identity(cfg)?;
     let semantic = plan
         .datasets
         .iter()
@@ -8398,13 +8410,38 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
         }
         all
     };
-    let latest_run_filter = runs
-        .first()
-        .and_then(|run| run.get("run_id"))
-        .and_then(|value| value.as_str())
-        .map(|run_id| json!({"term": {"run_id": run_id}}));
+    // #971: junk and duplicate documents are current state, not generation
+    // scratch. Ids are content-derived and upserted in place, and publication
+    // now rewrites only the documents that changed — an unchanged file's
+    // document keeps the run_id of the generation that last touched it.
+    // Filtering by the single latest run would therefore hide every file the
+    // newest run did not rewrite (touch one file in 10,000 and the map would
+    // show one junk entry instead of hundreds). Scope by the corpus prefixes
+    // the run documents name instead — same output as the old filter for a
+    // single-corpus node, and for a multi-corpus node it stops hiding every
+    // corpus except the one that ran last. (`prefix` is a mapped keyword
+    // since #737; on a pre-rc.68 catalog it was inferred, where a term
+    // matches only while the value has no separator — the same legacy caveat
+    // the scoped sweeps in `catalog.rs` document.)
+    let prefixes: Vec<String> = runs
+        .iter()
+        .filter_map(|run| run.get("prefix"))
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+    let prefix_filter = (!prefixes.is_empty()).then(|| {
+        json!({"bool": {
+            "should": prefixes
+                .iter()
+                .map(|prefix| json!({"term": {"prefix": prefix}}))
+                .collect::<Vec<_>>(),
+            "minimum_should_match": 1
+        }})
+    });
     let mut junk_must = vec![json!({"term": {"doc_kind": "file"}})];
-    if let Some(filter) = latest_run_filter.clone() {
+    if let Some(filter) = prefix_filter.clone() {
         junk_must.push(filter);
     }
     let junk_files = fetch(
@@ -8420,7 +8457,7 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
         json!({"term": {"doc_kind": "file"}}),
         json!({"term": {"status": "duplicate"}}),
     ];
-    if let Some(filter) = latest_run_filter {
+    if let Some(filter) = prefix_filter {
         duplicate_must.push(filter);
     }
     let duplicate_files = fetch(json!({"bool": {"must": duplicate_must}}), 500, None)?;
