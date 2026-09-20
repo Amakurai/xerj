@@ -28,6 +28,9 @@
 //! - [`views`] — saved views CRUD.
 //! - [`data_sources`] — `/data-sources/connections` + descendants
 //!   (read-only MVP backed by an auto-provisioned `built-in` adapter).
+//! - [`graph`] — session-authorized Second-Brain graph reads (`/graph/*`,
+//!   issue #936): brains discovery, `ego`, `overview`, brain-scoped edges and
+//!   nodes searches.
 //!
 //! Coming after RC: `/auth/magic/issue`, `/auth/api-tokens`, `/users`
 //! admin surface, `/cluster/raft*`, dashboards/views SSE streams, write
@@ -49,6 +52,7 @@ pub mod cluster;
 pub mod dashboards;
 pub mod data_sources;
 pub mod error;
+pub mod graph;
 pub mod indices;
 pub mod prefs;
 pub mod response;

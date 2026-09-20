@@ -133,7 +133,14 @@ Three consequences follow, and all three are load-bearing:
   `authz_middleware` never runs for it and its in-process engine calls carry no
   guard. The Console data-sources proxy therefore refuses the reserved namespace
   itself, with the same `404` a Console system index gets
-  (`xerj-console-api/src/data_sources.rs:37-48`). The gRPC listener does the
+  (`xerj-console-api/src/data_sources.rs:37-48`). The Console's own graph read
+  path reaches that namespace deliberately — but only through brain-scoped
+  routes that gate on the console session's role (`owner`/`admin` may read
+  brains), resolve the indices from each brain's own meta document, and answer
+  a role-refused read and a nonexistent brain identically, so it cannot be
+  used as an existence oracle or a general search proxy
+  (`xerj-console-api/src/graph.rs`, issue
+  [#936](https://github.com/xerj-org/xerj/issues/936)). The gRPC listener does the
   same with `Principal::allows_index` (`xerj-server/src/grpc.rs:62-75`) and
   refuses index patterns outright for non-superusers (`grpc.rs:81-88`).
 
