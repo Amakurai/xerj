@@ -50,6 +50,13 @@ xerj gain                                        # what it did for you — count
 
 Windows and a hand-verified install are under [Install by hand](#install-by-hand).
 
+That `--insecure` flag is a trust boundary, not a formality. It turns off TLS and API-key
+auth, so every caller that can reach the port is a superuser who can read and delete every
+index, including every `/_memory` namespace. It is meant for one user on a dev machine: a
+fresh node binds `127.0.0.1` only, and a cleartext bind on any other interface refuses to
+start unless you explicitly allow it. The full model is in
+[docs/SECURITY_MODEL.md](./docs/SECURITY_MODEL.md).
+
 ## Join the community
 
 You join XERJ by running it and sending back one short field report on what it was like: a
@@ -103,6 +110,9 @@ memory, with no schema to write and no pipeline to configure.
 xerj --insecure --data-dir ./data &      # start it
 xerj autoindex ~/my-project              # point it at anything
 ```
+
+`--insecure` again means no TLS and no auth — every caller a superuser — so this is the
+same one-user-on-a-dev-machine boundary as above ([security model](./docs/SECURITY_MODEL.md)).
 
 XERJ sniffs every file, works out what it is, and creates one index per dataset it finds.
 Code arrives with its symbols and line numbers through tree-sitter, not as flat text:
@@ -194,6 +204,10 @@ xerj --insecure --data-dir ./data &     # local dev: no TLS, no auth
 xerj autoindex ~/my-project
 ```
 
+That is the dev-machine trust boundary from the top of this README — no TLS, no auth, every
+caller a superuser. It is fine on a laptop because a fresh node binds `127.0.0.1` and
+nothing else; a shared host wants the auth-on start just below.
+
 If your server has auth on, which is the default for every start without `--insecure`
 (including any start from a config file), hand `autoindex` the same key. It never picks the
 key up from `xerj.toml`; pass `--api-key` or set `XERJ_API_KEY`, or every request comes back
@@ -255,8 +269,10 @@ xerj mcp                                # 2. MCP stdio server (your client runs 
 ```
 
 `xerj mcp` speaks MCP over stdio and proxies to the node named by `XERJ_URL` (default
-`http://localhost:9200`). It does not start a node; step 1 is the prerequisite. Drop this
-into your MCP client's config:
+`http://localhost:9200`). It does not start a node; step 1 is the prerequisite. The MCP
+server adds no trust of its own — it is the same binary talking stdio to your client and
+plain HTTP to the node, so the node's boundary is the one that counts, and step 1 above
+boots the same `--insecure` dev node. Drop this into your MCP client's config:
 
 ```json
 {
