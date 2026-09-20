@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **120 settings** versus
+//! Configuration is intentionally minimal: **121 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -72,7 +72,7 @@ pub struct Config {
     pub vector: VectorConfig,
     /// Log (time-series) retention — 2 settings.
     pub logs: LogsConfig,
-    /// External embedding service — 19 settings.
+    /// External embedding service — 20 settings.
     pub embedding: EmbeddingConfig,
     /// Resource limits — 14 settings.
     pub limits: LimitsConfig,
@@ -99,7 +99,7 @@ pub struct Config {
     pub rerank: RerankProviderConfig,
 }
 
-// 22 sub-configs, 120 leaf settings in total. Do not maintain that sum by hand
+// 22 sub-configs, 121 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -249,6 +249,11 @@ impl Config {
         if !(1..=2).contains(&self.embedding.onnx_session_pool_size) {
             return Err(XerjError::config(
                 "embedding.onnx_session_pool_size must be in 1..=2",
+            ));
+        }
+        if !(1..=64).contains(&self.embedding.neural_window_concurrency) {
+            return Err(XerjError::config(
+                "embedding.neural_window_concurrency must be in 1..=64",
             ));
         }
 
@@ -463,7 +468,7 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (120 user-facing settings total; counted by
+// Sub-configs  (121 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1295,7 +1300,7 @@ impl Default for LogsConfig {
 ///   * `"auto"` (default) — use the proxy when [`default_endpoint`] is set,
 ///     otherwise lexical. This preserves the historical behavior exactly.
 ///
-/// **19 settings.**
+/// **20 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
@@ -1320,6 +1325,16 @@ pub struct EmbeddingConfig {
     /// safetensors weights from this local directory instead of downloading
     /// — for air-gapped / offline deployments. Empty (default) = download.
     pub local_model_dir: String,
+    /// Neural backend: how many of one `_bulk` request's scheduling windows
+    /// may run through the embedder concurrently (default: `1`, range:
+    /// `1..=64`). The default preserves the historical strictly-serial
+    /// window loop exactly. `1` is also right for the lexical and proxy
+    /// backends, where there is nothing to overlap. For
+    /// `mode = "neural"` on a many-core box, raising it lets one `_bulk`
+    /// stream keep several BERT forward passes in flight on the shared
+    /// model instead of one (#938); every window is still embedded as its
+    /// own batch and reassembled by position, so outputs are unchanged.
+    pub neural_window_concurrency: usize,
     /// Experimental ONNX backend: local FP32 all-MiniLM-L6-v2-compatible
     /// model with int64 BERT inputs and a width-384 token-embedding output.
     /// Required when `mode = "onnx-experimental"`; never auto-downloaded.
@@ -1375,6 +1390,7 @@ impl Default for EmbeddingConfig {
             neural_model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
             model_cache_dir: String::new(),
             local_model_dir: String::new(),
+            neural_window_concurrency: 1,
             onnx_model_path: String::new(),
             onnx_tokenizer_path: String::new(),
             onnx_scheduling_window: 64,
@@ -2935,6 +2951,41 @@ mod tests {
         assert_eq!(cfg.embedding.onnx_session_pool_size, 1);
     }
 
+    /// The window concurrency opt-in must default to serial (#938): an
+    /// operator who never touches it keeps the one-window-at-a-time loop
+    /// that shipped before the key existed.
+    #[test]
+    fn neural_window_concurrency_defaults_to_serial() {
+        assert_eq!(Config::default().embedding.neural_window_concurrency, 1);
+        let cfg = Config::from_toml_str("[embedding]\n").unwrap();
+        assert_eq!(cfg.embedding.neural_window_concurrency, 1);
+        let cfg = Config::from_toml_str("[embedding]\nmode = \"neural\"\n").unwrap();
+        assert_eq!(cfg.embedding.neural_window_concurrency, 1);
+        // Round-trips through the file format.
+        let cfg = Config::from_toml_str("[embedding]\nneural_window_concurrency = 8\n").unwrap();
+        assert_eq!(cfg.embedding.neural_window_concurrency, 8);
+    }
+
+    #[test]
+    fn neural_window_concurrency_accepts_only_bounded_values() {
+        for value in [1usize, 2, 8, 64] {
+            Config::from_toml_str(&format!(
+                "[embedding]\nneural_window_concurrency = {value}\n"
+            ))
+            .unwrap_or_else(|error| {
+                panic!("neural_window_concurrency={value} must be valid: {error}")
+            });
+        }
+        for value in [0usize, 65] {
+            Config::from_toml_str(&format!(
+                "[embedding]\nneural_window_concurrency = {value}\n"
+            ))
+            .expect_err(&format!(
+                "neural_window_concurrency={value} must be rejected"
+            ));
+        }
+    }
+
     #[test]
     fn onnx_throughput_controls_accept_only_bounded_values() {
         for (key, valid) in [
@@ -3018,7 +3069,7 @@ mod tests {
         ("fts", 1),
         ("vector", 6),
         ("logs", 2),
-        ("embedding", 19),
+        ("embedding", 20),
         ("limits", 14),
         ("indexing", 3),
         ("engine", 4),
@@ -3072,7 +3123,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 120,
+            total, 121,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \
