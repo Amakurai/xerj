@@ -80,6 +80,11 @@ PAGES: dict[str, dict[str, str]] = {
         title="XERJ vs Elasticsearch — reproducible benchmarks",
         description="XERJ v1.0.0-rc.6 against Elasticsearch 8.13.4 across 88 measured cells — 55 win, 26 tie, 4 lose, 3 n/a — plus the four commands that reproduce every one.",
     ),
+    "benchmarks/decisions.html": dict(
+        label="Jev measured, wire spoken", kind="software",
+        title="XERJ.ai — Measuring the Jev judge, then speaking the System One wire",
+        description="A rerank stage that measured 0.3822 nDCG@10, was root-caused to one request shape and fixed to 0.8299; a 300-query controlled run of Jev on XERJ shortlists; and a XERJ node that answers /v1/systemone locally — the pip-installed jev-reranker runs against it unmodified.",
+    ),
     "demo/index.html": dict(
         label="Real-data demo", kind="software",
         title="XERJ.ai — Demo: 60M SSH events vs Elasticsearch",

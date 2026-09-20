@@ -408,8 +408,10 @@
         <td class="n">0.6764</td><td class="n">0.3291</td><td>us · <code class="inline">--embed-mode neural</code></td></tr>
       <tr><td>XERJ BM25 top-30, reordered by MiniLM</td>
         <td class="n">0.6855</td><td class="n">0.3323</td><td>us · <code class="inline">--embed-mode neural</code></td></tr>
-      <tr><td><strong>XERJ hybrid RRF</strong> (<code class="inline">hybrid</code>, server-side) — the best arm XERJ has, on both</td>
-        <td class="n w">0.6993</td><td class="n w">0.3448</td><td>us · <code class="inline">--embed-mode neural</code></td></tr>
+      <tr><td><strong>XERJ hybrid RRF</strong> (<code class="inline">hybrid</code>, server-side)</td>
+        <td class="n">0.6993</td><td class="n w">0.3448</td><td>us · <code class="inline">--embed-mode neural</code></td></tr>
+      <tr><td><strong>XERJ BM25 top-30, reordered by Jev</strong> (<code class="inline">jev-1.13.0</code>, pinned)</td>
+        <td class="n w">0.7410</td><td class="n">0.3312</td><td>us · median of 3 repeats — <a href="/benchmarks/decisions">the write-up</a></td></tr>
       <tr><td>Jev (TypeSafe AI), hosted reranker</td>
         <td class="n">0.768</td><td class="n">0.358</td><td><strong>not run by us</strong> — published in the hev/jev-rerank README</td></tr>
       <tr><td>Voyage rerank-3, hosted reranker</td>
@@ -433,11 +435,15 @@
     <li><strong>What neural mode costs.</strong> In the same run: about 3–7 documents per second to index on CPU
       (SciFact took about 25 minutes), and about 220–370 ms p50 per hybrid query against about 18 ms for BM25.
       The machine was also compiling, so read the latencies as upper bounds.</li>
-    <li><strong>The <code class="inline">rerank</code> search stage exists, and its quality is not verified.</strong>
-      XERJ can hand the top hits to an external relevance judge and reorder by the calibrated probability that
-      comes back. No provider key was available to this project, so ranking quality with the real model has
-      <strong>not</strong> been measured by us; the stage is tested against a test double. It is also the one
-      XERJ feature that sends document text off the machine —
+    <li><strong>The <code class="inline">rerank</code> stage is now measured — and its first measurement was a
+      disaster we published.</strong> With an evaluation key granted by TypeSafe, the stage as it shipped scored
+      <strong>0.3822 nDCG@10 against BM25's 0.7750</strong> on a 40-query pilot — our request asked the judge an
+      untargeted question, so it judged the pile once and echoed query-level noise. Root-caused, fixed
+      (<strong>0.8299</strong>, raw API 0.8389), then run in full: <strong>0.7410 / 0.3312</strong> over 300+323
+      queries, three repeats. The probabilities order documents well but are <strong>not calibrated to BEIR
+      relevance</strong> (ECE 0.10–0.13) — do not <code class="inline">min_score</code> the raw number.
+      <a href="/benchmarks/decisions">The full autopsy, run and gate</a>. The stage is also the one XERJ feature
+      that sends document text off the machine —
       <a href="/answers/rerank-search-results-calibrated-judge">read that before turning it on</a>.</li>
   </ul>
 
@@ -466,7 +472,10 @@
       new text by a rank-weighted vote over its ten nearest neighbours. On Banking77 the neural arm settled 86.9%
       of traffic at confidence 0.8 or higher and was right on 0.979 of it, with no tokens spent; only the rest
       needs a judge model or a person. Spam detection reached 0.983 with plain BM25, under a millisecond per
-      message.</li>
+      message. The vote now also <strong>speaks TypeSafe's System One wire</strong> —
+      <code class="inline">POST /v1/systemone</code> on the native port — so the pip-installed
+      <code class="inline">jev-reranker</code> runs against a local XERJ node unmodified, zero egress:
+      <a href="/benchmarks/decisions">the write-up</a>.</li>
     <li><strong>What it is not.</strong> It is not zero-shot: a new category has no history to vote from, and that
       case needs a judge model. XERJ did not run any judge model on these datasets and claims nothing about how
       one would score. Two datasets, one run each.</li>
@@ -477,7 +486,8 @@
     run 2026-09-18 on xerj v1.0.0-rc.74 · written up in
     <a href="/answers/hybrid-search-quality-measured-ndcg">hybrid search quality</a> and
     <a href="/answers/classify-text-from-labelled-history-without-llm">decisions without a model call</a>.
-    Hosted-reranker figures: <a href="https://github.com/hev/jev-rerank" rel="external">hev/jev-rerank</a> (Apache-2.0).</p>
+    Hosted-reranker figures: <a href="https://github.com/hev/jev-rerank" rel="external">hev/jev-rerank</a> (MIT) ·
+    the measured Jev rows and the System One wire: <a href="/benchmarks/decisions">benchmarks/decisions</a>.</p>
 </section>
 
 <!-- ============================ TOKEN SAVINGS ============================ -->

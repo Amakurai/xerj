@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="day">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XERJ.ai — Measuring the Jev judge, then speaking the System One wire</title>
+<meta name="description" content="A rerank stage that measured 0.3822 nDCG@10, was root-caused to one request shape and fixed to 0.8299; a 300-query controlled run of Jev on XERJ shortlists; and a XERJ node that answers /v1/systemone locally — the pip-installed jev-reranker runs against it unmodified.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230b0b0d'/><text x='50' y='68' font-size='60' font-family='Big Shoulders Display,sans-serif' font-weight='900' fill='%23ffc400' text-anchor='middle'>X</text></svg>">
+<link rel="stylesheet" href="/style.css?v=if9">
+<style>
+  /* page-local: a negative colour the system lacks, both themes */
+  :root                  { --z-neg: #d9575f; }
+  html[data-theme='day'] { --z-neg: #a32b2e; }
+
+  /* vertical comparison chart — same component as the benchmarks hub */
+  .vchart { margin: var(--sp-6) 0 0; }
+  .vc-legend { display:flex; flex-wrap:wrap; gap:22px; margin:0 0 var(--sp-8);
+               font-family:var(--font-data); font-size:var(--fs-11);
+               letter-spacing:var(--track-label); text-transform:uppercase; }
+  .vc-legend b { display:inline-flex; align-items:center; gap:8px; font-weight:600; }
+  .vc-legend b::before { content:''; width:11px; height:11px; border-radius:2px; background:currentColor; }
+  .vc-legend .bare { color:var(--z-neg); } .vc-legend .native { color:var(--z-cmp); }
+  .vc-legend .xerj { color:var(--z-accent); }
+  .vc-groups { display:grid; gap:var(--sp-10) var(--sp-12);
+               grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); }
+  .vc-group  { min-width:0; }
+  .vc-plot { box-sizing:border-box; height:238px; padding:30px var(--sp-2) 0;
+             display:grid; grid-auto-flow:column; grid-auto-columns:1fr;
+             gap:var(--sp-6); border-bottom:1px solid var(--z-line); }
+  .vc-col  { display:flex; flex-direction:column; justify-content:flex-end;
+             align-items:center; height:100%; min-width:0; }
+  .vc-bar  { position:relative; display:block; width:100%; max-width:78px;
+             min-height:3px; border-radius:2px 2px 0 0; background:currentColor; }
+  .vc-v    { position:absolute; bottom:100%; left:50%; transform:translateX(-50%);
+             margin-bottom:8px; white-space:nowrap; color:var(--z-ink);
+             font-family:var(--font-data); font-size:var(--fs-13); font-weight:700; }
+  .vc-col.bare   { color:var(--z-neg); }
+  .vc-col.native { color:var(--z-cmp); }
+  .vc-col.xerj   { color:var(--z-accent); }
+  .vc-col.xerj .vc-v { color:var(--z-accent); }
+  .vc-axis { display:grid; grid-auto-flow:column; grid-auto-columns:1fr; gap:var(--sp-6);
+             padding:var(--sp-3) var(--sp-2) 0; text-align:center; min-height:46px;
+             font-family:var(--font-data); font-size:var(--fs-11);
+             letter-spacing:var(--track-label); text-transform:uppercase; color:var(--z-mute); }
+  .vc-axis span { min-width:0; }
+  .vc-axis .sub { display:block; font-style:normal; letter-spacing:.03em;
+                  text-transform:none; opacity:.72; margin-top:3px; }
+  .vc-axis .win { color:var(--z-accent); opacity:1; }
+  .vc-title { margin-top:var(--sp-4); padding-top:var(--sp-3);
+              border-top:1px solid var(--z-faint);
+              font-family:var(--font-data); font-size:var(--fs-11);
+              letter-spacing:var(--track-label); text-transform:uppercase; color:var(--z-mute); }
+  .vc-title b { color:var(--z-ink); font-weight:600; }
+  .vc-note { margin:var(--sp-4) 0 0; max-width:900px;
+             font-family:var(--font-data); font-size:12px; letter-spacing:.03em; color:var(--z-mute); }
+  @media (max-width:620px) {
+    .vc-plot { height:196px; gap:var(--sp-3); padding-top:26px; }
+    .vc-axis { gap:var(--sp-3); }
+    .vc-v { font-size:11px; }
+  }
+
+  /* stat band */
+  .stat-band { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px,1fr));
+               gap:1px; background:var(--z-line); border:1px solid var(--z-line);
+               margin:var(--sp-8) 0 0; }
+  .stat { background:var(--z-bg); padding:20px 22px; }
+  .stat .v { font-family:var(--font-display); font-weight:800; font-size:var(--fs-32);
+             color:var(--z-accent); line-height:1.05; }
+  .stat .v.bad { color:var(--z-neg); }
+  .stat .k { font-family:var(--font-data); font-size:var(--fs-11); letter-spacing:var(--track-label);
+             text-transform:uppercase; color:var(--z-mute); margin-top:8px; }
+  .stat .s { font-size:13px; color:var(--z-mute); margin-top:4px; line-height:1.5; }
+  .stat .s a { color:var(--z-mute); }
+
+  /* verdict table */
+  .vt-wrap { overflow-x:auto; margin-top:var(--sp-6); }
+  table.vt { width:100%; border-collapse:collapse; font-family:var(--font-data); font-size:13.5px; }
+  .vt th { text-align:left; font-size:11px; letter-spacing:.06em; text-transform:uppercase;
+           color:var(--z-mute); font-weight:600; padding:9px 12px 9px 0; border-bottom:1px solid var(--z-ink); }
+  .vt td { padding:10px 12px 10px 0; border-bottom:1px solid var(--z-faint); vertical-align:top; }
+  .vt td.n { font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .vt .w { color:var(--z-accent); font-weight:700; }
+  .vt .t { color:var(--z-mute); font-weight:600; }
+  .vt .l { color:var(--z-neg); font-weight:700; }
+
+  /* wire panels */
+  .wire { display:grid; gap:var(--sp-4); margin-top:var(--sp-8); }
+  .wp { border:1px solid var(--z-line); border-left:3px solid var(--z-accent); padding:18px 22px; }
+  .wp .wh { display:flex; gap:14px; align-items:baseline; flex-wrap:wrap; }
+  .wp .wn { font-family:var(--font-data); font-size:12px; font-weight:700; letter-spacing:.08em; color:var(--z-accent); }
+  .wp h3 { margin:0; font-family:var(--font-display); font-weight:800; font-size:var(--fs-20); letter-spacing:.01em; }
+  .wp .wm { margin-left:auto; font-family:var(--font-data); font-size:12px; color:var(--z-mute); letter-spacing:.04em; }
+  .wp p { margin:8px 0 0; color:var(--z-mute); font-size:15px; line-height:1.6; max-width:920px; }
+  .wp p strong { color:var(--z-ink); }
+  .wp.neg { border-left-color:var(--z-neg); }
+  .wp.neg .wn { color:var(--z-neg); }
+
+  .loss { border:1px solid var(--z-line); border-left:3px solid var(--z-neg); padding:16px 20px;
+          margin-top:var(--sp-6); font-size:15px; color:var(--z-mute); line-height:1.65; max-width:980px; }
+  .loss strong { color:var(--z-ink); }
+  .src { font-family:var(--font-data); font-size:12px; letter-spacing:.03em; color:var(--z-mute); margin-top:var(--sp-4); }
+
+  /* terminal blocks */
+  pre.code { margin:var(--sp-5) 0 0; padding:18px 20px; border:1px solid var(--z-line);
+             overflow-x:auto; font-family:var(--font-data); font-size:12.5px; line-height:1.75;
+             color:var(--z-mute); background:var(--z-bg); }
+  pre.code .prompt { color:var(--z-accent); font-weight:700; user-select:none; }
+  pre.code .out { color:var(--z-ink); }
+  pre.code .cmt { opacity:.62; }
+</style>
+<!-- seo:begin — generated by scripts/seo/fix_heads.py · do not hand-edit -->
+<link rel="canonical" href="https://xerj.org/benchmarks/decisions">
+<meta property="og:site_name" content="XERJ.ai">
+<meta property="og:type" content="website">
+<meta property="og:title" content="XERJ.ai — Measuring the Jev judge, then speaking the System One wire">
+<meta property="og:description" content="A rerank stage that measured 0.3822 nDCG@10, was root-caused to one request shape and fixed to 0.8299; a 300-query controlled run of Jev on XERJ shortlists; and a XERJ node that answers /v1/systemone locally — the pip-installed jev-reranker runs against it unmodified.">
+<meta property="og:url" content="https://xerj.org/benchmarks/decisions">
+<meta property="og:image" content="https://xerj.org/og/xerj-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="XERJ.ai — the search engine built for AI agents">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="XERJ.ai — Measuring the Jev judge, then speaking the System One wire">
+<meta name="twitter:description" content="A rerank stage that measured 0.3822 nDCG@10, was root-caused to one request shape and fixed to 0.8299; a 300-query controlled run of Jev on XERJ shortlists; and a XERJ node that answers /v1/systemone locally — the pip-installed jev-reranker runs against it unmodified.">
+<meta name="twitter:image" content="https://xerj.org/og/xerj-card.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  "@id": "https://xerj.org/#organization",
+  "name": "XERJ",
+  "alternateName": "XERJ.ai",
+  "url": "https://xerj.org/",
+  "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "sameAs": [
+    "https://github.com/xerj-org/xerj"
+  ]
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebSite",
+  "@id": "https://xerj.org/#website",
+  "name": "XERJ.ai",
+  "url": "https://xerj.org/",
+  "inLanguage": "en",
+  "publisher": {
+    "@id": "https://xerj.org/#organization"
+  }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "XERJ",
+  "alternateName": "XERJ.ai",
+  "applicationCategory": "DeveloperApplication",
+  "applicationSubCategory": "Search engine",
+  "operatingSystem": "Linux, macOS, Windows",
+  "url": "https://xerj.org/benchmarks/decisions",
+  "description": "A rerank stage that measured 0.3822 nDCG@10, was root-caused to one request shape and fixed to 0.8299; a 300-query controlled run of Jev on XERJ shortlists; and a XERJ node that answers /v1/systemone locally — the pip-installed jev-reranker runs against it unmodified.",
+  "image": "https://xerj.org/og/xerj-card.png",
+  "license": "https://www.apache.org/licenses/LICENSE-2.0",
+  "isAccessibleForFree": true,
+  "codeRepository": "https://github.com/xerj-org/xerj",
+  "publisher": {
+    "@id": "https://xerj.org/#organization"
+  },
+  "mainEntityOfPage": {
+    "@type": "WebPage",
+    "@id": "https://xerj.org/benchmarks/decisions"
+  }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://xerj.org/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Jev measured, wire spoken"
+    }
+  ]
+}
+</script>
+<!-- seo:end -->
+</head>
+<body>
+
+<nav class="nav" aria-label="Primary">
+  <a href="/" class="brand">XERJ.AI</a>
+  <a href="/">HOME</a>
+  <a href="/product">PRODUCT</a>
+  <span class="nav-drop"><a href="/use-cases">USE CASES</a></span>
+  <a href="/case-studies">CASE STUDIES</a>
+  <a href="/benchmarks/" class="active">BENCHMARKS</a>
+  <span class="spacer"></span>
+  <a href="/for-agents">FOR AGENTS</a>
+  <a href="/docs/">DOCS</a>
+  <a href="/docs/recipes/">RECIPES</a>
+  <a href="/playground">DASHBOARDS</a>
+  <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
+  <span class="theme"><button type="button" data-theme="day" class="active">DAY</button><span class="dash">·</span><button type="button" data-theme="night">NIGHT</button></span>
+</nav>
+
+<div class="uc-hero">
+  <div class="uc-eyebrow">BENCHMARKS · ONE JUDGE MODEL, MEASURED · ONE WIRE, SPOKEN · 2026-09-20</div>
+  <h1>MEASURE THE JUDGE.<br><span class="accent">ANSWER ITS WIRE.</span></h1>
+  <p class="uc-lead">Two experiments, run in that order. First: what does TypeSafe AI's Jev judge model actually do to
+  XERJ's ranking — measured, not assumed, including the day our own integration scored
+  <strong>0.3822 nDCG@10 against BM25's 0.7750</strong> and had to be autopsied. Second, the inverse: a XERJ node that
+  <em>answers</em> the System One wire locally, so the pip-installed
+  <code class="inline">jev-reranker</code> client runs against it <strong>unmodified</strong> — zero requests leaving the
+  machine. Every number below traces to a run whose runner and raw output are in the repo; the losses are published
+  next to the wins.</p>
+</div>
+
+<section class="scene-section" style="border-top:0; padding-top:0;">
+  <div class="stat-band">
+    <div class="stat"><div class="v">0.3822</div><div class="k">the stage, as it shipped</div>
+      <div class="s">nDCG@10 over BM25's 0.7750 on 40 judged SciFact queries — our defect, published with the root cause below</div></div>
+    <div class="stat"><div class="v">0.8299</div><div class="k">the same stage, fixed</div>
+      <div class="s">one request shape changed, same shortlists, same day — within provider wobble of the raw API's 0.8389</div></div>
+    <div class="stat"><div class="v">+0.084</div><div class="k">nDCG@10 over BM25, full run</div>
+      <div class="s">SciFact 300 queries, Jev median over 3 repeats: 0.6572 → 0.7410; NFCorpus: 0.3016 → 0.3312</div></div>
+    <div class="stat"><div class="v">0.806</div><div class="k">gate separation, zero egress</div>
+      <div class="s">mean noul 0.9014 spam vs 0.0956 ham — the unmodified pip client ranking off a local XERJ node</div></div>
+  </div>
+</section>
+
+<!-- ============================ 01 · AUTOPSY ============================ -->
+<section class="scene-section" id="autopsy">
+  <div class="kicker"><span class="accent">01</span><span class="dash">·</span><span>THE AUTOPSY · A STAGE THAT SHIPPED UNMEASURED</span></div>
+  <h2 class="scene" style="font-size:var(--fs-56);">FIRST, WE BROKE IT<br><span class="accent">IN PUBLIC.</span></h2>
+  <p class="wide">The <code class="inline">rerank</code> stage — hand BM25's top hits to a hosted relevance judge,
+  reorder by the probability that comes back — shipped with a caveat that said, honestly,
+  <em>quality not verified, no provider key</em>. Then TypeSafe granted this project an evaluation key. The first
+  measured run turned the caveat into a number, and the number was a disaster: <strong>0.3822 nDCG@10 where plain BM25
+  scored 0.7750</strong>. Adding the judge made ranking <em>worse</em> than not using it.</p>
+
+  <div class="loss">
+    <strong>The defect was ours, not the model's.</strong> Isolated at the raw API, not guessed: the request builder put
+    every candidate into shared <code class="inline">state</code> and asked each question key an untargeted
+    <em>"Does this document contain information that answers the query?"</em> — so <strong>"this document" resolved to
+    nothing</strong>, and the model judged the whole pile once, echoing roughly that probability back per question.
+    Within every 30-document window the probabilities were near-uniform (spread ≈ 0.02) — query-level noise wearing a
+    ranking's clothes.
+  </div>
+
+  <div class="vt-wrap">
+  <table class="vt">
+    <thead><tr><th>Same 40 judged SciFact queries · same BM25 shortlists · same day</th><th>nDCG@10</th><th>What differed</th></tr></thead>
+    <tbody>
+      <tr><td>BM25 alone — no judge</td><td class="n">0.7750</td><td class="t">baseline</td></tr>
+      <tr><td>V1 — candidates in shared <code class="inline">state</code>, untargeted question</td>
+        <td class="n l">0.3822</td><td>what shipped; "this document" bound to nothing</td></tr>
+      <tr><td>V2 — one noul per document, the document inside its own question</td>
+        <td class="n w">0.8389</td><td>raw API, no stage machinery around it</td></tr>
+      <tr><td>The fixed stage — V2 shape through the real <code class="inline">rerank</code> path</td>
+        <td class="n w">0.8299</td><td>the commit that landed; p50 399 ms / p95 515 ms per query</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="vchart">
+    <div class="vc-legend">
+      <b class="xerj">BM25 — XERJ first stage</b>
+      <b class="bare">Jev through the pre-fix stage</b>
+      <b class="native">Jev through the fixed stage</b>
+      <b class="native">Jev, raw API</b>
+    </div>
+    <div class="vc-groups">
+      <div class="vc-group">
+        <div class="vc-plot">
+          <div class="vc-col xerj"><span class="vc-v">0.7750</span><i class="vc-bar" style="height:92.4%"></i></div>
+          <div class="vc-col bare"><span class="vc-v">0.3822</span><i class="vc-bar" style="height:45.6%"></i></div>
+          <div class="vc-col native"><span class="vc-v">0.8299</span><i class="vc-bar" style="height:99.0%"></i></div>
+          <div class="vc-col native"><span class="vc-v">0.8389</span><i class="vc-bar" style="height:100%"></i></div>
+        </div>
+        <div class="vc-axis">
+          <span>BM25<span class="sub">no judge</span></span>
+          <span>pre-fix<span class="sub">shipped unmeasured</span></span>
+          <span>fixed<span class="sub">this commit</span></span>
+          <span>raw API<span class="sub">no stage</span></span>
+        </div>
+        <div class="vc-title"><b>SciFact, first 40 judged queries</b> — pilot, 2026-09-20</div>
+      </div>
+    </div>
+    <p class="vc-note">The pilot's role was diagnosis: 40 queries were enough to see a 2× gap. The full run below is
+    every judged query, three repeats. The shape reference for the fix was read out of the installed
+    <code class="inline">jev-reranker</code> wheel (MIT) — listwise mode, the document referenced by backtick path
+    inside its own question — not recalled from memory.</p>
+  </div>
+
+  <ul class="deep">
+    <li><strong>The lesson generalises past this bug.</strong> A judge model answers the question it is asked —
+    literally, at the token level. An integration that scores well can still be asking a different question than the
+    one you think you're asking. Measure the integration itself, at the raw wire, before believing any number that
+    comes back.</li>
+  </ul>
+  <p class="src">Raw artifacts: <a href="https://github.com/xerj-org/xerj/tree/main/benchmarks/beir-hybrid/results/2026-09-20-rerank-pilot" rel="external">benchmarks/beir-hybrid/results/2026-09-20-rerank-pilot</a>
+    and <a href="https://github.com/xerj-org/xerj/tree/main/benchmarks/beir-hybrid/results/2026-09-20-rerank-full" rel="external">…/2026-09-20-rerank-full</a> ·
+    narrative in <a href="https://github.com/xerj-org/xerj/blob/main/docs/research/typesafe-skill-2026-09/NOTES.md" rel="external">docs/research/typesafe-skill-2026-09/NOTES.md</a> ·
+    model pinned <code class="inline">jev-1.13.0</code> throughout.</p>
+</section>
+
+<!-- ============================ 02 · FULL RUN ============================ -->
+<section class="scene-section" id="fullrun">
+  <div class="kicker"><span class="accent">02</span><span class="dash">·</span><span>THE FULL RUN · EVERY JUDGED QUERY, THREE REPEATS</span></div>
+  <h2 class="scene" style="font-size:var(--fs-56);">THEN, THE WHOLE<br><span class="accent">DATASET. TWICE.</span></h2>
+  <p class="wide">300 SciFact queries and 323 NFCorpus queries, BM25 top-30 shortlists fetched once (deterministic),
+  the fixed request shape sent <strong>three times per dataset with the query order shuffled</strong>, per-query medians
+  taken over the repeats. Zero failed requests. The repeats exist because the provider is not deterministic —
+  that finding is below, and it sets the resolution of everything in this section.</p>
+
+  <div class="vt-wrap">
+  <table class="vt">
+    <thead><tr><th>nDCG@10, BEIR <code class="inline">test</code> split</th><th>SciFact · 300 q</th><th>NFCorpus · 323 q</th><th>Run by</th></tr></thead>
+    <tbody>
+      <tr><td>XERJ BM25 (<code class="inline">multi_match</code>, no embedder)</td>
+        <td class="n">0.6572</td><td class="n">0.3016</td><td>us · any node</td></tr>
+      <tr><td>XERJ hybrid RRF (<code class="inline">--embed-mode neural</code>) — measured 2026-09-18, rc.74</td>
+        <td class="n">0.6993</td><td class="n w">0.3448</td><td>us · that run</td></tr>
+      <tr><td><strong>XERJ BM25 top-30, reordered by Jev</strong> (<code class="inline">jev-1.13.0</code>, pinned)</td>
+        <td class="n w">0.7410</td><td class="n">0.3312</td><td>us · this run, median of 3</td></tr>
+      <tr><td>Jev (TypeSafe AI), hosted reranker</td>
+        <td class="n">0.768</td><td class="n">0.358</td><td><strong>not run by us</strong> — published in the hev/jev-rerank README</td></tr>
+      <tr><td>Voyage rerank-3, hosted reranker</td>
+        <td class="n">0.755</td><td class="n">0.357</td><td><strong>not run by us</strong> — same README</td></tr>
+      <tr><td>Cohere rerank-v3.5, hosted reranker</td>
+        <td class="n">0.745</td><td class="n">0.340</td><td><strong>not run by us</strong> — same README</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <ul class="deep">
+    <li><strong>Read the Run by column before the numbers.</strong> The three hosted rows rerank that project's own
+    first-stage shortlists, not XERJ's — same dataset, same metric, nothing else controlled. Our Jev rows rerank
+    <em>XERJ's</em> BM25 top-30, which is the configuration an operator can actually run. The published 0.768 and our
+    0.7410 are not a race; they are two different experiments that share a metric.</li>
+    <li><strong>Where the judge wins and where it doesn't.</strong> On SciFact it lifts the best measured XERJ arm
+    (0.6993 hybrid → 0.7410 reranked). On NFCorpus it does not: BM25+Jev 0.3312 sits <em>below</em> the local hybrid
+    0.3448, and the losses concentrate in medical shorthand, where 30-candidate windows are mostly noise to a
+    general-purpose judge — and in the 25 queries where BM25 returned nothing at all, which no reorder can repair.</li>
+  </ul>
+
+  <div class="vchart">
+    <div class="vc-legend">
+      <b class="xerj">XERJ BM25 — the shortlist</b>
+      <b class="native">BM25 top-30 + Jev — this run</b>
+    </div>
+    <div class="vc-groups">
+      <div class="vc-group">
+        <div class="vc-plot">
+          <div class="vc-col xerj"><span class="vc-v">0.6572</span><i class="vc-bar" style="height:88.7%"></i></div>
+          <div class="vc-col native"><span class="vc-v">0.7410</span><i class="vc-bar" style="height:100%"></i></div>
+        </div>
+        <div class="vc-axis">
+          <span>BM25<span class="sub">no judge</span></span>
+          <span>+ Jev<span class="sub win">82 W · 30 L · 188 T</span></span>
+        </div>
+        <div class="vc-title"><b>SciFact · 300 queries</b> — median of 3 repeats</div>
+      </div>
+      <div class="vc-group">
+        <div class="vc-plot">
+          <div class="vc-col xerj"><span class="vc-v">0.3016</span><i class="vc-bar" style="height:91.1%"></i></div>
+          <div class="vc-col native"><span class="vc-v">0.3312</span><i class="vc-bar" style="height:100%"></i></div>
+        </div>
+        <div class="vc-axis">
+          <span>BM25<span class="sub">no judge</span></span>
+          <span>+ Jev<span class="sub win">118 W · 74 L · 131 T</span></span>
+        </div>
+        <div class="vc-title"><b>NFCorpus · 323 queries</b> — median of 3 repeats</div>
+      </div>
+    </div>
+    <p class="vc-note">W / L / T counted per query against the same run's BM25 arm. Both datasets net positive; neither
+    is a landslide, and NFCorpus's per-query losses are in the table above, not hidden.</p>
+  </div>
+
+  <div class="vt-wrap">
+  <table class="vt">
+    <thead><tr><th>The bill, and the clock</th><th>SciFact</th><th>NFCorpus</th></tr></thead>
+    <tbody>
+      <tr><td>Judge input tokens (document text sent, 3 repeats)</td>
+        <td class="n">9,589,068</td><td class="n">7,618,170</td></tr>
+      <tr><td>Cost at $0.042 / Mtok, input-only</td>
+        <td class="n">$0.4027</td><td class="n">$0.3200</td></tr>
+      <tr><td>Wall clock per query, p50</td>
+        <td class="n">1.49 s</td><td class="n">1.48 s</td></tr>
+      <tr><td>Failed requests</td>
+        <td class="n">0</td><td class="n">0</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="wire">
+    <div class="wp">
+      <div class="wh"><span class="wn">FINDING 1</span><h3>The provider is not deterministic</h3>
+        <span class="wm">900 same-document pairs per dataset</span></div>
+      <p>The same request, three times: mean per-document probability drift
+      <strong>|Δ| 0.0077</strong> (SciFact) / <strong>0.0096</strong> (NFCorpus), max 0.08. Repeat-level nDCG means
+      spanned 0.7422–0.7474 and 0.3285–0.3316. <strong>Any comparison of Jev numbers tighter than ~±0.01 nDCG@10 is
+      measuring noise.</strong> Our repeats were medians for exactly this reason; a single-shot benchmark of a hosted
+      judge is a coin with a ±0.01 bias.</p>
+    </div>
+    <div class="wp">
+      <div class="wh"><span class="wn">FINDING 2</span><h3>The probabilities are not calibrated to BEIR relevance</h3>
+        <span class="wm">9,000 + 7,186 (probability, relevance) pairs</span></div>
+      <p><strong>Expected calibration error 0.1023 on SciFact, 0.1332 on NFCorpus.</strong> The reliability curve is
+      monotone — the model discriminates, it orders documents well — but every bin above 0.2 overstates relevance.
+      On SciFact, documents the model rated around <strong>0.85 were relevant 42% of the time</strong>; on NFCorpus,
+      bin 9 is 0.92 confidence / 0.55 actual. A Jev probability is a usable <em>ordering</em> signal and an unusable
+      <em>threshold</em> against graded human labels: setting <code class="inline">min_score</code> on the raw number
+      cuts documents the qrels call relevant. The curves are in the result JSONs, bin by bin.</p>
+    </div>
+  </div>
+
+  <ul class="deep">
+    <li><strong>About the calibration number you'll meet again below.</strong> The local history vote on this site
+    measured ECE 0.012 on Banking77. That is <em>not</em> a scoreboard win over the judge's 0.10–0.13: the vote was
+    in-domain classification against its own training labels; the judge was scored cross-domain against BEIR's graded
+    human relevance. Calibration is a property of the target, not of the interface. Both numbers are honest on their
+    own task, and neither redeems the other.</li>
+  </ul>
+  <p class="src">Runner and raw JSON: <a href="https://github.com/xerj-org/xerj/tree/main/benchmarks/beir-hybrid/results/2026-09-20-rerank-full" rel="external">benchmarks/beir-hybrid/results/2026-09-20-rerank-full</a>
+    (per-query BM25/median numbers, reliability curves, repeat spreads) · run 2026-09-20 on the wire-compat branch's
+    engine, scoring byte-identical to the hybrid benchmark's <code class="inline">eval.py</code> ·
+    hosted-reranker figures: <a href="https://github.com/hev/jev-rerank" rel="external">hev/jev-rerank</a> (MIT), a third party's, not TypeSafe's and not ours.</p>
+</section>
+
+<!-- ============================ 03 · THE WIRE ============================ -->
+<section class="scene-section" id="wire">
+  <div class="kicker"><span class="accent">03</span><span class="dash">·</span><span>THE WIRE · A XERJ NODE THAT ANSWERS /v1/systemone</span></div>
+  <h2 class="scene" style="font-size:var(--fs-56);">THEN WE ASKED THE<br><span class="accent">QUESTION BACKWARDS.</span></h2>
+  <p class="wide">System One is a documented interface for typed judgement: <code class="inline">POST /v1/systemone</code>
+  with a state, a model, and a map of questions, each answered <code class="inline">noul</code> (a yes/no with a 0–1
+  probability) or <code class="inline">choice</code> (N named options with probabilities). XERJ already had the retrieval
+  answer for exactly that shape of question: <strong>index the labelled history you already have, answer a new question
+  by a rank-weighted vote over its k nearest neighbours, and report the winning label's vote share as the
+  probability</strong> — sub-millisecond, BM25-only, no model. So the node learned to speak the wire.</p>
+
+  <div class="wire">
+    <div class="wp">
+      <div class="wh"><span class="wn">SURFACE 1</span><h3><code class="inline">POST /v1/systemone</code></h3>
+        <span class="wm">native REST · --port + 1</span></div>
+      <p>The documented request and response shape, answered by the vote. A client written for TypeSafe's API works
+      unmodified: <code class="inline">state</code> string or object, <code class="inline">instructions</code> string /
+      object / array, backtick paths (<code class="inline">`documents.doc_0`</code>) resolved against state before the
+      vote text is built, answers keyed exactly by the ids sent — everything the strict clients validate.</p>
+    </div>
+    <div class="wp">
+      <div class="wh"><span class="wn">SURFACE 2</span><h3><code class="inline">POST /_decide</code></h3>
+        <span class="wm">ES-compat port · the audit surface</span></div>
+      <p>The same vote without the wire costume: it names its index per request, and it returns the
+      <strong>evidence</strong> — each neighbour's id, label, the engine's own BM25 score, its 1/rank weight, and its
+      text — so any answer can be checked against the history that produced it. Abstains below
+      <code class="inline">decisions.min_confidence</code>.</p>
+    </div>
+    <div class="wp neg">
+      <div class="wh"><span class="wn">BREAK 1</span><h3><code class="inline">model</code> is echoed truthfully</h3>
+        <span class="wm">deliberate · test-pinned</span></div>
+      <p>The response says <code class="inline">xerj-history-vote-1</code>, never a Jev model name. Echoing
+      <code class="inline">jev-1.13.0</code> would claim these probabilities are the hosted model's; the requested name
+      rides at <code class="inline">decisions.requested_model</code>. This page is about compatibility, and
+      compatibility does not require lying about whose numbers they are.</p>
+    </div>
+    <div class="wp neg">
+      <div class="wh"><span class="wn">BREAK 2</span><h3>Zero support is a 422, never a fabricated 0.5</h3>
+        <span class="wm">deliberate · test-pinned</span></div>
+      <p>A question whose vote finds no labelled neighbour carries no information. The endpoint refuses it — HTTP 422,
+      naming the question ids — rather than inventing a middle probability. A silent 0.5 is exactly the
+      silent-fake defect class this project treats as a bug, wire compatibility or not.</p>
+    </div>
+  </div>
+
+  <h3 class="scene" style="font-size:var(--fs-24); margin-top:var(--sp-8);">The gate: the pip client, unmodified, on a local node</h3>
+  <p class="wide">No SDK of ours, no patches, no subclassing — <code class="inline">pip install jev-reranker</code>
+  (0.1.0, MIT) in a clean venv, its own listwise instruction template, its own splitting, its own strict response
+  validation, pointed at a XERJ node holding 4,000 labelled SMS messages. Two environment variables, and one of them
+  is a trap:</p>
+
+  <pre class="code"><span class="prompt">$</span> pip install jev-reranker
+<span class="prompt">$</span> <span class="cmt"># TYPESAFE_ENDPOINT carries the FULL path — TYPESAFE_BASE_URL is silently ignored</span>
+<span class="prompt">$</span> <span class="cmt"># by this client (reranker.py:238) and the call still goes to the real host.</span>
+<span class="prompt">$</span> export TYPESAFE_ENDPOINT=http://localhost:9441/v1/systemone
+<span class="prompt">$</span> export TYPESAFE_API_KEY=local-only        <span class="cmt"># the node ignores it; localhost only</span>
+<span class="prompt">$</span> python3 gate_run.py
+<span class="out">client resolved model: ['xerj-history-vote-1']
+  1.0000  spam  Please call our customer service representative on 0800 169 6031 betwe
+  1.0000  spam  Great News! Call FREEFONE 08006344447 to claim your guaranteed £1000 C
+  1.0000  spam  URGENT! Your Mobile number has been awarded with a £2000 prize GUARANT
+  0.0000  ham   If you're not in my car in an hour and a half I'm going apeshit
+  0.0000  ham   Carlos says we can pick up from him later so yeah we're set
+  ...                                                     <span class="cmt"># 10 fixed docs, 5+5</span>
+mean noul  spam=0.9014  ham=0.0956  gap=0.8058
+GATE PASSED: unmodified jev-reranker ranked from the XERJ node</span></pre>
+
+  <p class="wide">The client's own validation <em>is</em> the wire gate — answers keyed exactly by the sent ids, every
+  noul numeric in 0..1, model a non-empty string, usage non-negative integers. Surviving it unmodified is the
+  compatibility claim; the spam/ham separation is the semantic one. <strong>Zero requests left the machine:</strong>
+  the vote is an ordinary search of an ordinary index, and the module adds no outbound client.</p>
+
+  <div class="loss">
+    <strong>The first gate attempt failed, and the failure is the most useful thing on this page.</strong> The wire puts
+    the query in <code class="inline">state</code>, and the vote text joins it — so query vocabulary participates in
+    retrieval. With a spam-bearing query ("winner claim prize"), <em>every</em> document retrieved spam neighbours and
+    the vote measured the query, not the documents: spam 1.000 vs ham 0.785, no separation. The fixed gate uses a
+    query whose every term is absent from the corpus ("triage inbox unsolicited correspondence"): 0.9014 vs 0.0956.
+    This is inherent to a retrieval vote, not a defect to fix — <strong>pick the query for the history you
+    have</strong>, and don't let a rerank-shaped habit leak vocabulary into a classification-shaped question.
+  </div>
+
+  <h3 class="scene" style="font-size:var(--fs-24); margin-top:var(--sp-8);">What the vote itself is worth</h3>
+  <p class="wide">Measured earlier on the same engine (<a href="/benchmarks/">the hub's ranking section</a>), on the
+  vote's home ground — labelled history, in-domain classification. <strong>No judge model was run on these datasets by
+  us, and none of these rows say anything about Jev.</strong></p>
+
+  <div class="vt-wrap">
+  <table class="vt">
+    <thead><tr><th>Decisions from labelled history · k = 10 · 1,000 held-out items</th><th>Accuracy</th><th>Calibration error</th><th>Decided at confidence ≥ 0.8</th><th>ms / item</th></tr></thead>
+    <tbody>
+      <tr><td>Banking77, 77-way intent routing — BM25, no model of any kind</td>
+        <td class="n">0.819</td><td class="n">0.089</td><td class="n">50.6% at 0.996</td><td class="n">2.2</td></tr>
+      <tr><td>Banking77 — MiniLM neighbours (<code class="inline">--embed-mode neural</code>)</td>
+        <td class="n w">0.933</td><td class="n w">0.012</td><td class="n w">86.9% at 0.979</td><td class="n">8.6</td></tr>
+      <tr><td>SMS spam, yes / no — BM25, no model of any kind</td>
+        <td class="n w">0.983</td><td class="n">0.017</td><td class="n">95.4% at 0.992</td><td class="n w">0.9</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <pre class="code"><span class="prompt">$</span> <span class="cmt"># the audit surface — same vote, evidence attached</span>
+<span class="prompt">$</span> curl -s localhost:9440/_decide -H 'content-type: application/json' \
+    -d '{"index":"sms","question":"URGENT! Your Mobile number has been awarded"}'
+<span class="out">{"index":"sms","k":10,"label":"spam","confidence":1.0,"abstain":false,
+ "neighbours":[{"_id":"1805","label":"spam",...,"weight":1.0}, ...]}</span></pre>
+
+  <ul class="deep">
+    <li><strong>Read this before quoting the compatibility claim.</strong> The node did not "become a language model."
+      It answers a typed judgement wire from a search over your own labelled history, says so in its model field,
+      refuses what it cannot know (zero support, <code class="inline">score</code>-type ordinal questions), and attaches
+      the neighbours that produced every answer. If you need judgement where you have <em>no</em> history — a new
+      policy, an unseen category — this is the wrong tool, and the hosted judge is the right one. The two ends of the
+      wire are complements, not competitors.</li>
+  </ul>
+  <p class="src">Endpoint: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-api/src/systemone_api.rs" rel="external">engine/crates/xerj-api/src/systemone_api.rs</a> ·
+    14 end-to-end tests: <a href="https://github.com/xerj-org/xerj/blob/main/engine/crates/xerj-api/tests/systemone_http.rs" rel="external">tests/systemone_http.rs</a> ·
+    operator doc: <a href="https://github.com/xerj-org/xerj/blob/main/docs/DECISIONS.md" rel="external">docs/DECISIONS.md</a> ·
+    gate harness and transcript: <a href="https://github.com/xerj-org/xerj/tree/main/benchmarks/systemone-gate" rel="external">benchmarks/systemone-gate</a> ·
+    the vote's own numbers: <a href="https://github.com/xerj-org/xerj/tree/main/benchmarks/decisions-as-retrieval" rel="external">benchmarks/decisions-as-retrieval</a>.</p>
+</section>
+
+<!-- ============================ 04 · ECONOMICS ============================ -->
+<section class="scene-section" id="economics">
+  <div class="kicker"><span class="accent">04</span><span class="dash">·</span><span>THE ECONOMICS · RENTED JUDGEMENT, OWNED DECISIONS</span></div>
+  <h2 class="scene" style="font-size:var(--fs-56);">JUDGEMENT IS RENTED.<br><span class="accent">DECISIONS ARE OWNED.</span></h2>
+  <p class="wide">The full run's bill, next to the vote's, for the same 300-query workload — different tools, priced
+  honestly side by side:</p>
+
+  <div class="vt-wrap">
+  <table class="vt">
+    <thead><tr><th>SciFact-scale workload · 300 queries</th><th>Judge (hosted, this run)</th><th>Vote (local, this engine)</th></tr></thead>
+    <tbody>
+      <tr><td>Cash cost</td>
+        <td class="n">$0.4027 <span class="t">at $0.042/Mtok in</span></td><td class="n w">$0</td></tr>
+      <tr><td>Latency per item, p50</td>
+        <td class="n">1.49 s</td><td class="n w">0.9–2.2 ms</td></tr>
+      <tr><td>Document text that leaves the machine</td>
+        <td class="n l">9.6 M tokens' worth <span class="t">(3 repeats)</span></td><td class="n w">none</td></tr>
+      <tr><td>Works with no labelled history</td>
+        <td class="n w">yes — that is its job</td><td class="n l">no — that is its limit</td></tr>
+      <tr><td>Calibration, on its own target</td>
+        <td class="n">ECE 0.10 <span class="t">cross-domain BEIR</span></td><td class="n">ECE 0.012 <span class="t">in-domain Banking77</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <ul class="deep">
+    <li><strong>Both columns survive contact with the other's weakness.</strong> The judge is the only option where
+    there is no history — and every call is metered, slower, and ships document text to a third party. The vote is
+    free, sub-millisecond, and never leaves the node — and it cannot judge anything your history doesn't already
+    cover. At 300 queries a day the judge costs $0.40 and is irrelevant to your budget — use it freely. At
+    300,000 messages a day it is 1.49 s each — <strong>124 hours of provider latency per day</strong>, however you
+    parallelise it — plus a bill of roughly <strong>$400 a day</strong> at this run's measured rate, plus every one
+    of those messages leaving the node. The vote answers each in under a millisecond, on the node, for nothing.</li>
+    <li><strong>Why the wire matters more than either number.</strong> Every System One client — the reranker, the
+    SDKs, whatever an agent is already holding — now has a second, local implementation of the interface it speaks.
+    Point <code class="inline">TYPESAFE_ENDPOINT</code> at a XERJ node when the questions have history and must stay
+    home; point it at the hosted API when they don't. Same client, same wire, no code change — that is the whole
+    bridge.</li>
+  </ul>
+
+  <div class="loss" style="border-left-color:var(--z-accent);">
+    <strong>What we claim, and what we do not.</strong> Claimed: every number on this page, from the runs cited beside
+    it, on our node, our shortlists, the pinned model. Not claimed: anything about how Jev scores on Banking77 or SMS
+    (TypeSafe has published no such numbers and we ran none — which is why those tables carry no judge row); any
+    zero-shot ability for the local vote; that the published hosted-reranker figures and ours are comparable beyond
+    dataset and metric. TypeSafe AI granted the evaluation key that made §01–§02 possible — the measurements are of
+    their model, through their documented API, and this project thanks them for the access. The findings here are
+    ours, warts published.
+  </div>
+
+  <h3 class="scene" style="font-size:var(--fs-24); margin-top:var(--sp-8);">Reproduce the gate</h3>
+  <pre class="code"><span class="prompt">$</span> git clone https://github.com/xerj-org/xerj && cd xerj/engine
+<span class="prompt">$</span> cargo build --release -p xerj-server
+<span class="prompt">$</span> cat &gt; gate.toml &lt;&lt;'EOF'
+[decisions]
+index          = "sms"
+k              = 10
+label_field    = "label"
+text_field     = "text"
+positive_label = "spam"
+min_confidence = 0.0
+EOF
+<span class="prompt">$</span> ./target/release/xerj --insecure --port 9440 --config gate.toml <span class="cmt"># native REST on 9441</span>
+<span class="prompt">$</span> python3 benchmarks/systemone-gate/gate_load_sms.py   <span class="cmt"># index 4,000 labelled SMS</span>
+<span class="prompt">$</span> python3 -m venv ~/gate-venv &amp;&amp; ~/gate-venv/bin/pip install jev-reranker
+<span class="prompt">$</span> TYPESAFE_ENDPOINT=http://localhost:9441/v1/systemone \
+  TYPESAFE_API_KEY=local-only ~/gate-venv/bin/python benchmarks/systemone-gate/gate_run.py
+<span class="out">mean noul  spam=0.9014  ham=0.0956  gap=0.8058
+GATE PASSED: unmodified jev-reranker ranked from the XERJ node</span></pre>
+  <p class="src">Everything on this page: <a href="https://github.com/xerj-org/xerj/tree/main/benchmarks/beir-hybrid/results/2026-09-20-rerank-pilot" rel="external">the pilot</a> ·
+    <a href="https://github.com/xerj-org/xerj/tree/main/benchmarks/beir-hybrid/results/2026-09-20-rerank-full" rel="external">the full run</a> ·
+    <a href="https://github.com/xerj-org/xerj/tree/main/benchmarks/systemone-gate" rel="external">the gate</a> ·
+    <a href="https://github.com/xerj-org/xerj/blob/main/docs/research/typesafe-skill-2026-09/NOTES.md" rel="external">the research narrative</a> ·
+    measured 2026-09-19..20 · engine at the wire-compat branch, ES-YAML conformance 1371 passed / 0 failed ·
+    related: <a href="/benchmarks/">the benchmarks hub</a> · <a href="/answers/rerank-search-results-calibrated-judge">the rerank stage, documented</a> ·
+    <a href="/benchmarks/elasticsearch">the ES scorecard</a>.</p>
+</section>
+
+<!-- seo:footer-begin — generated by scripts/seo/fix_links.py · do not hand-edit -->
+<nav class="footer-map" aria-label="Site map">
+  <div class="fm-col">
+    <span class="fm-h">PRODUCT</span>
+    <a href="/product">PRODUCT</a>
+    <a href="/architecture/">ARCHITECTURE</a>
+    <a href="/benchmarks/">BENCHMARKS</a>
+    <a href="/pricing/">PRICING</a>
+    <a href="/security/">SECURITY</a>
+    <a href="/playground">DASHBOARDS</a>
+    <a href="/demo/">REAL-DATA DEMO</a>
+    <a href="/aise-demo">PRODUCT TOUR</a>
+  </div>
+  <div class="fm-col">
+    <span class="fm-h">SOLUTIONS</span>
+    <a href="/solutions/">SOLUTIONS</a>
+    <a href="/use-cases">USE CASES</a>
+    <a href="/case-studies">CASE STUDIES</a>
+    <a href="/industries/">INDUSTRIES</a>
+    <a href="/industries/finserv">FINANCIAL SERVICES</a>
+    <a href="/industries/public-sector">PUBLIC SECTOR</a>
+    <a href="/industries/healthcare">HEALTHCARE</a>
+    <a href="/industries/retail">RETAIL</a>
+    <a href="/use-cases/code-security-audit">AI CODE-SECURITY AUDIT</a>
+    <a href="/use-cases/semantic-analytics">SEMANTIC ANALYTICS</a>
+  </div>
+  <div class="fm-col">
+    <span class="fm-h">DOCS</span>
+    <a href="/docs/">DOCUMENTATION</a>
+    <a href="/docs/quickstart">QUICKSTART</a>
+    <a href="/docs/install">INSTALL</a>
+    <a href="/docs/migration-from-es">MIGRATE FROM ELASTICSEARCH</a>
+    <a href="/docs/recipes/">RECIPES</a>
+    <a href="/docs/agents/">DOCS FOR AI</a>
+    <a href="/for-agents">FOR AI AGENTS</a>
+    <a href="/agent-search/">AGENTIC SEARCH DEMO</a>
+    <a href="/answers/">ANSWERS</a>
+    <a href="/compare/">COMPARISONS</a>
+  </div>
+  <div class="fm-col">
+    <span class="fm-h">RESOURCES</span>
+    <a href="/resources/">SALES KIT</a>
+    <a href="/brand">BRAND</a>
+    <a href="/brandbook/">BRAND BOOK</a>
+    <a href="/llms.txt">LLMS.TXT</a>
+    <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
+  </div>
+</nav>
+<!-- seo:footer-end -->
+<footer class="footer">
+  <span>XERJ.AI · V0.1 · 2026</span>
+  <span>SEARCH FOR THE AGENT ERA</span>
+  <span><a href="/product">PRODUCT</a> · <a href="/docs/">DOCS</a> · <a href="/brand">BRAND</a> · <a href="/playground">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
+</footer>
+
+<script>
+  (function () {
+    const root = document.documentElement;
+    for (const btn of document.querySelectorAll('[data-theme]')) {
+      btn.addEventListener('click', () => {
+        const t = btn.getAttribute('data-theme');
+        root.setAttribute('data-theme', t);
+        for (const b of document.querySelectorAll('[data-theme]')) {
+          b.classList.toggle('active', b.getAttribute('data-theme') === t);
+        }
+      });
+    }
+  })();
+</script>
+
+</body>
+</html>
