@@ -98,9 +98,18 @@ format. A failed primary BM25 search still exits with an error. In standalone
 `--mode semantic`, mapping and search HTTP/transport failures exit `2`, rather
 than reporting no match; there are no BM25 results to fall back to.
 
+## Machine-readable retrieval
+
+Pass `--json` to return the search result as JSON, including when no passages
+match. Check both stdout and the exit status: matching results exit `0`, while
+an empty `hits.hits` array exits `1`. A corpus with no live indices still exits
+`3` with a diagnostic on stderr; it is not an empty search result.
+
 ## Tests
 
 ```sh
 tools/xerj-code/tests/test_xc_corpus.sh      # offline; local git fixtures over file://
 python3 tools/xerj-code/tests/test_hybrid_fallback.py  # offline; simulated HTTP failures
+
+python3 tools/xerj-code/tests/test_state_ledger.py  # offline; mocked HTTP responses
 ```
