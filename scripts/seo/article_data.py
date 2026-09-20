@@ -31,9 +31,16 @@ TOP_FIELDS = frozenset({
 # key-by-key and its sources still have to resolve.
 REQUIRED_FIELDS = frozenset({
     "title", "h1", "description", "slug", "cluster", "question", "intent",
-    "published", "author", "reviewer", "schema_type", "links_out",
+    "published", "updated", "author", "reviewer", "schema_type", "links_out",
     "faq",
 })
+# `updated` was optional until #974: an article without it fell back to the
+# content file's git committer date (build_articles.article_modified), so a
+# squash merge re-dated every page regenerated before the merge and main went
+# red on `build_articles --check`.  The field is now materialized in every
+# content source (value = the git date the pages already embedded, so the
+# change was a byte-level no-op on generated output) and required, which makes
+# article dates author-controlled data.
 STRING_FIELDS = frozenset({
     "title", "h1", "description", "slug", "cluster", "question", "intent",
     "author", "reviewer", "schema_type", "agent_prompt",
@@ -396,9 +403,14 @@ def _validate(path: pathlib.Path, values: dict[str, Any], line_map: dict[str, in
                      "schema_type must be TechArticle or Article")
 
     published = _date_value(values, "published", path, line_map, True)
-    updated = _date_value(values, "updated", path, line_map, False)
+    updated = _date_value(values, "updated", path, line_map, True)
 
     values.setdefault("evidence", [])
+    # Optional list fields need a default before the LIST_FIELDS loop reads
+    # them unconditionally; without this a source without `commands:` died
+    # with a bare KeyError instead of a clean schema decision (found by
+    # test_article_schema.py's minimal fixture, #974).
+    values.setdefault("commands", [])
     for key in LIST_FIELDS:
         value = values[key]
         if not isinstance(value, list):
