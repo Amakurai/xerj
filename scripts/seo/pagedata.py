@@ -82,8 +82,8 @@ PAGES: dict[str, dict[str, str]] = {
     ),
     "benchmarks/decisions.html": dict(
         label="Jev measured, wire spoken", kind="software",
-        title="XERJ.ai — Measuring the Jev judge, then speaking the System One wire",
-        description="A rerank stage that measured 0.3822 nDCG@10, was root-caused to one request shape and fixed to 0.8299; a 300-query controlled run of Jev on XERJ shortlists; and a XERJ node that answers /v1/systemone locally — the pip-installed jev-reranker runs against it unmodified.",
+        title="XERJ.ai — We measured the Jev judge. Then we answered its wire.",
+        description="We broke our own Jev rerank stage in public (0.3822 nDCG@10), fixed it, then ran 1,271 judged queries on three public datasets. Then we made XERJ answer the System One wire locally. The pip client runs against it unmodified. Nothing leaves your machine.",
     ),
     "demo/index.html": dict(
         label="Real-data demo", kind="software",

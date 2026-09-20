@@ -34,8 +34,10 @@ HTTP, one connection, distinct items (no cache reuse — every item is new,
 which is the real workload). Run logs: `run-2026-09-20.txt`.
 
 Same-box wire comparison for the same workload class: the hosted Jev API
-measured p50 1,230 ms per item on SciFact-scale shortlists (see
-`../../../beir-hybrid/results/2026-09-20-rerank-full/`); the local vote on
+measured p50 1,230 ms per query on the FiQA rerank run, its fastest of the
+three datasets (see
+`../../../beir-hybrid/results/2026-09-20-rerank-full-fiqa/`; SciFact and
+NFCorpus measured 1.49 s and 1.48 s); the local vote on
 120k history answers `/v1/systemone` at p50 42.7 ms (300 distinct items,
 final binary). Different tools — the vote needs this labelled history, Jev
 needs nothing — so this is a cost/latency/egress contrast, not a quality

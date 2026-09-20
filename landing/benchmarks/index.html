@@ -400,24 +400,24 @@
 
   <div class="vt-wrap">
   <table class="vt">
-    <thead><tr><th>nDCG@10, BEIR <code class="inline">test</code> split</th><th>SciFact · 300 q · 5,183 docs</th><th>NFCorpus · 323 q · 3,633 docs</th><th>Run by</th></tr></thead>
+    <thead><tr><th>nDCG@10, BEIR <code class="inline">test</code> split</th><th>SciFact · 300 q · 5,183 docs</th><th>NFCorpus · 323 q · 3,633 docs</th><th>FiQA · 648 q · 57,638 docs</th><th>Run by</th></tr></thead>
     <tbody>
       <tr><td>XERJ BM25 (<code class="inline">multi_match</code>, no embedder)</td>
-        <td class="n">0.6572</td><td class="n">0.3016</td><td>us · any node</td></tr>
+        <td class="n">0.6572</td><td class="n">0.3016</td><td class="n">0.2382</td><td>us · any node</td></tr>
       <tr><td>XERJ MiniLM vectors only (<code class="inline">semantic</code>)</td>
-        <td class="n">0.6764</td><td class="n">0.3291</td><td>us · <code class="inline">--embed-mode neural</code></td></tr>
+        <td class="n">0.6764</td><td class="n">0.3291</td><td class="n t">not run</td><td>us · <code class="inline">--embed-mode neural</code></td></tr>
       <tr><td>XERJ BM25 top-30, reordered by MiniLM</td>
-        <td class="n">0.6855</td><td class="n">0.3323</td><td>us · <code class="inline">--embed-mode neural</code></td></tr>
+        <td class="n">0.6855</td><td class="n">0.3323</td><td class="n t">not run</td><td>us · <code class="inline">--embed-mode neural</code></td></tr>
       <tr><td><strong>XERJ hybrid RRF</strong> (<code class="inline">hybrid</code>, server-side)</td>
-        <td class="n">0.6993</td><td class="n w">0.3448</td><td>us · <code class="inline">--embed-mode neural</code></td></tr>
+        <td class="n">0.6993</td><td class="n w">0.3448</td><td class="n t">not run</td><td>us · <code class="inline">--embed-mode neural</code></td></tr>
       <tr><td><strong>XERJ BM25 top-30, reordered by Jev</strong> (<code class="inline">jev-1.13.0</code>, pinned)</td>
-        <td class="n w">0.7410</td><td class="n">0.3312</td><td>us · median of 3 repeats — <a href="/benchmarks/decisions">the write-up</a></td></tr>
+        <td class="n w">0.7410</td><td class="n">0.3312</td><td class="n w">0.3638</td><td>us · median of 3 repeats — <a href="/benchmarks/decisions">the write-up</a></td></tr>
       <tr><td>Jev (TypeSafe AI), hosted reranker</td>
-        <td class="n">0.768</td><td class="n">0.358</td><td><strong>not run by us</strong> — published in the hev/jev-rerank README</td></tr>
+        <td class="n">0.768</td><td class="n">0.358</td><td class="n t">no figure</td><td><strong>not run by us</strong> — published in the hev/jev-rerank README</td></tr>
       <tr><td>Voyage rerank-3, hosted reranker</td>
-        <td class="n">0.755</td><td class="n">0.357</td><td><strong>not run by us</strong> — same README</td></tr>
+        <td class="n">0.755</td><td class="n">0.357</td><td class="n t">no figure</td><td><strong>not run by us</strong> — same README</td></tr>
       <tr><td>Cohere rerank-v3.5, hosted reranker</td>
-        <td class="n">0.745</td><td class="n">0.340</td><td><strong>not run by us</strong> — same README</td></tr>
+        <td class="n">0.745</td><td class="n">0.340</td><td class="n t">no figure</td><td><strong>not run by us</strong> — same README</td></tr>
     </tbody>
   </table>
   </div>
@@ -439,9 +439,12 @@
       disaster we published.</strong> With an evaluation key granted by TypeSafe, the stage as it shipped scored
       <strong>0.3822 nDCG@10 against BM25's 0.7750</strong> on a 40-query pilot — our request asked the judge an
       untargeted question, so it judged the pile once and echoed query-level noise. Root-caused, fixed
-      (<strong>0.8299</strong>, raw API 0.8389), then run in full: <strong>0.7410 / 0.3312</strong> over 300+323
-      queries, three repeats. The probabilities order documents well but are <strong>not calibrated to BEIR
-      relevance</strong> (ECE 0.10–0.13) — do not <code class="inline">min_score</code> the raw number.
+      (<strong>0.8299</strong>, raw API 0.8389), then run in full on three datasets:
+      <strong>0.7410 / 0.3312 / 0.3638</strong> over 1,271 judged queries, three repeats each. FiQA is the judge's
+      biggest lift (+0.126 over BM25) and its worst calibration case. The probabilities order documents well but
+      are <strong>not calibrated to BEIR relevance</strong>. ECE runs 0.10–0.31 across the three datasets, and
+      on FiQA documents rated 0.93 were relevant 34% of the time. Do not <code class="inline">min_score</code>
+      the raw number.
       <a href="/benchmarks/decisions">The full autopsy, run and gate</a>. The stage is also the one XERJ feature
       that sends document text off the machine —
       <a href="/answers/rerank-search-results-calibrated-judge">read that before turning it on</a>.</li>
@@ -449,20 +452,22 @@
 
   <div class="vt-wrap">
   <table class="vt">
-    <thead><tr><th>Decisions from labelled history · k = 10 · 1,000 held-out items</th><th>Accuracy</th><th>Calibration error</th><th>Decided at confidence ≥ 0.8</th><th>ms / item</th></tr></thead>
+    <thead><tr><th>Decisions from labelled history · k = 10 · held-out items</th><th>Accuracy</th><th>Calibration error</th><th>Decided at confidence ≥ 0.8</th><th>ms / item</th></tr></thead>
     <tbody>
-      <tr><td>Banking77, 77-way intent routing — BM25, no model of any kind</td>
+      <tr><td>Banking77, 77-way intent routing · 1,000 items — BM25, no model of any kind</td>
         <td class="n">0.819</td><td class="n">0.089</td><td class="n">50.6% at 0.996</td><td class="n">2.2</td></tr>
       <tr><td>Banking77 — MiniLM neighbours (<code class="inline">--embed-mode neural</code>)</td>
         <td class="n w">0.933</td><td class="n w">0.012</td><td class="n w">86.9% at 0.979</td><td class="n">8.6</td></tr>
       <tr><td>Banking77 — hybrid RRF (<code class="inline">--embed-mode neural</code>)</td>
         <td class="n w">0.937</td><td class="n">0.052</td><td class="n">79.2% at 0.989</td><td class="n">12.4</td></tr>
-      <tr><td>SMS spam, yes / no — BM25, no model of any kind</td>
+      <tr><td>SMS spam, yes / no · 1,000 items — BM25, no model of any kind</td>
         <td class="n w">0.983</td><td class="n">0.017</td><td class="n">95.4% at 0.992</td><td class="n w">0.9</td></tr>
       <tr><td>SMS spam — MiniLM neighbours (<code class="inline">--embed-mode neural</code>)</td>
         <td class="n">0.982</td><td class="n">0.009</td><td class="n">95.8% at 0.989</td><td class="n">74.5</td></tr>
       <tr><td>SMS spam — hybrid RRF (<code class="inline">--embed-mode neural</code>)</td>
         <td class="n w">0.989</td><td class="n">0.015</td><td class="n">95.7% at 0.997</td><td class="n">67.2</td></tr>
+      <tr><td>AG News, 4-way topic · 7,600 items · 120,000-deep history — BM25, no model of any kind</td>
+        <td class="n w">0.9182</td><td class="n">0.019</td><td class="n">83.1% at 0.9669</td><td class="n">34.2</td></tr>
     </tbody>
   </table>
   </div>
@@ -472,18 +477,26 @@
       new text by a rank-weighted vote over its ten nearest neighbours. On Banking77 the neural arm settled 86.9%
       of traffic at confidence 0.8 or higher and was right on 0.979 of it, with no tokens spent; only the rest
       needs a judge model or a person. Spam detection reached 0.983 with plain BM25, under a millisecond per
-      message. The vote now also <strong>speaks TypeSafe's System One wire</strong> —
+      message. AG News shows the scale end: 92% of 7,600 four-way topic decisions right against a 120,000-deep
+      history, 34.2 ms per item. The vote now also <strong>speaks TypeSafe's System One wire</strong> —
       <code class="inline">POST /v1/systemone</code> on the native port — so the pip-installed
       <code class="inline">jev-reranker</code> runs against a local XERJ node unmodified, zero egress:
       <a href="/benchmarks/decisions">the write-up</a>.</li>
+    <li><strong>The engine under it got 2.0× faster with bit-identical results.</strong> A full news item is a
+      ~40-clause disjunction whose match set is most of the index, and the generic search path paid full
+      materialisation for it. A WAND-style pruned walk (Broder et al., the same idea tantivy uses) now scores a
+      document only when it can still make the page. 68.7 to 34.2 ms per item over all 7,600 AG News items, same
+      labels, same confidence bands; the three BEIR BM25 figures reproduce to four decimals and the ES-YAML
+      conformance suite stayed at 1371 passed / 0 failed.
+      <a href="https://github.com/xerj-org/xerj/commit/cf6a9989" rel="external">Commit cf6a9989</a>.</li>
     <li><strong>What it is not.</strong> It is not zero-shot: a new category has no history to vote from, and that
       case needs a judge model. XERJ did not run any judge model on these datasets and claims nothing about how
-      one would score. Two datasets, one run each.</li>
+      one would score. Three datasets, one run each.</li>
   </ul>
   <p class="src">Scripts, raw output and reproduce commands:
     <a href="https://github.com/xerj-org/xerj/tree/main/benchmarks/beir-hybrid" rel="external">benchmarks/beir-hybrid</a> ·
     <a href="https://github.com/xerj-org/xerj/tree/main/benchmarks/decisions-as-retrieval" rel="external">benchmarks/decisions-as-retrieval</a> ·
-    run 2026-09-18 on xerj v1.0.0-rc.74 · written up in
+    run 2026-09-18 on xerj v1.0.0-rc.74 · AG News 2026-09-20 on the wire-compat branch engine (cf6a9989) · written up in
     <a href="/answers/hybrid-search-quality-measured-ndcg">hybrid search quality</a> and
     <a href="/answers/classify-text-from-labelled-history-without-llm">decisions without a model call</a>.
     Hosted-reranker figures: <a href="https://github.com/hev/jev-rerank" rel="external">hev/jev-rerank</a> (MIT) ·
