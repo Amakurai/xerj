@@ -128,6 +128,19 @@ impl TopN {
         self.total
     }
 
+    /// The worst hit currently RETAINED (the heap's max by `Ord` = the
+    /// next eviction victim), or `None` while the heap is below `cap` (or
+    /// `cap == 0`).  Read by the WAND walk's pruning check: a candidate
+    /// whose score upper bound is below this cannot be admitted, so it
+    /// never needs scoring at all.
+    pub fn worst(&self) -> Option<&ScoredHit> {
+        if self.cap == 0 || self.heap.len() < self.cap {
+            None
+        } else {
+            self.heap.peek()
+        }
+    }
+
     /// Consume the collector: `(best-first sorted hits, exact total)`.
     pub fn finish(self) -> (Vec<ScoredHit>, u64) {
         let total = self.total;
@@ -592,9 +605,247 @@ impl FtsSearcher {
         cap: usize,
         explain: bool,
     ) -> Result<(Vec<ScoredHit>, u64)> {
+        // WAND fast path for the shape a `match`/`multi_match` query becomes
+        // after planning (`bool{should: [Term..]}`, nothing else).  Only when
+        // nothing downstream needs the generic walk: `explain` needs every
+        // retained hit's breakdown, and `cap == usize::MAX` callers want the
+        // complete match set.
+        if !explain && cap != usize::MAX {
+            if let Some(res) = self.wand_should_bool(query, cap)? {
+                return Ok(res);
+            }
+        }
         // The no-op observer monomorphises away, so this stays byte-identical to
         // the pre-#179 bounded search on the hot (no-delete) path.
         self.search_bounded_observed(query, cap, explain, |_| {})
+    }
+
+    /// Doc-at-a-time top-`cap` evaluation for the exact shape a `match` /
+    /// `multi_match` query becomes after planning: a `bool` with ONLY
+    /// `should` clauses, every clause a plain [`TermQuery`], effective
+    /// `min_should_match == 1`.  Returns `None` for any other shape so the
+    /// caller falls back to the generic path unchanged.
+    ///
+    /// Why this exists: the generic path materialises a `Vec<ScoredHit>` per
+    /// clause, folds them through a `HashMap<u32, u32>` match counter plus a
+    /// `HashMap<u32, f32>` score map, collects the union, and sorts it — fine
+    /// for rare terms, quadratic-feeling for stopwords.  A three-stopword
+    /// `match` over a 120k-doc index (~180k postings, ~100k distinct docs)
+    /// spent ~28 ms there, almost all of it per-posting work that could not
+    /// change the answer: BM25 evaluation + a `field_length` lookup for docs
+    /// that never had a chance of entering a size-10 page.
+    ///
+    /// Design: WAND-style upper-bound pruning (Broder et al., *Faster Top-k
+    /// Document Retrieval Using Block-Max Indexes*; the same dynamic-pruning
+    /// idea as tantivy's `block_wand`, MIT — quickwit-oss/tantivy
+    /// `src/query/boolean_query/block_wand_union.rs`, whose block-max half
+    /// needs impact-ordered postings and skip tables this postings format
+    /// does not carry).  The walk still visits EVERY matching doc — postings
+    /// have no skip lists, and the caller needs an EXACT total — but a doc
+    /// is scored only when the sum of its matched terms' score upper bounds
+    /// (`idf × (k1+1) × boost`, the supremum of `score_term` over any tf/dl)
+    /// can still enter the heap.  For stopword-only docs that bound sum sits
+    //    below the 10th-best score almost immediately, so the entire scoring
+    ///   cost for them disappears; what remains per skipped doc is one
+    ///   cursor compare and one `next()`.
+    ///
+    /// Output identity with the generic path, by construction:
+    /// - **Scores are bit-identical**: the matched terms are summed in
+    ///   CLAUSE order — the same order `execute_bool`'s `score_map`
+    ///   accumulates in — then multiplied by `bq.boost`, so every f32
+    ///   addition happens in the same sequence.
+    /// - **Ordering is identical**: hits pass through the same [`TopN`] /
+    ///   [`ScoredHit`] `Ord`.  A doc is skipped only when its upper bound is
+    ///   STRICTLY below the worst retained score, so a tie-score doc with a
+    ///   smaller `doc_id` (which `Ord` ranks better and `TopN` would admit)
+    ///   is never pruned.
+    /// - **The total is identical**: every matching doc is visited and
+    ///   counted, `[TopN::total]` or not.
+    ///
+    /// Deadline: the walk polls every 4 096 docs; stopping early yields a
+    /// subset of the true hits and an undercount — the same partial-implies-
+    /// narrower contract `execute_bool`'s `run_clauses` already upholds for
+    /// abandoned `should` clauses, surfaced as `timed_out: true` by
+    /// [`Self::deadline_tripped`].
+    fn wand_should_bool(
+        &self,
+        query: &Query,
+        cap: usize,
+    ) -> Result<Option<(Vec<ScoredHit>, u64)>> {
+        let Query::Bool(bq) = query else {
+            return Ok(None);
+        };
+        if bq.must.is_empty()
+            && bq.filter.is_empty()
+            && bq.must_not.is_empty()
+            && !bq.should.is_empty()
+            && bq.min_should_match.unwrap_or(1) == 1
+        {
+            // All clauses must be plain terms (the common `match` shape);
+            // anything richer — phrases, nested bools, wildcards — keeps the
+            // generic path.
+            for q in &bq.should {
+                if !matches!(q, Query::Term(_)) {
+                    return Ok(None);
+                }
+            }
+        } else {
+            return Ok(None);
+        }
+
+        // One cursor per clause, mirroring `scan_term`'s term-lookup and
+        // reader construction (positions decoded per the field's real
+        // layout and simply never read — the format is positions-dependent,
+        // so a docs-only reader would misparse the stream).
+        struct WandTerm<'a, 'b> {
+            /// Clause index — the f32 summation order (see above) and the
+            /// cursor-order tiebreak.
+            ord: usize,
+            tq: &'b TermQuery,
+            bm25: crate::bm25::Bm25Scorer,
+            /// The `doc_freq` the generic path would score with
+            /// (`scoring_df`, i.e. index-wide when collection stats are on).
+            score_df: u64,
+            reader: PostingsReader<'a>,
+            doc: u32,
+            tf: u32,
+            /// Supremum of this term's contribution over any (tf, dl):
+            /// `idf × (k1+1) × boost`.  `tf_norm < k1+1` always, so this
+            /// never underestimates `score_term`.
+            ubound: f32,
+        }
+        let mut scorers: Vec<WandTerm> = Vec::with_capacity(bq.should.len());
+        for (ord, q) in bq.should.iter().enumerate() {
+            // Cooperative deadline on the clause fan-out axis, mirroring
+            // `run_clauses` (poll every 64 clauses): a projected disjunction
+            // can carry tens of thousands of clauses, and dropping a should
+            // clause only narrows the answer — the partial-implies-narrower
+            // contract `execute_bool` already upholds.
+            if ord & 63 == 0 && self.deadline_hit() {
+                break;
+            }
+            let Query::Term(tq) = q else { unreachable!("checked above") };
+            let Some(tp) = self.reader.lookup_term(&tq.field, &tq.term) else {
+                // Term absent from this segment: the clause matches nothing
+                // and contributes no score — exactly the generic path's
+                // empty per-clause `Vec`.
+                continue;
+            };
+            let Some(post_data) = self.reader.postings_data(&tq.field, &tp) else {
+                continue;
+            };
+            // The postings byte format is positions-dependent: a docs-only
+            // reader would synthesise tf=1 and misparse a positions-bearing
+            // stream.  Read the field's real layout, exactly like
+            // `scan_term`; the decoded positions are simply never read.
+            let has_positions = self.reader.field_has_positions(&tq.field);
+            let mut reader =
+                PostingsReader::new_with_positions(post_data, tp.doc_frequency, has_positions);
+            let Some(first) = reader.next() else { continue };
+            let bm25 = self.make_scorer(&tq.field);
+            let score_df = self.scoring_df(&tq.field, &tq.term, tp.doc_frequency as u64);
+            let ubound = bm25.idf(score_df) * (bm25.k1 + 1.0) * tq.boost;
+            scorers.push(WandTerm {
+                ord,
+                tq,
+                bm25,
+                score_df,
+                reader,
+                doc: first.doc_id,
+                tf: first.term_freq,
+                ubound,
+            });
+        }
+        // Cursor order: (doc, ord).  Deterministic, and keeps the scorers
+        // sitting on the same doc contiguous.
+        scorers.sort_by_key(|s| (s.doc, s.ord));
+        if scorers.is_empty() {
+            return Ok(Some((Vec::new(), 0)));
+        }
+
+        let mut top = TopN::new(cap);
+        let mut total: u64 = 0;
+        let mut since_poll: u32 = 0;
+        loop {
+            let d = scorers[0].doc;
+            let k = scorers.iter().take_while(|s| s.doc == d).count();
+
+            // Skip-or-score.  While the heap is below `cap` there is no bar
+            // to clear (and `cap == 0` retains nothing, so never score).
+            // Once full, prune only STRICTLY below the worst retained score:
+            // at equality the candidate could tie the worst score and win
+            // the `doc_id` tiebreak, which `TopN` would admit — so equality
+            // must still be scored.
+            let score_it = match top.worst() {
+                None => cap > 0,
+                Some(worst) => {
+                    let bound: f32 = scorers[..k].iter().map(|s| s.ubound).sum();
+                    bound >= worst.score
+                }
+            };
+            if score_it {
+                // Sum the matched terms in CLAUSE order (bit-identical to
+                // `execute_bool`'s `score_map` accumulation), then apply the
+                // bool boost exactly where the generic path applies it.
+                // `scorers[..k]` is reordered by `ord` IN PLACE — ords are
+                // unique, so the unstable sort is deterministic, and no
+                // per-doc buffer is allocated (a heap alloc per scored doc
+                // was measurable at 120k-doc disjunctions).
+                scorers[..k].sort_unstable_by_key(|s| s.ord);
+                let first_field = scorers[0].tq.field.as_str();
+                let first_len = self.reader.field_length(first_field, d).unwrap_or(1) as u32;
+                let mut sum = 0.0f32;
+                for s in &scorers[..k] {
+                    // Clauses usually share one field (`match`) — look the
+                    // length up once; only multi-field queries pay per field.
+                    let doc_len = if s.tq.field == first_field {
+                        first_len
+                    } else {
+                        self.reader.field_length(&s.tq.field, d).unwrap_or(1) as u32
+                    };
+                    sum += s.bm25.score_term(s.score_df, s.tf, doc_len) * s.tq.boost;
+                }
+                top.push(ScoredHit {
+                    doc_id: d,
+                    score: sum * bq.boost,
+                    explanation: None,
+                });
+            }
+
+            total += 1;
+
+            // Advance every scorer sitting on `d` — exactly `scorers[..k]`
+            // (the sort invariant makes the at-d cursors a prefix).
+            // Exhausted cursors are marked `u32::MAX`, which sorts last, and
+            // pop off after the re-sort.  `sort_unstable` never allocates the
+            // scratch buffer a stable sort spills to on >20-element slices —
+            // this re-sort runs once per DOC, so that alloc was per-doc too.
+            for i in 0..k {
+                match scorers[i].reader.next() {
+                    Some(next) => {
+                        scorers[i].doc = next.doc_id;
+                        scorers[i].tf = next.term_freq;
+                    }
+                    None => scorers[i].doc = u32::MAX,
+                }
+            }
+            scorers.sort_unstable_by_key(|s| (s.doc, s.ord));
+            while scorers.last().is_some_and(|s| s.doc == u32::MAX) {
+                scorers.pop();
+            }
+            if scorers.is_empty() {
+                break;
+            }
+
+            // Cooperative deadline, polled like the expansion loops: partial
+            // = subset of hits + undercount, latched for `timed_out: true`.
+            since_poll += 1;
+            if since_poll & 4095 == 0 && self.deadline_hit() {
+                break;
+            }
+        }
+        let (hits, _) = top.finish();
+        Ok(Some((hits, total)))
     }
 
     /// Like [`Self::search_bounded`], but invokes `observe(doc_id)` once for
@@ -3063,5 +3314,304 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Corpus sized to make the WAND bound actually bite: one term in every
+    /// document (low idf → a tiny score upper bound) beside one term in three
+    /// documents (high idf → the only scores that can fill a page).
+    ///
+    /// Returns the searcher.
+    fn wand_fixture(dir: &std::path::Path) -> FtsSearcher {
+        let registry = Arc::new(AnalyzerRegistry::default());
+        let mut writer = FtsIndexWriter::new(dir, "seg0", Arc::clone(&registry));
+        writer.configure_field(
+            "body",
+            FieldIndexConfig {
+                analyzer: "whitespace".to_owned(),
+                ..Default::default()
+            },
+        );
+        for i in 0..300u32 {
+            // Docs 0..3 carry "needle"; every doc carries "the". Lengths vary
+            // so `field_length` lookups differ across the walk.
+            let text = if i < 3 {
+                format!("the needle pad{i}")
+            } else {
+                format!("the pad{i} filler{}", i % 7)
+            };
+            let fields: HashMap<String, FieldValues> =
+                [("body".to_owned(), FieldValues::from(text))].into_iter().collect();
+            writer.add_document(i, &fields);
+        }
+        writer.finish().unwrap();
+        let reader = Arc::new(FtsIndexReader::open(dir, "seg0", &["body"]).unwrap());
+        FtsSearcher::new(reader, registry)
+    }
+
+    /// The WAND path (`search_bounded` on a should-only bool of terms) must be
+    /// indistinguishable from the generic path — same hits, same order,
+    /// **bit-identical scores**, same exact total — on a corpus where the
+    /// pruning branch genuinely fires, and it must fire by construction, not
+    /// by luck.
+    ///
+    /// The pruning precondition is ASSERTED, not assumed (the lesson of
+    /// `bool_deadline_never_broadens_a_must_not`): once the page holds the
+    /// three needle docs, a "the"-only doc can enter only if
+    /// `idf(the)·(k1+1) ≥ worst-retained-score` — and this test fails loudly
+    /// if that ever stops holding, because then the 297 pruning decisions it
+    /// relies on would not have happened and the equivalence above would be
+    /// passing vacuously over the same docs the legacy test already covers.
+    #[test]
+    fn wand_should_bool_matches_generic_path_when_pruning_fires() {
+        let dir = TempDir::new().unwrap();
+        let searcher = wand_fixture(dir.path());
+
+        let q = Query::Bool(Box::new(
+            BoolQuery::new()
+                .should(Query::Term(TermQuery::new("body", "the")))
+                .should(Query::Term(TermQuery::new("body", "needle"))),
+        ));
+
+        // Reference: usize::MAX never takes the WAND path, so this is the
+        // generic walk's answer in full.
+        let full = searcher.search(&q, usize::MAX, false).unwrap();
+        assert_eq!(full.len(), 300, "every doc matches 'the'");
+        for w in full.windows(2) {
+            assert!(w[0].score >= w[1].score);
+        }
+
+        // --- the non-vacuity precondition ---
+        // The three needle docs must be the page at cap=3, and the common
+        // term's score supremum must sit strictly below that page's worst —
+        // exactly the comparison the walk makes for each of the 297
+        // "the"-only docs.
+        assert_eq!(
+            full[..3].iter().map(|h| h.doc_id).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "the three needle docs must lead the ranking"
+        );
+        let bm25 = searcher.make_scorer("body");
+        let the_df = searcher.scoring_df("body", "the", 300);
+        let the_ubound = bm25.idf(the_df) * (bm25.k1 + 1.0);
+        assert!(
+            the_ubound < full[2].score,
+            "precondition: 'the'-only docs (bound {the_ubound:.4}) must be prunable \
+             against the cap-3 page (worst {:.4}) — otherwise this test exercises \
+             no pruning",
+            full[2].score
+        );
+
+        for cap in [0usize, 1, 2, 3, 5, 300, 305] {
+            let (bounded, total) = searcher.search_bounded(&q, cap, false).unwrap();
+            assert_eq!(total, 300, "exact total must survive pruning at cap={cap}");
+            let expected: Vec<(u32, u32)> = full
+                .iter()
+                .take(cap)
+                .map(|h| (h.doc_id, h.score.to_bits()))
+                .collect();
+            let got: Vec<(u32, u32)> = bounded
+                .iter()
+                .map(|h| (h.doc_id, h.score.to_bits()))
+                .collect();
+            assert_eq!(
+                got, expected,
+                "WAND top-{cap} must be byte-identical to the generic path"
+            );
+        }
+    }
+
+    /// Clause shapes that must NOT take the WAND path (`min_should_match > 1`,
+    /// `must` beside `should`, a non-`Term` should clause) still get correct
+    /// bounded answers — the shape guard falls them through to the generic
+    /// walk, and this pins that the fallthrough, not just the guard, is right.
+    #[test]
+    fn wand_should_bool_falls_back_for_richer_shapes() {
+        let dir = TempDir::new().unwrap();
+        let searcher = wand_fixture(dir.path());
+
+        let shapes: Vec<(&str, Query)> = vec![
+            (
+                "min_should_match=2",
+                Query::Bool(Box::new(
+                    BoolQuery::new()
+                        .should(Query::Term(TermQuery::new("body", "the")))
+                        .should(Query::Term(TermQuery::new("body", "needle")))
+                        .min_should_match(2),
+                )),
+            ),
+            (
+                "must + should",
+                Query::Bool(Box::new(
+                    BoolQuery::new()
+                        .must(Query::Term(TermQuery::new("body", "needle")))
+                        .should(Query::Term(TermQuery::new("body", "the"))),
+                )),
+            ),
+            (
+                "non-Term should clause",
+                Query::Bool(Box::new(
+                    BoolQuery::new()
+                        .should(Query::Term(TermQuery::new("body", "the")))
+                        .should(Query::Prefix(PrefixQuery::new("body", "needl"))),
+                )),
+            ),
+        ];
+
+        for (name, q) in &shapes {
+            let full = searcher.search(q, usize::MAX, false).unwrap();
+            assert!(!full.is_empty(), "{name}: fixture must match something");
+            for cap in [0usize, 1, 2, 3, 10, full.len(), full.len() + 5] {
+                let (bounded, total) = searcher.search_bounded(q, cap, false).unwrap();
+                assert_eq!(
+                    total,
+                    full.len() as u64,
+                    "{name}: total at cap={cap}"
+                );
+                let expected: Vec<(u32, u32)> = full
+                    .iter()
+                    .take(cap)
+                    .map(|h| (h.doc_id, h.score.to_bits()))
+                    .collect();
+                let got: Vec<(u32, u32)> = bounded
+                    .iter()
+                    .map(|h| (h.doc_id, h.score.to_bits()))
+                    .collect();
+                assert_eq!(got, expected, "{name}: top-{cap}");
+            }
+        }
+    }
+
+    /// The WAND path's own clause bookkeeping on the awkward-but-legal edges:
+    /// a DUPLICATE term (two cursors over the same postings, both must land in
+    /// the clause-order sum), a boosted term (the bound must carry the boost
+    /// or pruning would over-prune), an absent term (dropped like the generic
+    /// path's empty per-clause vec), and a bool-level boost (applied exactly
+    /// where the generic path applies it).
+    #[test]
+    fn wand_should_bool_duplicate_boosted_absent_and_bool_boost() {
+        let dir = TempDir::new().unwrap();
+        let searcher = wand_fixture(dir.path());
+
+        let mut tq_dup = TermQuery::new("body", "needle");
+        tq_dup.boost = 2.0;
+        let q = Query::Bool(Box::new(
+            BoolQuery::new()
+                .should(Query::Term(tq_dup))
+                // duplicate clause over the same postings, default boost
+                .should(Query::Term(TermQuery::new("body", "needle")))
+                .should(Query::Term(TermQuery::new("body", "the")))
+                // absent from every doc
+                .should(Query::Term(TermQuery::new("body", "absentterm")))
+                .boost(1.5),
+        ));
+
+        let full = searcher.search(&q, usize::MAX, false).unwrap();
+        assert_eq!(full.len(), 300, "the still matches everything");
+        // The duplicate must actually double-count: each needle doc's score
+        // here exceeds the same doc's single-needle score by roughly the
+        // single contribution (boost 2.0 + 1.0 = 3× vs 1×).
+        let single = Query::Bool(Box::new(
+            BoolQuery::new().should(Query::Term(TermQuery::new("body", "needle"))),
+        ));
+        let single_hits = searcher.search(&single, usize::MAX, false).unwrap();
+        let s0 = single_hits.iter().find(|h| h.doc_id == 0).unwrap().score;
+        let d0 = full.iter().find(|h| h.doc_id == 0).unwrap().score;
+        assert!(
+            d0 > s0 * 4.0,
+            "duplicate + 2.0 boost + 1.5 bool boost must compound: {d0:.4} vs {s0:.4}"
+        );
+
+        for cap in [0usize, 1, 2, 3, 7, 300] {
+            let (bounded, total) = searcher.search_bounded(&q, cap, false).unwrap();
+            assert_eq!(total, 300, "total at cap={cap}");
+            let expected: Vec<(u32, u32)> = full
+                .iter()
+                .take(cap)
+                .map(|h| (h.doc_id, h.score.to_bits()))
+                .collect();
+            let got: Vec<(u32, u32)> = bounded
+                .iter()
+                .map(|h| (h.doc_id, h.score.to_bits()))
+                .collect();
+            assert_eq!(got, expected, "top-{cap} with duplicate/boosted/absent clauses");
+        }
+    }
+
+    /// Micro-bench (ignored by default; run with `--ignored`): the WAND path
+    /// vs the generic bounded walk on a stopword-heavy disjunction over a
+    /// 200k-doc synthetic index — the shape that motivated the fast path.
+    /// `WAND_BENCH="clauses,cap"` (default "3,10") selects the clause count
+    /// and page size; `WAND_BENCH="1,0"` measures the pure walk (nothing ever
+    /// scored).  Asserts result equivalence once so the timing cannot silently
+    /// drift onto unequal answers.
+    #[test]
+    #[ignore]
+    fn bench_wand_vs_generic_stopword_disjunction() {
+        let cfg = std::env::var("WAND_BENCH").unwrap_or_else(|_| "3,10".to_owned());
+        let (nclauses, cap): (usize, usize) = {
+            let mut it = cfg.split(',');
+            (
+                it.next().unwrap_or("3").parse().unwrap(),
+                it.next().unwrap_or("10").parse().unwrap(),
+            )
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry = Arc::new(AnalyzerRegistry::default());
+        let mut writer = FtsIndexWriter::new(dir.path(), "seg0", Arc::clone(&registry));
+        writer.configure_field(
+            "body",
+            FieldIndexConfig {
+                analyzer: "whitespace".to_owned(),
+                ..Default::default()
+            },
+        );
+        const N: u32 = 200_000;
+        let stops = ["the", "of", "and", "to", "in", "is"];
+        for i in 0..N {
+            // Terms of full df (the "stopwords"), a graded mid-df term, and
+            // unique padding for realistic lengths.
+            let mid = if i % 4 == 0 { "mid" } else { "pad" };
+            let text = format!("{} {mid} u{i}", stops[..nclauses.min(stops.len())].join(" "));
+            let fields: HashMap<String, FieldValues> =
+                [("body".to_owned(), FieldValues::from(text))].into_iter().collect();
+            writer.add_document(i, &fields);
+        }
+        writer.finish().unwrap();
+        let reader = Arc::new(FtsIndexReader::open(dir.path(), "seg0", &["body"]).unwrap());
+        let searcher = FtsSearcher::new(reader, registry);
+
+        let mut bq = BoolQuery::new();
+        for t in &stops[..nclauses.min(stops.len())] {
+            bq = bq.should(Query::Term(TermQuery::new("body", *t)));
+        }
+        let q = Query::Bool(Box::new(bq));
+        const REPS: u32 = 20;
+        let _ = searcher.search_bounded(&q, cap, false).unwrap(); // warm
+        let mut wand_us = 0f64;
+        for _ in 0..REPS {
+            let t0 = std::time::Instant::now();
+            let _ = searcher.search_bounded(&q, cap, false).unwrap();
+            wand_us += t0.elapsed().as_secs_f64() * 1e6;
+        }
+        let (g_hits, g_total) = searcher.search_bounded_observed(&q, cap, false, |_| {}).unwrap();
+        let mut gen_us = 0f64;
+        for _ in 0..REPS {
+            let t0 = std::time::Instant::now();
+            let _ = searcher
+                .search_bounded_observed(&q, cap, false, |_| {})
+                .unwrap();
+            gen_us += t0.elapsed().as_secs_f64() * 1e6;
+        }
+        let (w_hits, w_total) = searcher.search_bounded(&q, cap, false).unwrap();
+        assert_eq!(w_total, g_total);
+        assert_eq!(
+            w_hits.iter().map(|h| (h.doc_id, h.score.to_bits())).collect::<Vec<_>>(),
+            g_hits.iter().map(|h| (h.doc_id, h.score.to_bits())).collect::<Vec<_>>(),
+        );
+        println!(
+            "{nclauses}-stopword disjunction over {N} docs (df={N} each), cap={cap}: \
+             generic {gen_us:.0} µs vs WAND {wand_us:.0} µs ({:.1}×), total={w_total}",
+            gen_us / wand_us
+        );
     }
 }
