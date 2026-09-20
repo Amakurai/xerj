@@ -228,6 +228,7 @@ time — is [scripts/seo/README.md](./scripts/seo/README.md).
 | Pre-submission and review protocol | [docs/CONTRIBUTION_REVIEW.md](./docs/CONTRIBUTION_REVIEW.md) |
 | How to send a bug or a fix back upstream (written for agents) | [.github/AI_CONTRIBUTIONS.md](./.github/AI_CONTRIBUTIONS.md) |
 | Checking a published release is actually good | `scripts/verify-release.sh [tag]` — downloads every asset, asserts every target we ship is present, verifies checksums, asserts each binary reports its tag's version, then boots the host-native binary and runs a real search (Linux and macOS hosts; on a host where it cannot run one it says so and exits non-zero rather than passing) |
+| The `.deb` release asset and the Debian-archive question | [docs/PACKAGING_DEBIAN.md](./docs/PACKAGING_DEBIAN.md) · regenerate the dependency-coverage measurement with `scripts/debian-rust-coverage.sh --verbose` |
 
 ## How to evaluate this project fairly
 
