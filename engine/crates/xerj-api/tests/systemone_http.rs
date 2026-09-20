@@ -79,7 +79,13 @@ async fn gate_node() -> Node {
 }
 
 impl Node {
-    async fn call(&self, router: &axum::Router, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
+    async fn call(
+        &self,
+        router: &axum::Router,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
         let response = router
             .clone()
             .oneshot(
@@ -103,10 +109,12 @@ impl Node {
     }
 
     async fn systemone(&self, body: Value) -> (StatusCode, Value) {
-        self.call(&self.native.clone(), "POST", "/v1/systemone", body).await
+        self.call(&self.native.clone(), "POST", "/v1/systemone", body)
+            .await
     }
     async fn models(&self) -> (StatusCode, Value) {
-        self.call(&self.native.clone(), "GET", "/v1/models", json!({})).await
+        self.call(&self.native.clone(), "GET", "/v1/models", json!({}))
+            .await
     }
     async fn decide(&self, body: Value) -> (StatusCode, Value) {
         self.call(&self.app.clone(), "POST", "/_decide", body).await
@@ -139,13 +147,21 @@ async fn seed(node: &Node, index: &str, docs: &[(&str, &str, &str)]) {
         assert!(st.is_success(), "index {index}/{id}: {st} {b}");
     }
     let (st, b) = node
-        .call(&node.app.clone(), "POST", &format!("/{index}/_refresh"), json!({}))
+        .call(
+            &node.app.clone(),
+            "POST",
+            &format!("/{index}/_refresh"),
+            json!({}),
+        )
         .await;
     assert!(st.is_success(), "refresh {index}: {st} {b}");
 }
 
 fn reason(r: &Value) -> String {
-    r["error"]["reason"].as_str().unwrap_or_default().to_string()
+    r["error"]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -205,7 +221,10 @@ async fn answers_a_jev_reranker_shaped_request_with_backtick_references() {
     for id in ["d0", "d1"] {
         let a = answers.get(id).unwrap_or(&Value::Null);
         // Clients parse answers strictly: exactly the documented fields.
-        let keys: Vec<&str> = a.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+        let keys: Vec<&str> = a
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
         assert_eq!(keys, vec!["type", "noul"], "{id}: {a}");
         assert_eq!(a["type"], "noul");
     }
@@ -285,7 +304,10 @@ async fn choice_answers_carry_a_probability_for_every_option() {
     keys.sort_unstable();
     assert_eq!(keys, vec!["billing", "tech"], "{probs:?}");
     let sum: f64 = probs.values().filter_map(Value::as_f64).sum();
-    assert!((sum - 1.0).abs() < 1e-4, "probabilities sum to {sum}: {probs:?}");
+    assert!(
+        (sum - 1.0).abs() < 1e-4,
+        "probabilities sum to {sum}: {probs:?}"
+    );
     // The choice is the argmax of the reported probabilities, and the
     // confidence is that option's own probability.
     let (argmax, _) = probs
@@ -299,7 +321,9 @@ async fn choice_answers_carry_a_probability_for_every_option() {
 
     // The same vote through /_decide names its neighbours; the probabilities
     // above must be the weighted shares of exactly those neighbours.
-    let (st2, d) = node.decide(json!({"index": "mixed", "question": vote})).await;
+    let (st2, d) = node
+        .decide(json!({"index": "mixed", "question": vote}))
+        .await;
     assert!(st2.is_success(), "{d}");
     let total: f64 = d["neighbours"]
         .as_array()
@@ -362,7 +386,10 @@ async fn zero_support_is_an_error_naming_the_question_not_a_half() {
     assert!(why.contains("`d0`"), "{why}");
     assert!(why.contains("`d1`"), "{why}");
     assert!(!r.to_string().contains("0.5"), "no fabricated halves: {r}");
-    assert!(r["answers"].is_null(), "no half-answered judgement history: {r}");
+    assert!(
+        r["answers"].is_null(),
+        "no half-answered judgement history: {r}"
+    );
 }
 
 /// Until `[decisions] index` names an index, the endpoint says 503 — not a
@@ -427,7 +454,10 @@ async fn more_than_300_questions_is_refused() {
     let node = gate_node().await;
     let mut questions = serde_json::Map::new();
     for i in 0..301 {
-        questions.insert(format!("d{i}"), json!({"type": "noul", "instructions": "refund"}));
+        questions.insert(
+            format!("d{i}"),
+            json!({"type": "noul", "instructions": "refund"}),
+        );
     }
     let (st, r) = node
         .systemone(json!({"state": "refund", "questions": Value::Object(questions)}))
@@ -454,7 +484,10 @@ async fn decide_returns_its_neighbours_and_honours_per_request_k() {
     assert_eq!(r["index"], "history");
     assert_eq!(r["k"], 1);
     assert_eq!(r["label"], "true");
-    assert!((r["confidence"].as_f64().unwrap_or(0.0) - 1.0).abs() < 1e-9, "{r}");
+    assert!(
+        (r["confidence"].as_f64().unwrap_or(0.0) - 1.0).abs() < 1e-9,
+        "{r}"
+    );
     assert_eq!(r["abstain"], json!(false));
     let neighbours = r["neighbours"].as_array().expect("neighbours");
     assert_eq!(neighbours.len(), 1, "k=1: {neighbours:?}");
@@ -462,7 +495,10 @@ async fn decide_returns_its_neighbours_and_honours_per_request_k() {
     assert_eq!(n["_id"], "h1");
     assert_eq!(n["label"], "true");
     assert!(n["_score"].as_f64().is_some(), "engine score: {n}");
-    assert!(n["text"].as_str().is_some_and(|t| t.contains("refund")), "{n}");
+    assert!(
+        n["text"].as_str().is_some_and(|t| t.contains("refund")),
+        "{n}"
+    );
 
     // Full k: both refund docs are neighbours, weights reciprocal in rank.
     let (_, r) = node
@@ -500,7 +536,12 @@ async fn decide_abstains_below_min_confidence_and_on_no_neighbours() {
         .await;
     assert!(st.is_success(), "{r}");
     assert_eq!(r["abstain"], json!(true));
-    assert!(r["reason"].as_str().is_some_and(|s| s.contains("min_confidence")), "{r}");
+    assert!(
+        r["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains("min_confidence")),
+        "{r}"
+    );
 
     // Nothing matches at all: abstain with the no-neighbour reason.
     let (st, r) = strict
@@ -509,7 +550,12 @@ async fn decide_abstains_below_min_confidence_and_on_no_neighbours() {
     assert!(st.is_success(), "{r}");
     assert_eq!(r["abstain"], json!(true));
     assert!(r["label"].is_null(), "{r}");
-    assert!(r["reason"].as_str().is_some_and(|s| s.contains("no labelled neighbour")), "{r}");
+    assert!(
+        r["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains("no labelled neighbour")),
+        "{r}"
+    );
 }
 
 #[tokio::test]

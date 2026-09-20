@@ -667,11 +667,7 @@ impl FtsSearcher {
     /// narrower contract `execute_bool`'s `run_clauses` already upholds for
     /// abandoned `should` clauses, surfaced as `timed_out: true` by
     /// [`Self::deadline_tripped`].
-    fn wand_should_bool(
-        &self,
-        query: &Query,
-        cap: usize,
-    ) -> Result<Option<(Vec<ScoredHit>, u64)>> {
+    fn wand_should_bool(&self, query: &Query, cap: usize) -> Result<Option<(Vec<ScoredHit>, u64)>> {
         let Query::Bool(bq) = query else {
             return Ok(None);
         };
@@ -724,7 +720,9 @@ impl FtsSearcher {
             if ord & 63 == 0 && self.deadline_hit() {
                 break;
             }
-            let Query::Term(tq) = q else { unreachable!("checked above") };
+            let Query::Term(tq) = q else {
+                unreachable!("checked above")
+            };
             let Some(tp) = self.reader.lookup_term(&tq.field, &tq.term) else {
                 // Term absent from this segment: the clause matches nothing
                 // and contributes no score — exactly the generic path's
@@ -820,13 +818,13 @@ impl FtsSearcher {
             // pop off after the re-sort.  `sort_unstable` never allocates the
             // scratch buffer a stable sort spills to on >20-element slices —
             // this re-sort runs once per DOC, so that alloc was per-doc too.
-            for i in 0..k {
-                match scorers[i].reader.next() {
+            for s in scorers.iter_mut().take(k) {
+                match s.reader.next() {
                     Some(next) => {
-                        scorers[i].doc = next.doc_id;
-                        scorers[i].tf = next.term_freq;
+                        s.doc = next.doc_id;
+                        s.tf = next.term_freq;
                     }
-                    None => scorers[i].doc = u32::MAX,
+                    None => s.doc = u32::MAX,
                 }
             }
             scorers.sort_unstable_by_key(|s| (s.doc, s.ord));
@@ -3340,7 +3338,9 @@ mod tests {
                 format!("the pad{i} filler{}", i % 7)
             };
             let fields: HashMap<String, FieldValues> =
-                [("body".to_owned(), FieldValues::from(text))].into_iter().collect();
+                [("body".to_owned(), FieldValues::from(text))]
+                    .into_iter()
+                    .collect();
             writer.add_document(i, &fields);
         }
         writer.finish().unwrap();
@@ -3462,11 +3462,7 @@ mod tests {
             assert!(!full.is_empty(), "{name}: fixture must match something");
             for cap in [0usize, 1, 2, 3, 10, full.len(), full.len() + 5] {
                 let (bounded, total) = searcher.search_bounded(q, cap, false).unwrap();
-                assert_eq!(
-                    total,
-                    full.len() as u64,
-                    "{name}: total at cap={cap}"
-                );
+                assert_eq!(total, full.len() as u64, "{name}: total at cap={cap}");
                 let expected: Vec<(u32, u32)> = full
                     .iter()
                     .take(cap)
@@ -3533,7 +3529,10 @@ mod tests {
                 .iter()
                 .map(|h| (h.doc_id, h.score.to_bits()))
                 .collect();
-            assert_eq!(got, expected, "top-{cap} with duplicate/boosted/absent clauses");
+            assert_eq!(
+                got, expected,
+                "top-{cap} with duplicate/boosted/absent clauses"
+            );
         }
     }
 
@@ -3571,9 +3570,14 @@ mod tests {
             // Terms of full df (the "stopwords"), a graded mid-df term, and
             // unique padding for realistic lengths.
             let mid = if i % 4 == 0 { "mid" } else { "pad" };
-            let text = format!("{} {mid} u{i}", stops[..nclauses.min(stops.len())].join(" "));
+            let text = format!(
+                "{} {mid} u{i}",
+                stops[..nclauses.min(stops.len())].join(" ")
+            );
             let fields: HashMap<String, FieldValues> =
-                [("body".to_owned(), FieldValues::from(text))].into_iter().collect();
+                [("body".to_owned(), FieldValues::from(text))]
+                    .into_iter()
+                    .collect();
             writer.add_document(i, &fields);
         }
         writer.finish().unwrap();
@@ -3593,7 +3597,9 @@ mod tests {
             let _ = searcher.search_bounded(&q, cap, false).unwrap();
             wand_us += t0.elapsed().as_secs_f64() * 1e6;
         }
-        let (g_hits, g_total) = searcher.search_bounded_observed(&q, cap, false, |_| {}).unwrap();
+        let (g_hits, g_total) = searcher
+            .search_bounded_observed(&q, cap, false, |_| {})
+            .unwrap();
         let mut gen_us = 0f64;
         for _ in 0..REPS {
             let t0 = std::time::Instant::now();
@@ -3605,8 +3611,14 @@ mod tests {
         let (w_hits, w_total) = searcher.search_bounded(&q, cap, false).unwrap();
         assert_eq!(w_total, g_total);
         assert_eq!(
-            w_hits.iter().map(|h| (h.doc_id, h.score.to_bits())).collect::<Vec<_>>(),
-            g_hits.iter().map(|h| (h.doc_id, h.score.to_bits())).collect::<Vec<_>>(),
+            w_hits
+                .iter()
+                .map(|h| (h.doc_id, h.score.to_bits()))
+                .collect::<Vec<_>>(),
+            g_hits
+                .iter()
+                .map(|h| (h.doc_id, h.score.to_bits()))
+                .collect::<Vec<_>>(),
         );
         println!(
             "{nclauses}-stopword disjunction over {N} docs (df={N} each), cap={cap}: \

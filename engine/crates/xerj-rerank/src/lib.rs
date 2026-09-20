@@ -552,7 +552,6 @@ impl RerankConfig {
 
         Ok(cfg)
     }
-
 }
 
 /// Truncate on a char boundary. Byte slicing a `&str` here would panic on any

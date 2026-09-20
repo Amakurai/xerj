@@ -1030,7 +1030,9 @@ async fn wire_shape_bearer_auth_model_and_one_noul_per_document_keyed_identicall
             "{key}: the question must name the field it judges: {text}"
         );
         assert!(
-            instructions["document"].as_str().is_some_and(|d| !d.is_empty()),
+            instructions["document"]
+                .as_str()
+                .is_some_and(|d| !d.is_empty()),
             "{key}: the candidate itself travels with its question"
         );
     }
@@ -2216,8 +2218,13 @@ async fn the_matching_passage_is_judgeable_and_goes_first() {
         // tail and never the part that matched.
         let (title, rest) = text.split_once(". ").unwrap_or(("", text));
         assert!(
-            ["Bone health basics", "Trial results", "Cooking", "Density of materials"]
-                .contains(&title),
+            [
+                "Bone health basics",
+                "Trial results",
+                "Cooking",
+                "Density of materials"
+            ]
+            .contains(&title),
             "{key}: the returned title joins its document: {text:?}"
         );
         let first_line = rest.lines().next().unwrap_or_default();

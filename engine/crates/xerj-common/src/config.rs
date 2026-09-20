@@ -2292,7 +2292,6 @@ impl RerankProviderConfig {
     }
 }
 
-
 /// Typed decisions (`/v1/systemone`, `/_decide`) answered locally by a
 /// weighted nearest-neighbour vote over a labelled-history index — the
 /// retrieval analogue of a judge model, with the evidence staying on the node.

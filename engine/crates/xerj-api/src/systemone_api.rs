@@ -140,8 +140,10 @@ pub async fn systemone(
                 );
             }
             Kind::Choice { options } => {
-                let criteria_total: f64 =
-                    options.iter().map(|o| weight_by_label.get(o.as_str()).copied().unwrap_or(0.0)).sum();
+                let criteria_total: f64 = options
+                    .iter()
+                    .map(|o| weight_by_label.get(o.as_str()).copied().unwrap_or(0.0))
+                    .sum();
                 if criteria_total <= 0.0 {
                     unsupported.push(id.clone());
                     continue;
@@ -150,7 +152,9 @@ pub async fn systemone(
                 for option in options {
                     probabilities.insert(
                         option.clone(),
-                        json!(round6(weight_by_label.get(option.as_str()).copied().unwrap_or(0.0) / total)),
+                        json!(round6(
+                            weight_by_label.get(option.as_str()).copied().unwrap_or(0.0) / total
+                        )),
                     );
                 }
                 let (winner, _) = options
@@ -187,7 +191,11 @@ pub async fn systemone(
         return no_support(&unsupported, &cfg);
     }
 
-    let _ = state.metrics.record_query(&cfg.index, "systemone_vote", started.elapsed().as_secs_f64());
+    state.metrics.record_query(
+        &cfg.index,
+        "systemone_vote",
+        started.elapsed().as_secs_f64(),
+    );
     Json(json!({
         "model": MODEL_ID,
         "answers": Value::Object(answers),
@@ -264,11 +272,11 @@ pub async fn decide(
     cfg.label_field = defaults.label_field.clone();
     cfg.text_field = defaults.text_field.clone();
 
-    let neighbours = match vote_neighbours(&state, &cfg, &clip(&question, MAX_VOTE_TEXT_CHARS)).await
-    {
-        Ok(n) => n,
-        Err(resp) => return resp,
-    };
+    let neighbours =
+        match vote_neighbours(&state, &cfg, &clip(&question, MAX_VOTE_TEXT_CHARS)).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
     let total: f64 = neighbours.iter().map(|(w, _, _)| *w).sum();
     let mut weight_by_label: BTreeMap<String, f64> = BTreeMap::new();
     for (w, label, _) in &neighbours {
@@ -311,7 +319,7 @@ pub async fn decide(
             })
         })
         .collect();
-    let _ = state
+    state
         .metrics
         .record_query(&index, "decide", started.elapsed().as_secs_f64());
 
@@ -355,7 +363,9 @@ fn parse_question(id: &str, q: &Value, state_val: &Value) -> Result<Question, St
             let criteria = obj
                 .get("criteria")
                 .and_then(Value::as_object)
-                .ok_or_else(|| format!("question `{id}` is a choice and needs `criteria` naming its options"))?;
+                .ok_or_else(|| {
+                    format!("question `{id}` is a choice and needs `criteria` naming its options")
+                })?;
             if criteria.is_empty() || criteria.len() > MAX_CHOICE_OPTIONS {
                 return Err(format!(
                     "question `{id}`: `criteria` must name 1..{MAX_CHOICE_OPTIONS} options (got {})",
@@ -434,7 +444,11 @@ async fn vote_neighbours(
     });
     let search_req = match parse_request(&query_body) {
         Ok(r) => r,
-        Err(e) => return Err(unprocessable(&format!("internal query would not parse: {e}"))),
+        Err(e) => {
+            return Err(unprocessable(&format!(
+                "internal query would not parse: {e}"
+            )))
+        }
     };
     let result = match idx.search(&search_req).await {
         Ok(r) => r,
@@ -568,7 +582,10 @@ fn no_support(ids: &[String], cfg: &DecisionsConfig) -> axum::response::Response
             cfg.index,
             cfg.k,
             if ids.len() == 1 { "" } else { "s" },
-            ids.iter().map(|i| format!("`{i}`")).collect::<Vec<_>>().join(", ")
+            ids.iter()
+                .map(|i| format!("`{i}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     )
 }
