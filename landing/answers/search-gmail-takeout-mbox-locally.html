@@ -65,7 +65,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-09-18",
-  "dateModified": "2026-09-19",
+  "dateModified": "2026-09-20",
   "author": {
     "@type": "Person",
     "name": "XERJ documentation team"
@@ -232,7 +232,7 @@
   <div class="breadcrumb"><a href="/">HOME</a><span class="sep">·</span><a href="/answers/">ANSWERS</a><span class="sep">·</span>I EXPORTED MY GMAIL WITH GOOGLE TAKEOUT. HOW DO I SEARCH THAT MBOX FILE LOCALLY?</div>
   <div class="kicker"><span>ANSWERS · FOLDER INDEXING</span></div>
   <h1>I exported my Gmail with Google Takeout. How do I search that mbox file locally?</h1>
-  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-09-19</div>
+  <div class="source-note">AUTHOR · XERJ documentation team · REVIEWED BY · XERJ engineering team · PUBLISHED · 2026-09-18 · UPDATED · 2026-09-20</div>
   <p><strong>TL;DR</strong> — Unzip the Takeout download, run <code class="inline">xerj autoindex</code> on the folder with its own <code class="inline">--prefix</code>, then search the mailbox over HTTP. The mbox is recognised by its content and streamed one message at a time. Attached PDFs become per-page documents linked to their message. Senders are filterable by bare address, and Gmail thread ids and reply headers become filters and graph edges. With the default embedder, which is lexical (feature hashing, not neural), no message text leaves your machine. The node's memory is the limit today: at a 16 GiB laptop's memory cap, a 300 MB mailbox already drove the node past that laptop's RAM in our runs.</p>
   <div class="prompt-card">
     <span class="prompt-label">PASTE THIS TO YOUR AI AGENT — IT DOES THE REST</span>

@@ -413,7 +413,7 @@
       "canonical_url": "https://xerj.org/answers/search-gmail-takeout-mbox-locally",
       "markdown_url": "https://xerj.org/answers/search-gmail-takeout-mbox-locally.md",
       "cluster": "Folder indexing",
-      "updated": "2026-09-19",
+      "updated": "2026-09-20",
       "summary": "Unzip the export, run xerj autoindex on the folder, and search messages, threads and attached PDF pages over HTTP. The mailbox is streamed, and with the default embedder no message text leaves your machine."
     },
     {
@@ -494,7 +494,7 @@
       "canonical_url": "https://xerj.org/answers/autoindex-says-extract-the-archive-first",
       "markdown_url": "https://xerj.org/answers/autoindex-says-extract-the-archive-first.md",
       "cluster": "Operations: exit codes",
-      "updated": "2026-09-19",
+      "updated": "2026-09-20",
       "summary": "autoindex never opens archives. A .zip, .tgz, .7z, .rar or .xz is marked as junk with the exact extraction command; the run continues. Index the extracted folder."
     },
     {
