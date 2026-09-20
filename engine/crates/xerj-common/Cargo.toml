@@ -26,6 +26,12 @@ prometheus.workspace = true
 # Machine probes for `resource`: sysconf/sysctl/setpriority. No abstraction
 # layer buys anything here — the calls differ per platform by design.
 libc = "0.2"
+# `localauth`: real URL parsing for the loopback guard. Already in the graph
+# via reqwest (which re-exports this exact type as `reqwest::Url`), so this
+# adds an edge, not a second URL parser. Hand-rolled host surgery is how the
+# `http://localhost:9200@evil.com/` userinfo leak happened — see
+# src/localauth.rs.
+url = "2"
 
 [dev-dependencies]
 tempfile.workspace = true

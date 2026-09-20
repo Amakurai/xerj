@@ -39,6 +39,11 @@ OPTIONS:
 
 After init: restart the agent session so it picks up the new tools, then
 `xerj autoindex <folder>` anything you want searchable.
+
+Auth: nothing secret is written (`.mcp.json` is meant to be committed). For a
+loopback node the MCP server reads <data-dir>/admin.key by itself and says so
+on stderr; for any other node add \"XERJ_AUTH\": \"ApiKey <key>\" to the env
+block — init prints which case you are in.
 ";
 
 /// The ten-line teaching file. One idea per line, no filler: what the tools
@@ -247,6 +252,36 @@ pub(crate) fn run_init_in(cwd: &Path, url: &str, dry: bool) -> Result<Vec<String
         }
     }
 
+    // 5) Auth note — say plainly what will happen at tool-call time (#961).
+    //
+    // `.mcp.json` is Claude Code *project* scope, i.e. a file meant to be
+    // committed, so init deliberately writes no credential into it; auth is
+    // ON by default, and the gap between "ran xerj init" and "tools work"
+    // used to be a silent 401 on the first tool call. The MCP server now
+    // falls back to the local admin key for loopback nodes by itself; here
+    // we only tell the user which of the two worlds they are in — the key
+    // itself is never printed or written.
+    if xerj_common::localauth::url_is_loopback(url) {
+        match xerj_common::localauth::discover_local_admin_key() {
+            Some((_, path)) => out.push(format!(
+                "  auth     MCP authenticates with the admin key at {} (local node)",
+                path.display()
+            )),
+            None => out.push(
+                "  auth     no --auth given and no local admin key found; if the node at \
+                 {url} runs with auth on, add \"XERJ_AUTH\": \"ApiKey <key>\" to the \
+                 .mcp.json env — the key is the node's <data-dir>/admin.key"
+                    .to_string(),
+            ),
+        }
+    } else {
+        out.push(format!(
+            "  auth     {url} is not local, so no admin key is auto-discovered for it; \
+                 if the node runs with auth on, add \"XERJ_AUTH\": \"ApiKey <key>\" to \
+                 the .mcp.json env — the key is the node's <data-dir>/admin.key"
+        ));
+    }
+
     Ok(out)
 }
 
@@ -302,7 +337,14 @@ mod tests {
         let lines = run_init_in(d.path(), "http://x:1", false).unwrap();
         let second = fs::read_to_string(d.path().join("AGENTS.md")).unwrap();
         assert_eq!(first, second, "AGENTS.md must not grow on re-run");
-        assert!(lines.iter().all(|l| l.contains("kept")), "{lines:?}");
+        // "kept" for every surface; the only other line init emits is the
+        // auth note (section 5), which rewrites nothing.
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.contains("kept") || l.contains("auth")),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -333,5 +375,108 @@ mod tests {
         fs::create_dir_all(d.path().join(".cursor")).unwrap();
         run_init_in(d.path(), "http://x:1", false).unwrap();
         assert!(d.path().join(".cursor/rules/xerj.mdc").exists());
+    }
+
+    // ── auth note (#961) ────────────────────────────────────────────────
+
+    /// The auth note reads the working directory and `HOME` (that is what
+    /// admin-key discovery does), so its tests sandbox both — serialised,
+    /// because they are per-process state.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct Sandbox {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        dir: tempfile::TempDir,
+        previous_dir: PathBuf,
+        previous_home: Option<std::ffi::OsString>,
+    }
+
+    impl Sandbox {
+        fn new() -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let previous_dir = std::env::current_dir().unwrap();
+            let previous_home = std::env::var_os("HOME");
+            std::env::set_current_dir(dir.path()).unwrap();
+            std::env::set_var("HOME", dir.path().join("home"));
+            Self {
+                _lock: lock,
+                dir,
+                previous_dir,
+                previous_home,
+            }
+        }
+
+        fn write(&self, relative: &str, contents: &str) {
+            let path = self.dir.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous_dir).unwrap();
+            match &self.previous_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// The happy path of #961: a local node's key exists, init says the MCP
+    /// server will use it — and the secret still goes nowhere near the
+    /// committable `.mcp.json`.
+    #[test]
+    fn auth_note_names_the_discovered_key_and_writes_no_secret() {
+        let sandbox = Sandbox::new();
+        sandbox.write("data/admin.key", "local-admin-key\n");
+        let lines = run_init_in(sandbox.dir.path(), "http://localhost:9200", false).unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("admin key at") && l.ends_with("data/admin.key (local node)")),
+            "the note must name the file the MCP server will use: {lines:?}"
+        );
+        let mcp = fs::read_to_string(sandbox.dir.path().join(".mcp.json")).unwrap();
+        assert!(
+            !mcp.contains("local-admin-key") && !mcp.contains("XERJ_AUTH"),
+            "a credential must never be written into a committable file: {mcp}"
+        );
+    }
+
+    /// No key on disk: the note must say the manual step plainly instead of
+    /// letting the first tool call be the user's first 401.
+    #[test]
+    fn auth_note_gives_the_manual_step_when_no_key_exists() {
+        let sandbox = Sandbox::new();
+        let lines = run_init_in(sandbox.dir.path(), "http://localhost:9200", false).unwrap();
+        let note = lines
+            .iter()
+            .find(|l| l.contains("auth"))
+            .expect("the auth note is always present");
+        assert!(
+            note.contains("XERJ_AUTH") && note.contains("admin.key"),
+            "the fallback note must name the env var and the key file: {note}"
+        );
+    }
+
+    /// A non-loopback URL never triggers discovery, even with a local key
+    /// sitting right there — reading it would only encourage sending it
+    /// off-box.
+    #[test]
+    fn remote_url_gets_no_discovery_even_with_a_local_key_present() {
+        let sandbox = Sandbox::new();
+        sandbox.write("data/admin.key", "local-admin-key\n");
+        let lines =
+            run_init_in(sandbox.dir.path(), "http://search.example.com:9200", false).unwrap();
+        let note = lines
+            .iter()
+            .find(|l| l.contains("auth"))
+            .expect("the auth note is always present");
+        assert!(
+            note.contains("XERJ_AUTH") && !note.contains("admin key at"),
+            "a remote node gets the manual step, never a local key: {note}"
+        );
     }
 }
