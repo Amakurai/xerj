@@ -6179,6 +6179,291 @@ fn synonym_settings(synonym_rules: &[&str]) -> serde_json::Value {
     })
 }
 
+// ── #937: a declared analyzer must survive `_flush` ─────────────────────────
+//
+// The memtable resolves `get_analyzer("default").or_else(standard)` on both
+// its insert and its query side; the segment writer used to hard-code
+// `standard` (build_fts_field_configs) and the segment query projection used
+// to build a fresh default registry. An index that declared an analyzer
+// therefore answered the same `match` differently before and after a flush.
+
+/// Row A of the #937 table: a custom `default` analyzer (synonym expansion)
+/// applies to tokens indexed AFTER a flush exactly as it did before it, in
+/// both synonym directions, across the flush boundary.
+#[tokio::test]
+async fn declared_default_analyzer_survives_flush() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    let settings = synonym_settings(&["fast,quick"]);
+    engine
+        .create_index_with_settings("an_default", Schema::empty(), settings)
+        .unwrap();
+    let idx = engine.get_index("an_default").unwrap();
+
+    let hits = |q: &str| {
+        let idx = idx.clone();
+        let q = q.to_string();
+        async move {
+            idx.search(&make_search(json!({"match": {"description": q}})))
+                .await
+                .unwrap()
+                .total
+                .value
+        }
+    };
+
+    // Before the flush the doc lives in the memtable — this always worked.
+    idx.index_document(Some("1".into()), json!({ "description": "fast car" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        hits("quick").await,
+        1,
+        "memtable honours the declared default"
+    );
+
+    // Flush. Pre-#937 the segment was written and queried with `standard`,
+    // so `quick` stopped matching here.
+    idx.flush().await.unwrap();
+    assert_eq!(
+        hits("quick").await,
+        1,
+        "the declared default must survive _flush"
+    );
+    assert_eq!(hits("fast").await, 1);
+
+    // Index AGAIN after the flush and flush once more: documents on both
+    // sides of the boundary must share one term space.
+    idx.index_document(Some("2".into()), json!({ "description": "quick fox" }))
+        .await
+        .unwrap();
+    idx.flush().await.unwrap();
+    assert_eq!(
+        hits("fast").await,
+        2,
+        "a document indexed after the flush is analysed with the declared \
+         default too (synonym expansion applies in both directions)"
+    );
+    assert_eq!(hits("quick").await, 2);
+    assert_eq!(hits("slow").await, 0, "unrelated terms still do not match");
+}
+
+/// Row B of the #937 table: built-in `english` as the index default —
+/// stemming and stop-words must hold before AND after a flush.
+#[tokio::test]
+async fn builtin_english_default_survives_flush() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    let settings = json!({
+        "analysis": { "analyzer": { "default": { "type": "english" } } }
+    });
+    engine
+        .create_index_with_settings("an_english", Schema::empty(), settings)
+        .unwrap();
+    let idx = engine.get_index("an_english").unwrap();
+
+    let hits = |q: &str| {
+        let idx = idx.clone();
+        let q = q.to_string();
+        async move {
+            idx.search(&make_search(json!({"match": {"t": q}})))
+                .await
+                .unwrap()
+                .total
+                .value
+        }
+    };
+
+    idx.index_document(
+        Some("1".into()),
+        json!({ "t": "I ate a bagel near the airport scanner" }),
+    )
+    .await
+    .unwrap();
+    // Memtable: the english pipeline stems `bagels`→`bagel` and drops `the`.
+    assert_eq!(hits("bagels").await, 1, "stemming before the flush");
+    assert_eq!(hits("the").await, 0, "stop-words before the flush");
+
+    idx.flush().await.unwrap();
+    // Pre-#937 this flipped: `bagels`→0 (no stemming on the segment) and
+    // `the`→1 (no stop-word removal).
+    assert_eq!(hits("bagels").await, 1, "stemming survives the flush");
+    assert_eq!(hits("the").await, 0, "stop-word removal survives the flush");
+
+    // A second document indexed AFTER the flush joins the stemmed space.
+    idx.index_document(Some("2".into()), json!({ "t": "more bagels please" }))
+        .await
+        .unwrap();
+    idx.flush().await.unwrap();
+    assert_eq!(
+        hits("bagel").await,
+        2,
+        "documents indexed after the flush share the stemmed term space"
+    );
+}
+
+/// The #204-style on-disk compatibility arm: an index whose binding marker
+/// predates #937 (no `segment_analyzers` key), which declares a `default`
+/// and already holds documents, must NOT have its segments silently rebound
+/// to the declared analyzer — the pre-fix split is preserved, the decision
+/// is recorded so it cannot flip later, and the memtable keeps the declared
+/// default exactly as pre-#937.
+#[tokio::test]
+async fn pre_937_index_with_documents_keeps_its_standard_segments() {
+    let dir = TempDir::new().unwrap();
+    {
+        let engine = make_engine(&dir);
+        engine
+            .create_index_with_settings("an_legacy", Schema::empty(), namespaced_ngram_settings())
+            .unwrap();
+        let idx = engine.get_index("an_legacy").unwrap();
+        idx.index_document(Some("1".into()), json!({ "name": "basketball" }))
+            .await
+            .unwrap();
+        idx.flush().await.unwrap();
+        // Created by THIS build: the segment is ngram-analysed, so the whole
+        // word matches through its grams.
+        let result = idx
+            .search(&make_search(json!({"match": {"name": "basketball"}})))
+            .await
+            .unwrap();
+        assert_eq!(result.total.value, 1, "sanity: honoured at create");
+    }
+
+    // Make the binding marker look like a pre-#937 write: the #204 key is
+    // there, the #937 key is not.
+    let marker = dir.path().join("an_legacy").join("analysis-binding.json");
+    assert!(marker.exists(), "create records the binding marker");
+    std::fs::write(&marker, br#"{"binding":"canonical"}"#).expect("rewrite marker");
+
+    {
+        let engine = make_engine(&dir);
+        let idx = engine.get_index("an_legacy").unwrap();
+        // The conservative arm engaged: segment queries analyse with
+        // `standard`, so the whole-word query no longer expands to grams.
+        let whole = idx
+            .search(&make_search(json!({"match": {"name": "basketball"}})))
+            .await
+            .unwrap();
+        assert_eq!(
+            whole.total.value, 0,
+            "a pre-#937 index keeps its segments bound to `standard` rather than \
+             silently switching them to the declared analyzer"
+        );
+        // The decision was recorded — reopening cannot flip it.
+        let recorded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+        assert_eq!(
+            recorded["segment_analyzers"], "standard",
+            "the standard binding must be recorded, got: {recorded}"
+        );
+
+        // And the memtable still honours the declaration, exactly as the
+        // pre-#937 build did: `ket` matches through the ngram analyzer.
+        idx.index_document(Some("2".into()), json!({ "name": "basketball" }))
+            .await
+            .unwrap();
+        let gram = idx
+            .search(&make_search(json!({"match": {"name": "ket"}})))
+            .await
+            .unwrap();
+        assert_eq!(
+            gram.total.value, 2,
+            "the memtable keeps the declared default (the pre-fix behaviour, \
+             preserved rather than silently changed)"
+        );
+    }
+
+    // Reopen again: the recorded decision stands — the marker still says
+    // `standard`, and document 2 (indexed AFTER the downgrade, so flushed by
+    // this build into a standard-bound segment) matches the whole word while
+    // the pre-rewrite ngram segment still does not.
+    let engine = make_engine(&dir);
+    let idx = engine.get_index("an_legacy").unwrap();
+    let recorded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+    assert_eq!(
+        recorded["segment_analyzers"], "standard",
+        "the recorded standard binding is stable across reopens"
+    );
+    let whole = idx
+        .search(&make_search(json!({"match": {"name": "basketball"}})))
+        .await
+        .unwrap();
+    assert_eq!(
+        whole.total.value, 1,
+        "the binding governs new writes too: the post-downgrade document is \
+         standard-analysed, while the pre-rewrite ngram segment still does not \
+         match the whole word"
+    );
+}
+
+/// A merge whose inputs' recorded analyzer contradicts what it would write
+/// (here: the `.ftsan` markers are removed, making both inputs look like
+/// pre-#937 `standard` segments while the index declares `english`) must
+/// fall back to re-analysis — `fts_merge_readers` declines the replay — and
+/// still produce a coherent stemmed segment. This is the upgrade path every
+/// pre-#937 index with a declared default takes through its first forcemerge;
+/// a gate that mis-declines would abort the batch, and a gate that failed to
+/// decline would replay postings it cannot vouch for.
+#[tokio::test]
+async fn merge_reanalyses_inputs_whose_recorded_analyzer_differs() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    let settings = json!({
+        "analysis": { "analyzer": { "default": { "type": "english" } } }
+    });
+    engine
+        .create_index_with_settings("an_merge", Schema::empty(), settings)
+        .unwrap();
+    let idx = engine.get_index("an_merge").unwrap();
+
+    idx.index_document(Some("1".into()), json!({ "t": "one bagel batch" }))
+        .await
+        .unwrap();
+    idx.flush().await.unwrap();
+    idx.index_document(Some("2".into()), json!({ "t": "two scanner belts" }))
+        .await
+        .unwrap();
+    idx.flush().await.unwrap();
+
+    let segments_dir = dir.path().join("an_merge").join("segments");
+    let markers: Vec<_> = std::fs::read_dir(&segments_dir)
+        .unwrap()
+        .filter_map(|e| {
+            let name = e.unwrap().file_name().to_string_lossy().into_owned();
+            name.ends_with(".ftsan").then(|| segments_dir.join(name))
+        })
+        .collect();
+    assert!(
+        !markers.is_empty(),
+        "an index that declares a default records its segments' analyzer"
+    );
+    for marker in markers {
+        std::fs::remove_file(&marker).expect("make the inputs look pre-#937");
+    }
+
+    idx.force_merge(1).await.expect("forcemerge");
+
+    let bagels = idx
+        .search(&make_search(json!({"match": {"t": "bagels"}})))
+        .await
+        .unwrap();
+    assert_eq!(
+        bagels.total.value, 1,
+        "after the merge the stemmed term space is intact (the batch was \
+         re-analysed with the declared default, not replayed as `standard`)"
+    );
+    let the = idx
+        .search(&make_search(json!({"match": {"t": "the"}})))
+        .await
+        .unwrap();
+    assert_eq!(
+        the.total.value, 0,
+        "stop-words stay removed after the merge"
+    );
+}
+
 #[tokio::test]
 async fn test_custom_analyzer_synonym_expansion() {
     let dir = TempDir::new().unwrap();
