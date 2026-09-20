@@ -10,6 +10,11 @@ use std::time::Duration;
 /// and `--max-minutes 0` already exists to mean "never ask".
 pub const MAX_MAX_MINUTES: u64 = 7 * 24 * 60;
 
+/// Largest `--debounce` accepted: one minute. A quiet period longer than that
+/// is not debouncing, it is a timer — and `xerj autoindex` on a cron schedule
+/// already is one, without holding watches open.
+pub const MAX_DEBOUNCE_MS: u64 = 60_000;
+
 /// Largest `--bulk-mb` accepted. Past this a single bulk body stops being a
 /// unit of work and starts being a memory incident on the server.
 pub const MAX_BULK_MB: usize = 24;
@@ -89,6 +94,11 @@ pub struct IndexCfg {
     /// Progress cadence. `None` means "the surface's default" — 1 s on a
     /// terminal, 5 s for a pipe.
     pub progress_interval: Option<Duration>,
+    /// `--watch`: after the first pass, stay resident and reindex what changes.
+    pub watch: bool,
+    /// `--watch`'s quiet period. One editor save is several filesystem events,
+    /// so a pass waits for the tree to go quiet for this long before running.
+    pub debounce: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +232,15 @@ pub fn help_text_with(feedback: bool) -> String {
                                   .xerj-memory-<NAME>-edges (default: folder name slug)\n\
              --no-graph           skip relationship detection (wikilinks, local links,\n\
                                   section order, directory chains) — no edges are written\n\
+             --watch              index once, then stay resident and reindex what changes.\n\
+                                  Needs --no-graph: the graph route refuses an ADDED file\n\
+                                  (exit 3, skipped until --fresh) and ABORTS on a deletion\n\
+                                  (exit 1, and every later re-run aborts too). It does\n\
+                                  reindex a MODIFIED file. One OS watch per indexed\n\
+                                  directory, no polling; respects the same ignore rules as\n\
+                                  a re-run. docs/LIVE_REINDEXING.md has the measurements.\n\
+             --debounce <MS>      --watch quiet period before a pass (default 400, max\n\
+                                  60000). One editor save is several filesystem events.\n\
              --max-minutes <N>    stop and ask before indexing if phase A's MEASURED estimate\n\
                                   is longer than this (default 10; 0 disables the gate;\n\
                                   max 10080). See ESTIMATE + DECISION GATE below.\n\
@@ -509,6 +528,8 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut no_semantic = false;
     let mut brain: Option<String> = None;
     let mut no_graph = false;
+    let mut watch = false;
+    let mut debounce_ms: Option<u64> = None;
     let mut dry_run = false;
     let mut max_minutes = DEFAULT_MAX_MINUTES;
     let mut max_minutes_explicit = false;
@@ -643,6 +664,22 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 brain = Some(name);
             }
             "--no-graph" => no_graph = true,
+            "--watch" => watch = true,
+            "--debounce" => {
+                let raw = it
+                    .next()
+                    .ok_or("--debounce needs a number of milliseconds (0 disables the wait)")?;
+                let parsed: u64 = raw.parse().map_err(|_| {
+                    format!("--debounce needs an integer from 0 to {MAX_DEBOUNCE_MS}")
+                })?;
+                if parsed > MAX_DEBOUNCE_MS {
+                    return Err(format!(
+                        "--debounce must be from 0 to {MAX_DEBOUNCE_MS} milliseconds; past that a \
+                         change you just made would sit unindexed for minutes"
+                    ));
+                }
+                debounce_ms = Some(parsed);
+            }
             "--max-minutes" => {
                 max_minutes_explicit = true;
                 max_minutes = it
@@ -789,6 +826,51 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         return Err(
             "--approve cancel and --dry-run contradict each other: a dry run already indexes \
              nothing. Drop one of the two"
+                .into(),
+        );
+    }
+
+    // `--watch` is refused rather than quietly downgraded in each of these
+    // cases. Accepting a flag and not doing what it says is the #204 class, and
+    // for a watcher the symptom is the worst one available: an index the
+    // operator believes is live and is not.
+    if watch {
+        if dry_run {
+            return Err(
+                "--watch and --dry-run contradict each other: a dry run indexes nothing, and a \
+                 watcher exists to index changes as they land. Drop one of the two"
+                    .into(),
+            );
+        }
+        if fresh {
+            return Err(
+                "--watch and --fresh contradict each other: --fresh discards the resume journal \
+                 and rebuilds the plan, which a watcher would then redo on every change. Run \
+                 `xerj autoindex <folder> --fresh` once, then start the watcher without it"
+                    .into(),
+            );
+        }
+        if !no_graph {
+            return Err(
+                "--watch needs --no-graph today, and that is a real limitation rather than a \
+                 formality: reconciling an ADDED or DELETED file exists only on the --no-graph \
+                 (generated) route. On the default graph path a re-run resumes a frozen plan, \
+                 so a file created after that plan was frozen is reported as 'appeared after \
+                 the resume plan was frozen' and is NOT indexed until the corpus is rebuilt \
+                 with --fresh, and a file deleted from the folder ABORTS the run — and every \
+                 re-run after it — because its documents are still live in the destination. \
+                 (A file whose CONTENT changed is reconciled there; additions and deletions \
+                 are what a watcher on that route could not keep current.) Re-run as `xerj \
+                 autoindex <folder> --watch --no-graph` (relationship detection off), or keep \
+                 rebuilding a graph corpus with `xerj autoindex <folder> --fresh`"
+                    .into(),
+            );
+        }
+    }
+    if debounce_ms.is_some() && !watch {
+        return Err(
+            "--debounce sets the quiet period of a watcher that is not running. Add --watch, or \
+             drop --debounce"
                 .into(),
         );
     }
@@ -945,6 +1027,10 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 quiet,
                 progress,
                 progress_interval,
+                watch,
+                debounce: Duration::from_millis(
+                    debounce_ms.unwrap_or(crate::watch::DEFAULT_DEBOUNCE_MS),
+                ),
             })))
         }
         _ => Ok(Cmd::Help),
@@ -1053,6 +1139,37 @@ mod tests {
 
     fn err(args: &[&str]) -> String {
         parse(args.iter().map(|s| s.to_string()).collect()).expect_err("must be refused")
+    }
+
+    /// The `--watch` refusal must name the limitation it actually has. Measured
+    /// on the graph route against a 10,000-file corpus
+    /// (`docs/measurements/autoindex-watch-2026-09-19.md`, section 4): a re-run
+    /// after a file's CONTENT changed indexes it (3.07 s, `files=1`, searchable),
+    /// a re-run after an ADDITION skips the file with exit 3, and a re-run after a
+    /// DELETION aborts with exit 1 and keeps aborting. The message used to claim
+    /// the opposite about a changed file, which came from a measurement whose
+    /// shell append had created a new file rather than modifying one.
+    #[test]
+    fn the_watch_refusal_names_additions_and_deletions_not_content_changes() {
+        let text = err(&["data", "--watch"]);
+        assert!(
+            text.contains("--no-graph"),
+            "the message must name the flag that makes it work: {text}"
+        );
+        assert!(
+            text.contains("ADDED") && text.contains("DELETED"),
+            "the message must say which changes the graph route cannot reconcile: {text}"
+        );
+        assert!(
+            text.contains("CONTENT changed is reconciled"),
+            "the message must not leave the operator thinking an edit is lost too: {text}"
+        );
+        assert!(
+            !text.contains("a file whose content changed is reported"),
+            "the corrected claim must not come back: {text}"
+        );
+        // With --no-graph it parses, and the watcher is on.
+        assert!(index(&["data", "--watch", "--no-graph"]).watch);
     }
 
     /// `xerj autoindex` reads its endpoint from `--url` only; setting `XERJ_URL`
@@ -1392,6 +1509,29 @@ mod tests {
             let err = parse(args.into_iter().map(str::to_string).collect()).unwrap_err();
             assert!(err.contains("apply only to indexing"), "{err}");
         }
+    }
+
+    /// The graph route DOES reindex a modified file; what it cannot do is an
+    /// add or a delete. The help asserted the retracted version for as long as
+    /// the docs did, and pointed at a help section that does not exist.
+    #[test]
+    fn the_watch_help_does_not_repeat_the_retracted_graph_claim() {
+        let help = super::help_text();
+        assert!(
+            !help.contains("only that route reindexes"),
+            "the --watch help repeats the retracted claim about the graph route"
+        );
+        for expected in ["refuses an ADDED file", "ABORTS on a deletion"] {
+            assert!(
+                help.contains(expected),
+                "--watch help is missing {expected:?}"
+            );
+        }
+        // It pointed at a help section that does not exist.
+        assert!(
+            !help.contains("See LIVE REINDEXING below"),
+            "the help points at a LIVE REINDEXING section it does not have"
+        );
     }
 
     /// A flag the engine honours but never mentions is only half-shipped, and
