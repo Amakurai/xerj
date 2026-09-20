@@ -26,6 +26,12 @@
 //! for a human or agent to fill, because a tool must not invent an opinion any
 //! more than it may invent a number.
 //!
+//! And one hard refusal: `--open-pr` branches, commits and pushes in the
+//! current directory's repository, so it first checks that the repository's
+//! `origin` actually is `xerj-org/xerj`. An agent's working directory is
+//! normally the user's own project; the command must never branch, commit or
+//! push there (#960).
+//!
 //! The rendered report's FIRST line states an AI agent wrote it — the same
 //! provenance rule the invitation and `.github/AI_CONTRIBUTIONS.md` apply to
 //! every agent-authored contribution.
@@ -359,7 +365,7 @@ pub fn pr_commands(d: &Draft) -> String {
          git add {relpath}\n\
          git commit --only {relpath} -m \"docs(field-report): {slug}\"\n\
          git push -u origin {branch}\n\
-         gh pr create --base main --head {branch} \\\n\
+         gh pr create --repo xerj-org/xerj --base main --head {branch} \\\n\
          \x20 --title \"Agent field report: {title}\" \\\n\
          \x20 --body \"Written by an AI agent on behalf of a human. Field report only; see {relpath}.\"",
         used_for = d.used_for,
@@ -401,31 +407,115 @@ fn field_report_commit_argv(relpath: &str, slug: &str) -> Vec<String> {
     ]
 }
 
+/// The canonical spellings of this repository's GitHub `origin`, as `git
+/// remote get-url origin` may print them: https, scp-style ssh and ssh-URL
+/// form, each without the optional `.git` suffix (the matcher tolerates it).
+const XERJ_ORIGIN_URLS: &[&str] = &[
+    "https://github.com/xerj-org/xerj",
+    "git@github.com:xerj-org/xerj",
+    "ssh://git@github.com/xerj-org/xerj",
+];
+
+/// Whether `url` — the raw output of `git remote get-url origin` — points at
+/// the xerj-org/xerj repository itself, and at nothing else.
+///
+/// Pure string matching against the three canonical GitHub spellings above,
+/// case-insensitive, with an optional `.git` suffix and trailing slashes
+/// tolerated. The owner/name must match EXACTLY after that normalisation, so a
+/// same-prefix repository (`xerj-org/xerj-fork`) or someone else's project
+/// never passes. #960.
+fn origin_url_is_xerj(url: &str) -> bool {
+    let normalized = url.trim().to_ascii_lowercase();
+    let normalized = normalized
+        .strip_suffix(".git")
+        .unwrap_or(normalized.as_str());
+    let normalized = normalized.trim_end_matches('/');
+    XERJ_ORIGIN_URLS.contains(&normalized)
+}
+
+/// `git remote get-url origin` run in `dir` (the process working directory
+/// when `None`). `None` when the command fails — not inside a git repository,
+/// or the repository has no `origin` remote.
+fn origin_remote_url(dir: Option<&Path>) -> Option<String> {
+    let mut cmd = Command::new("git");
+    cmd.args(["remote", "get-url", "origin"]);
+    if let Some(dir) = dir {
+        cmd.current_dir(dir);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!url.is_empty()).then_some(url)
+}
+
+/// Whether the repository at `dir` (the process working directory when `None`)
+/// is a checkout whose `origin` remote points at xerj-org/xerj — the one
+/// repository `--open-pr` may branch, commit and push in. #960.
+fn origin_is_xerj_checkout(dir: Option<&Path>) -> bool {
+    origin_remote_url(dir)
+        .as_deref()
+        .is_some_and(origin_url_is_xerj)
+}
+
 /// `--open-pr`: commit ONLY the field report on a new branch and run
 /// `gh pr create`. If `gh` is missing or unauthenticated, FAIL LOUDLY and print
 /// the exact ready-to-run commands — the honest sandboxed-agent path, never a
 /// silent partial success.
 fn open_pr(draft: &Draft, report: &str, commands: &str) -> i32 {
+    open_pr_at(None, draft, report, commands)
+}
+
+/// The working core of [`open_pr`]. `dir` is the repository to act in — `None`
+/// is the process working directory, the only mode the CLI uses; `Some(path)`
+/// exists so the foreign-repo refusal can be tested against a real throwaway
+/// repository instead of mutating this process's working directory (#960).
+fn open_pr_at(dir: Option<&Path>, draft: &Draft, report: &str, commands: &str) -> i32 {
     let relpath = report_relpath(&draft.date, &draft.slug);
     let branch = format!("field-report/{}", draft.slug);
 
-    // Preconditions first, before we touch the working tree: a `gh` that cannot
-    // open the PR turns a committed branch into a dead end. Say so and hand over
-    // the commands instead.
+    // Preconditions first, before we touch the working tree.
+    //
+    // THE one repository this may run in: the steps below branch, commit and
+    // push in `dir`'s repository, and an agent's working directory is normally
+    // the user's own project, not a checkout of xerj. Before #960 the only
+    // precondition was "some git repo exists", so the invitation effectively
+    // asked every agent to branch, commit and push in whatever repository it
+    // happened to be standing in. Refuse unless `origin` resolves to
+    // xerj-org/xerj itself.
+    if !origin_is_xerj_checkout(dir) {
+        let found = match origin_remote_url(dir) {
+            Some(url) => format!("{url:?}"),
+            None => "none — this directory is not a git repository, or it has no \
+                     `origin` remote"
+                .to_string(),
+        };
+        eprintln!(
+            "error: `xerj feedback --open-pr` may only run in a checkout of xerj-org/xerj; \
+             this repository's `origin` is {found}."
+        );
+        eprintln!(
+            "Refusing to create a branch, write the report, commit or push here — nothing \
+             has been touched."
+        );
+        eprintln!(
+            "To file the report: run this command again from a clone of xerj-org/xerj, or \
+             fork it, push `{branch}` to your fork and open the PR with \
+             `gh pr create --repo xerj-org/xerj --head <your-login>:{branch}`."
+        );
+        eprintln!("The report and the exact commands to run there:\n");
+        println!("{report}");
+        println!("\n{commands}");
+        return 1;
+    }
+    // A `gh` that cannot open the PR turns a committed branch into a dead end.
+    // Say so and hand over the commands instead.
     if let Err(reason) = gh_ready() {
         eprintln!("error: cannot open the pull request automatically: {reason}");
         eprintln!(
             "Falling back to the exact commands — run these yourself (the sandboxed-agent path):\n"
         );
-        println!("{commands}");
-        return 1;
-    }
-    if !in_git_repo() {
-        eprintln!(
-            "error: `xerj feedback --open-pr` must run inside a checkout of the xerj repository \
-             (no .git found)."
-        );
-        eprintln!("Falling back to the exact commands:\n");
         println!("{commands}");
         return 1;
     }
@@ -447,17 +537,21 @@ fn open_pr(draft: &Draft, report: &str, commands: &str) -> i32 {
         ),
     ];
 
+    let report_path = match dir {
+        Some(d) => d.join(&relpath),
+        None => PathBuf::from(&relpath),
+    };
     for (label, argv) in steps {
         if label == "write report" {
-            if let Err(e) = write_report_file(Path::new(&relpath), report) {
-                eprintln!("error: could not write {relpath}: {e}");
+            if let Err(e) = write_report_file(&report_path, report) {
+                eprintln!("error: could not write {}: {e}", report_path.display());
                 eprintln!("Falling back to the exact commands:\n");
                 println!("{commands}");
                 return 1;
             }
             continue;
         }
-        if !run_cmd("git", &argv) {
+        if !run_cmd(dir, "git", &argv) {
             eprintln!("error: `git {}` failed.", argv.join(" "));
             eprintln!("Falling back to the exact commands:\n");
             println!("{commands}");
@@ -470,6 +564,10 @@ fn open_pr(draft: &Draft, report: &str, commands: &str) -> i32 {
     let pr_args = vec![
         "pr".to_string(),
         "create".to_string(),
+        // Explicit, so the PR can only ever land in this repository — never in
+        // whatever repository `gh` would otherwise infer from the cwd (#960).
+        "--repo".to_string(),
+        "xerj-org/xerj".to_string(),
         "--base".to_string(),
         "main".to_string(),
         "--head".to_string(),
@@ -479,7 +577,7 @@ fn open_pr(draft: &Draft, report: &str, commands: &str) -> i32 {
         "--body".to_string(),
         pr_body,
     ];
-    if !run_cmd("gh", &pr_args) {
+    if !run_cmd(dir, "gh", &pr_args) {
         eprintln!("error: `gh pr create` failed — the branch and commit are in place.");
         eprintln!("Finish it yourself with:\n");
         println!("{commands}");
@@ -501,20 +599,13 @@ fn gh_ready() -> Result<(), String> {
     }
 }
 
-fn in_git_repo() -> bool {
-    Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn run_cmd(bin: &str, args: &[String]) -> bool {
-    Command::new(bin)
-        .args(args)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+fn run_cmd(dir: Option<&Path>, bin: &str, args: &[String]) -> bool {
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
+    if let Some(dir) = dir {
+        cmd.current_dir(dir);
+    }
+    cmd.status().map(|s| s.success()).unwrap_or(false)
 }
 
 pub fn print_help() {
@@ -554,8 +645,12 @@ pub fn help_text(feedback: bool) -> String {
              --slug <TEXT>        filename slug (default: derived from --used-for/--pointed-at);\n\
                                   the file lands at {dir}/<YYYY-MM-DD>-<slug>.md\n\
              --open-pr            create branch field-report/<slug>, commit ONLY that one file,\n\
-                                  and run `gh pr create`. If gh is missing/unauth it FAILS\n\
-                                  LOUDLY and prints the exact commands to run by hand\n\
+                                  and run `gh pr create --repo xerj-org/xerj`. Requires a\n\
+                                  checkout whose `origin` IS xerj-org/xerj; in any other\n\
+                                  repository it refuses loudly — nothing written, committed\n\
+                                  or pushed — and prints the report + commands. If gh is\n\
+                                  missing/unauth it FAILS LOUDLY and prints the exact\n\
+                                  commands to run by hand\n\
              --dry-run            print the report AND the exact commands, and do nothing\n\
                                   (opens no PR, writes no file)\n\
          \n\
@@ -802,6 +897,10 @@ mod tests {
             "first line states an AI agent wrote it",
             "exempted from the CLA gate",
             FIELD_REPORT_DIR,
+            // #960: the origin precondition is part of the --open-pr contract.
+            "xerj-org/xerj",
+            "origin",
+            "refuses loudly",
         ] {
             assert!(help.contains(expected), "help missing {expected:?}");
         }
@@ -884,6 +983,202 @@ mod tests {
         assert!(
             staged.contains("SECRET.env"),
             "the decoy must remain staged, untouched: {staged:?}"
+        );
+    }
+
+    /// Run `git` in `root`, asserting success — the #484 test's pattern.
+    fn git_run(root: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// `git`'s stdout in `root`, asserting success.
+    fn git_stdout(root: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// A minimal real repository: one commit, no remotes.
+    fn seeded_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_run(root, &["init", "-q"]);
+        git_run(root, &["config", "user.email", "t@t"]);
+        git_run(root, &["config", "user.name", "t"]);
+        git_run(root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("seed"), "seed").unwrap();
+        git_run(root, &["add", "seed"]);
+        git_run(root, &["commit", "-qm", "seed"]);
+        dir
+    }
+
+    /// #960: the origin matcher accepts exactly the canonical spellings of
+    /// xerj-org/xerj — and nothing else, however similar.
+    #[test]
+    fn origin_url_is_xerj_matches_only_the_xerj_repository() {
+        for url in [
+            "https://github.com/xerj-org/xerj",
+            "https://github.com/xerj-org/xerj.git",
+            "git@github.com:xerj-org/xerj",
+            "git@github.com:xerj-org/xerj.git",
+            "ssh://git@github.com/xerj-org/xerj",
+            "ssh://git@github.com/xerj-org/xerj.git",
+            // Tolerate the forms a copy button or `git remote set-url` leaves
+            // behind: trailing slash, mixed case, surrounding whitespace.
+            "https://github.com/xerj-org/xerj/",
+            "  HTTPS://GitHub.com/XERJ-Org/XERJ.git\n",
+        ] {
+            assert!(origin_url_is_xerj(url), "{url:?} should be accepted");
+        }
+        for url in [
+            "",
+            "   ",
+            "https://github.com/someone/project.git",
+            "git@github.com:someone/project.git",
+            // Same prefix, different repository: must NOT pass.
+            "git@github.com:xerj-org/xerj-fork.git",
+            "https://github.com/xerj-org/xerj-fork",
+            // A path under the repository is a different URL.
+            "https://github.com/xerj-org/xerj/issues",
+            // Same owner/name on a different host: must NOT pass.
+            "ssh://git@gitlab.com/xerj-org/xerj.git",
+        ] {
+            assert!(!origin_url_is_xerj(url), "{url:?} must be rejected");
+        }
+    }
+
+    /// #960: the precondition reads the repository's REAL `origin` remote —
+    /// foreign origin, xerj origin, no origin at all, and no repository at all
+    /// each resolve the way the refusal needs.
+    #[test]
+    fn origin_is_xerj_checkout_reads_the_actual_origin_remote() {
+        let foreign = seeded_repo();
+        git_run(
+            foreign.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/foreign/repo.git",
+            ],
+        );
+        assert!(
+            !origin_is_xerj_checkout(Some(foreign.path())),
+            "a foreign origin must be refused"
+        );
+
+        let xerj = seeded_repo();
+        git_run(
+            xerj.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:xerj-org/xerj.git",
+            ],
+        );
+        assert!(
+            origin_is_xerj_checkout(Some(xerj.path())),
+            "the xerj origin must pass"
+        );
+
+        let no_remote = seeded_repo();
+        assert!(
+            !origin_is_xerj_checkout(Some(no_remote.path())),
+            "a repository without an origin remote must be refused"
+        );
+
+        let not_a_repo = tempfile::tempdir().unwrap();
+        assert!(
+            !origin_is_xerj_checkout(Some(not_a_repo.path())),
+            "a directory that is not a git repository must be refused"
+        );
+    }
+
+    /// #960: in a repository whose `origin` is NOT xerj-org/xerj, `--open-pr`
+    /// must refuse BEFORE any step runs — no branch, no report file, no
+    /// commit, no push — and hand over the report + commands instead.
+    ///
+    /// `gh` is stubbed as installed-and-authenticated for the duration of this
+    /// test (the same stub-gh construction the issue was reproduced with), so
+    /// the ONLY precondition that can refuse is the origin one. Prepending a
+    /// directory to PATH is process-global but harmless here: it is restored on
+    /// drop (panic included), and no other test in this binary spawns `gh`.
+    #[test]
+    fn open_pr_refuses_in_a_foreign_repository_before_touching_the_tree() {
+        struct PathGuard(std::ffi::OsString);
+        impl Drop for PathGuard {
+            fn drop(&mut self) {
+                std::env::set_var("PATH", &self.0);
+            }
+        }
+
+        let dir = seeded_repo();
+        let root = dir.path();
+        git_run(
+            root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/foreign/repo.git",
+            ],
+        );
+        // If the precondition ever fails to refuse, the steps would run; make
+        // the push fail instantly and offline rather than touching a network.
+        git_run(
+            root,
+            &["remote", "set-url", "--push", "origin", "/nonexistent/960"],
+        );
+
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub = stub_dir.path().join("gh");
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let previous_path = std::env::var_os("PATH").expect("PATH is set");
+        std::env::set_var(
+            "PATH",
+            std::ffi::OsString::from(format!(
+                "{}:{}",
+                stub_dir.path().display(),
+                previous_path.to_string_lossy()
+            )),
+        );
+        let _restore_path = PathGuard(previous_path);
+
+        let head_before = git_stdout(root, &["rev-parse", "HEAD"]);
+        let d = resolve_draft(&base_cfg(), None, "2026-09-20");
+        let report = render_report(&d);
+        let commands = pr_commands(&d);
+        let code = open_pr_at(Some(root), &d, &report, &commands);
+
+        assert_eq!(code, 1, "the foreign-repo refusal must exit nonzero");
+        assert!(
+            !root.join(FIELD_REPORT_DIR).exists(),
+            "#960: no report may be written into a foreign repository"
+        );
+        let branches = git_stdout(root, &["branch", "--list", "field-report/*"]);
+        assert!(
+            branches.trim().is_empty(),
+            "#960: no field-report branch may be created in a foreign repository: {branches}"
+        );
+        assert_eq!(
+            git_stdout(root, &["rev-parse", "HEAD"]).trim(),
+            head_before.trim(),
+            "#960: HEAD must not move in a foreign repository"
         );
     }
 }
