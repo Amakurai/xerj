@@ -39845,7 +39845,10 @@ fn is_doc_scan_query(q: &QueryNode) -> bool {
 /// `block_in_place` across many worker threads; a shared map would just
 /// re-serialise the hot loop.  Capped and cleared at 64 entries — the
 /// pattern set is query-supplied and must not grow unbounded.
-fn compiled_anchored_regex(pattern: &str) -> Option<Regex> {
+// pub(crate) for #959: the filter/filters aggregations evaluate `regexp`
+// clauses through this same compile-once cache (aggs.rs
+// `doc_matches_filter`) instead of silently counting every document.
+pub(crate) fn compiled_anchored_regex(pattern: &str) -> Option<Regex> {
     use std::cell::RefCell;
     thread_local! {
         static REGEX_CACHE: RefCell<std::collections::HashMap<String, Option<Regex>>> =
@@ -44929,7 +44932,10 @@ fn json_scalar_equal(dv: &Value, query_val: &Value) -> bool {
 }
 
 /// Simple wildcard pattern matching: `?` = any single char, `*` = zero or more chars.
-fn wildcard_match(text: &str, pattern: &str) -> bool {
+// pub(crate) for #959: the filter/filters aggregations evaluate their
+// clauses with this same glob matcher (aggs.rs `doc_matches_filter`) so a
+// `wildcard` counts identically inside an agg and as a query.
+pub(crate) fn wildcard_match(text: &str, pattern: &str) -> bool {
     let text: Vec<char> = text.chars().collect();
     let pattern: Vec<char> = pattern.chars().collect();
     wildcard_match_inner(&text, &pattern)
