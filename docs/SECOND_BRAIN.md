@@ -106,6 +106,28 @@ to the folder's name.
 You can also build a brain with no folder at all, by asserting edges through the
 HTTP API. The edges index is created lazily on the first `link` call.
 
+## Reading it in the console
+
+The bundled console has three surfaces for the documents a brain is built over,
+documented in [`CONSOLE_READER.md`](./CONSOLE_READER.md):
+
+- **Corpus** (`/_xerj-console/`, the landing route) — one card per dataset in
+  the `autoindex-catalog` index, or the one command to run on an empty engine.
+- **Reader** (`#/reader?index=<index>&id=<id>&brain=<brain>`) — any record,
+  rendered by its shape (an email with its attachments, a PDF page, a note, a
+  code symbol), beside a panel of what the brain links it to: one
+  `GET /_graph/{brain}/ego` call with `hops=1`, grouped by edge type.
+- **Guest mode** — a read-only view of exactly the shared indices for the
+  holder of a share link, with a visible expiry.
+
+Two limits worth knowing before you rely on it. On an auth-enabled engine (the
+default) the Reader's graph panel is refused for a signed-in operator, because
+a console session is not an engine API key and the console's proxy cannot read
+the reserved namespace (see [the tenant boundary](#the-reserved-namespace-is-a-tenant-boundary));
+records, search and attachments still work, and the panel says it was refused
+rather than claiming there are no links. And the Reader shows extracted text:
+it does not render PDF pages or email HTML.
+
 ## The endpoints
 
 All four graph routes are mounted on the ES-compatible router, alongside the
@@ -516,6 +538,7 @@ The resource a brain authorizes against is its edges index,
 | the configured admin key | every brain |
 | a key minted with `role_descriptors` naming the edges index | that brain, at the granted privilege |
 | a key minted without `role_descriptors` | no brain |
+| a share-link guest (`xerj share … --brain`, see [Sharing a brain](#sharing-a-brain)) | that brain, `read` only: `ego` and `overview`, never `link` or `unlink` |
 | no or invalid credential | nothing |
 
 `ego` and `overview` need `read`; `link` and `unlink` need `write`. Creating the
@@ -560,6 +583,15 @@ Two properties are worth calling out because they are deliberate:
   with `write` on the brain) can point it anywhere, so hydration is authorized
   against the resolved index in its own right. Without that, `write` on one
   brain would be a read primitive for every index on the node.
+- **A multi-dataset `nodes_index` is authorized name by name.** `xerj brain`
+  records every dataset index a folder produced as one comma-joined string
+  (`"ax-mail,ax-pdfs"`). Each name in it is authorized on its own
+  (`graph_api.rs`, `authorize_nodes_index`), and one ungranted name refuses the
+  request. Before 2026-09-18 the whole string was compared to the key's grants
+  as a single index name, so every scoped key was refused `overview` and node
+  hydration on any brain over more than one dataset, and `overview` reported 0
+  notes for such a brain because it looked for an index called
+  `"ax-mail,ax-pdfs"`.
 
 Enforcement is not limited to these four routes. A brain's edges live in an
 ordinary index whose name merely starts with a dot, so it is nameable through
@@ -590,10 +622,50 @@ handlers do call `authz::authorize_memory_namespace` (for example
 `memory_api.rs:318` and `memory_api.rs:490`); the comment is stale, the code is
 not.
 
+## Sharing a brain
+
+`xerj share <folder>` gives one other person read-only search over the folder
+`xerj brain` indexed, through a link and a passcode. `xerj brain` prints the
+exact command in its closing summary, with each argument quoted when it needs to
+be (a folder called `case files` pastes as one argument):
+
+```
+  share it: xerj share /home/you/casefiles   (read-only link + passcode for one person; the documents stay on this machine)
+```
+
+A folder argument resolves the way `xerj brain` named things: the brain is
+`derive_brain_name(<folder>)` (or `--brain`), and the indices are the
+`nodes_index` list in that brain's meta document
+(`engine/crates/xerj-server/src/share.rs`, `resolve_target`). A folder that was
+never indexed on this node is an error that says so, never a guess — and a wrong
+or non-admin key is reported as a key problem, not as a folder that was never
+indexed.
+
+The guest's key gets `read` on those indices and on the brain's edges index,
+and nothing else in the reserved namespace — not the `.xerj-memory-{brain}`
+memory namespace, not any other brain, and not `/_memory/*`. One consequence: a
+brain built through the HTTP API alone keeps its notes in
+`.xerj-memory-{brain}`, which a share never grants, so a guest of such a brain
+can walk its links with `ego` but is refused `overview` and node hydration
+(`403`). A brain built by `xerj brain` keeps its notes in the dataset indices
+the share names, and both work. On the graph API that means
+`GET /_graph/{brain}/ego` and `GET /_graph/{brain}/overview`; `link` and
+`unlink` are refused by the guest route allow-list before the privilege check is
+reached. `ego?nodes_index=` cannot be used to redirect hydration at an index the
+share does not name, alone or as one name in a list.
+
+The command refuses a node running in open mode, for the reason given above:
+brain isolation only exists on a server with authentication on.
+
+The whole feature — the command, what a guest can and cannot reach, the threat
+model, `--tunnel` — is in [SHARING.md](./SHARING.md).
+
 ## What is not covered here
 
-- Console and MCP surfaces for the second brain exist but are not documented in
-  this file.
+- The console's corpus home, reader and guest mode are documented in
+  [`CONSOLE_READER.md`](./CONSOLE_READER.md). The console's Second Brain
+  dashboard (THE MAP, the ego ledger) and the MCP surface exist but are not
+  documented in this file.
 - Edge fields `src_format` and `dst_format` are written by the detectors and are
   in the mapping, but no endpoint documented above returns them in a shaped
   response field of their own; they arrive as part of an edge's `_source` when

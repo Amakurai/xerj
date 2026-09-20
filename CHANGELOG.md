@@ -7,7 +7,227 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.75] - 2026-09-20
+
 ### Added
+
+- **`xerj share <index|folder>` — give one person read-only search over one
+  indexed folder: a link, a passcode, an expiry.** The guest opens the link,
+  types the passcode and gets a reading room (search, highlighted snippets, a
+  document view) served by the owner's node; the folder is not uploaded and
+  the guest installs nothing. `POST /_share` (admin key only) stores only a
+  SHA-256 digest of the share id and an Argon2id hash of the passcode; the
+  unauthenticated, rate-limited, audited `POST /_share/claim` takes
+  `{id, passcode}` in its body, so the share id is not in the request line an
+  access log records, and mints a scoped read-only key that expires with the
+  share; a guest-only route allow-list closes `_cat`, `_cluster`, every other
+  index, all writes, and scroll / PIT / async contexts. Every response under
+  `/_share` and every response to a guest key is `no-store`; a guest's refused
+  attempts to manage shares or mint a key are audited; the `autoindex-catalog`
+  index cannot be shared. `--tunnel` supervises your own `cloudflared` quick
+  tunnel and revokes the share on Ctrl-C. That traffic passes through
+  Cloudflare, which terminates TLS and can read the passcode, the guest key and
+  the documents; the command and the guest page both say so. `--list` /
+  `--revoke <handle>` manage shares; the command refuses a node running with
+  authentication off, where a read-only key would restrict nothing.
+  `xerj brain` now prints the share command for the folder it indexed. Found
+  and fixed on the way: the graph API
+  authorized a multi-dataset brain's comma-joined `nodes_index` as one literal
+  index name, so every scoped key got `403` on `overview` for any folder with
+  more than one dataset (and `overview` reported 0 notes for it); and the
+  Console asset bundle was not rebuilt when a new file appeared under
+  `xerj-ux/` on a warm target directory. Threat model, guest reach table and
+  the quick-tunnel trade-offs: [docs/SHARING.md](docs/SHARING.md).
+- **`xerj autoindex` reads mbox mailboxes and Google Takeout exports** — an mbox
+  (Takeout, Thunderbird, Apple Mail, mutt) is detected by content, split in a
+  bounded-memory stream with `>From ` unquoting, CRLF/LF and a missing final
+  newline handled, and every message goes through the same extractor as a
+  standalone `.eml`, so message and attachment records (PDF pages included)
+  have one shape; senders and recipients are filterable by bare address
+  (`email_from_address`, `email_to_address`, `email_cc_address`), Subject
+  words are searchable in `body`, and Gmail's decimal `X-GM-THRID` is stored
+  as the hex id Gmail's web interface uses; messages are parsed on a
+  `--workers`-wide pool under one process-wide in-flight byte budget and
+  forwarded in order, the progress bar moves inside the file, a Takeout
+  root's `archive_browser.html` and Keep `.html` twins are skipped by named
+  rules, Keep `.json` notes are indexed, and an unextracted archive is named
+  under the run's summary with the command to extract it. The new
+  `email-thread@1` detector writes `replies_to` (`In-Reply-To`/`References`)
+  and `attachment_of` edges with evidence, and an incremental run keeps a
+  reply across two mailboxes (Inbox → Sent) by loading the untouched
+  mailboxes' messages back from the index. A loading run now waits the
+  server's memory circuit breaker out — a 429, per item or as the HTTP
+  status, is re-offered (only the rejected records) for up to ten minutes
+  instead of aborting the run. Numbers, machine and commands:
+  `benchmarks/mbox-ingest/README.md` (synthetic mailbox; not yet verified on
+  a real Takeout export). Measured limits, filed on
+  [#948](https://github.com/xerj-org/xerj/issues/948): the client peaks under
+  300 MiB on a 1 GB mailbox, but the node needs 66.9 GiB of RSS to finish it
+  and does not finish under its default 16 GiB cap; at a 16 GiB laptop's
+  8 GiB cap a 300 MB mailbox completes with the node peaking at 18–20 GiB;
+  and after a restart, a first-time query on the 1 GB index takes either
+  under 50 ms or seconds (up to 16.6 s measured) until the node warms.
+- **`xerj autoindex <folder> --watch` keeps an index current from filesystem
+  events instead of a re-run.** The session indexes once, then places one OS
+  watch per *indexed* directory (`notify`: inotify / FSEvents /
+  ReadDirectoryChangesW) and reindexes what changed, debounced (`--debounce`,
+  default 400 ms) so one editor save is one pass. The watch set comes from the
+  same walk the indexer uses, so an ignored `target/` costs no watch and
+  produces no events, and a watched run and a re-run agree on what is indexed.
+  A file skips its re-hash only when no event named it or an ancestor AND its
+  `(size, mtime, inode)` fingerprint is unchanged; the cache is in-memory, so a
+  restart re-hashes in full. Requires `--no-graph`, refused rather than
+  downgraded: reconciling an ADDED or DELETED file exists only on that route —
+  on the graph path a re-run skips a file added after the resume plan was frozen
+  (exit 3, `appeared after the resume plan was frozen`) and ABORTS on a deleted
+  one (exit 1, and every re-run after it), so a watcher there would go stale on
+  the first new file and stop reindexing on the first deletion. A file whose
+  CONTENT changed is reconciled on the graph path, measured at 3.07 s; the
+  earlier claim that it is not came from a measurement whose shell append had
+  created a file instead of modifying one. Measured on a 10,000-file /
+  4,576,300-byte tree, single samples on a shared box: idle costs 0.00
+  CPU-seconds per minute and 0 bytes read (holding 157 MiB and 295 threads),
+  against 1.7 s wall / 2.1 CPU-s and a full corpus re-read for every poll of a
+  re-run loop. Per change `--watch` is not faster than re-running the same
+  command (47.6 s / 6.6 CPU-s against 44.3 s / 7.6 CPU-s for one modified file);
+  both beat re-indexing the folder from scratch (293.8 s / 127.9 CPU-s) by an
+  order of magnitude. The pass cost is two O(corpus) terms neither route avoids
+  — a ~13 s snapshot over the whole inventory
+  (`sync_executor::create_snapshot_inner`) and ~27 s of server CPU rewriting one
+  catalog document per file — the measured next lever, not fixed here. Hitting
+  `fs.inotify.max_user_watches` stops the run with the limit, the directory
+  count and the `sysctl`, because a half-watched tree looks live and silently is
+  not. Docs: `docs/LIVE_REINDEXING.md`, measurement record in
+  `docs/measurements/autoindex-watch-2026-09-19.md`.
+- **`xerj autoindex s3://bucket/prefix` indexes an S3-compatible bucket** —
+  Amazon S3, Cloudflare R2 (`r2://`), MinIO, Ceph or anything else that speaks
+  S3, via `--endpoint-url` (falling back to `AWS_ENDPOINT_URL_S3` /
+  `AWS_ENDPOINT_URL`). The bucket is a *source*, not a second product: the
+  prefix is listed with ListObjectsV2, each object is streamed into a local
+  mirror under `--state-dir`, and the ordinary discovery pipeline — sniffing,
+  the code and document extractors, the plan, the resume journal, the
+  incremental reconcile — runs over that mirror unchanged. Credentials come
+  only from the environment (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+  `AWS_SESSION_TOKEN`) — no profile files, no instance metadata, no SSO, and
+  never from the URL (`s3://key:secret@…` is refused by name). `aws-config` is
+  deliberately not a dependency: it would re-enable the SDK's default HTTPS
+  client and with it the `aws-lc-rs` C/assembly crypto backend that this
+  workspace keeps out of its cross-compile matrix, and it would bring a second
+  S3 client with the SDK's own invisible retry layer. Change detection is the ETag plus the size, treated as an
+  opaque token: a multipart `-N` ETag is stored and compared verbatim and never
+  mistaken for an MD5, and a store that returns no ETag falls back to
+  last-modified plus size with the count of such objects reported. Keys that
+  cannot become a safe portable path (`..`, control characters, Windows
+  reserved names, case collisions), dotfiles and the built-in build-output
+  list are filtered out of the listing, so they never cost a request. Cost is
+  printed by every run, in the two classes that are billed: a scan is
+  `ceil(N/1000)` LIST (class A) plus one GET (class B) per changed object, and
+  the run also prints what the same command would cost daily, hourly and every
+  five minutes against a 1,000,000/month free allowance. Those counts are
+  **billed wire attempts**: the SDK's own retry layer is disabled and the
+  client charges its counter before each attempt, so a throttled request that
+  succeeded on its third try reports three, and one that exhausts its retries
+  reports what it spent instead of nothing. A run that fails mid-transfer
+  records the objects whose bytes already landed (and checkpoints every ten
+  seconds during a long one), so the re-run pays one GET per object it had not
+  already fetched rather than paying for all of them twice; the LIST cost is
+  paid again. Measured end to end
+  against a live node and MinIO: first index of six keys (including a 12 MiB
+  real multipart object) 1 LIST + 5 GET; unchanged re-run 1 LIST + **0 GET**;
+  one changed object 1 LIST + 1 GET; one deleted object (`--no-graph`, the
+  journal that reconciles deletions) removes exactly that object's documents.
+  A 1 GiB object streams through for 4 MB of RSS growth (22 MB → 26 MB), in
+  281–318 ms over four loopback runs — the memory figure is the claim; the
+  milliseconds are a same-host transfer and not a throughput benchmark. Nothing is
+  ever written to the bucket, and the index stays on the node's local disk —
+  `docs/OBJECT_STORAGE.md` states both, with the request arithmetic and the
+  measured runs.
+- **A real S3-compatible object-storage backend — Cloudflare R2, MinIO and AWS
+  S3 — with per-request cost accounting.** `xerj-storage`'s `S3Backend` was a
+  local-directory simulation that its own doc comment admitted to; it is now an
+  `aws-sdk-s3` client doing ranged `GetObject`, `PutObject`, paginated
+  `ListObjectsV2` and `HeadObject`, verified against both MinIO and R2
+  (including the 1,200-object `ListObjectsV2` page boundary, listed in exactly
+  two Class A operations). The simulation is kept as `SimulatedObjectStore`, a
+  test double, because unit tests want a backend with no network and no cost.
+  Because object stores bill per request and Cloudflare R2's free tier allows
+  1,000,000 Class A operations a month *per account* — about 23 a minute for
+  everything — the backend counts every billed attempt by class and exposes it
+  through `StorageBackend::ops()`, and `OpBudget` refuses to send more past a
+  ceiling. Counted per wire attempt, which is why the AWS SDK's retry layer is
+  disabled in favour of XERJ's own: an SDK-internal retry is invisible to a
+  counter wrapped around the call. A listing is bounded by a seen-token check
+  (which catches a continuation-token cycle of any length, not only an
+  immediately repeated token) and by `S3Config::max_list_pages`, so a broken or
+  hostile endpoint cannot bill a Class A request per page without end. `SegmentCache` gained hit/miss/bytes
+  accounting, `get_range` (whole-object fetch on miss, then slice) and
+  `get_range_uncached` (fetch the range only) — measured against MinIO on
+  loopback at 5.98 ms cold, 1.67 ms range-only and 0.068 ms warm, and, in a
+  single unrepeated run over a ~1 MB/s link that is not a performance claim
+  about R2, against R2 at 3.72 s, 0.67 s and 0.12 ms. **`storage.backend =
+  "s3"` still refuses to start**: nothing routes the index's segment reads and
+  writes through the backend, the flush path that exists uploads 1 of a
+  segment's 104 files, and `snapshot.json` never leaves local disk, so a fresh
+  node pointed at a bucket sees zero segments — asserted by
+  `object_store_mode_does_not_yet_make_an_index_stateless`, which also shows
+  that a fresh node *can* fetch and read a segment from the bucket by id. Full
+  arithmetic, measurements and remaining work in
+  [docs/OBJECT_STORAGE.md](docs/OBJECT_STORAGE.md).
+
+- **`xerj autoindex s3://bucket/prefix --watch` keeps a bucket-backed index
+  current with a poll whose cost is bounded and visible.** An object store has
+  no inotify, so change tracking is polling or event notifications. This lands
+  polling, because `ListObjectsV2` is served by S3, R2, MinIO and Ceph RGW
+  alike and because a poll is self-correcting: every cycle re-derives the truth
+  from the bucket, so a dropped notification cannot leave an index permanently
+  wrong. Each cycle lists the prefix, compares ETag, size and last-modified
+  against a per-object journal, reads only what changed, and emits one JSON
+  event per added, changed or deleted object — it produces a change feed and
+  does NOT index, and it is not `xerj autoindex s3://bucket/prefix`, which
+  indexes a bucket once; wiring the feed into that indexer plugs into the same
+  `ChangeSink` and is still to come.
+  The cost model is the feature, not a footnote: `ListObjectsV2` is a **Class A**
+  operation at **at least** one call per 1,000 keys per cycle, charged whether
+  anything changed or not (at least, because when a store stops paging is its
+  own choice: MinIO serves 11 calls for 10,000 keys, not 10, so the projection
+  takes whichever is larger, the arithmetic or what the store just served), against Cloudflare R2's free tier of 1,000,000 Class A
+  operations a month (~23/minute for a whole account). A 5 s poll on an *empty*
+  bucket costs 518,400/month — half the tier to watch nothing; a 60 s poll on a
+  100,000-object prefix costs 4,320,000/month, over four times the whole
+  allowance. So the default interval is 300 s, the default budget is 200,000
+  Class A ops/month (20% of the tier, because the rest of the account spends
+  from it too), and a cycle whose projection exceeds the budget is **refused**
+  with exit 4 and a decision-request document naming the minimum safe interval
+  — the same contract the folder-indexing gate uses. The budget is a CIRCUIT
+  BREAKER on every cycle, not a greeting on the first: a prefix that grows past
+  it mid-watch stops the watch, and so does a month whose allowance is spent
+  (Class A and Class B are counted in `<state-dir>/objwatch-spend.json`, which
+  survives restarts, so a supervisor restart loop cannot mint a fresh budget
+  each time — the ledger is written BEFORE the calls it pays for, sixteen at a
+  time, so a `kill -9` in the middle of a long first scan still leaves the run
+  owing what it spent, and a ledger stamped with a future month is a backwards
+  clock step rather than a new allowance). GETs have their own budget, `--max-monthly-gets`, default
+  2,000,000 (20% of the 10,000,000 Class B tier).
+  `--append-only` turns a growing key space into one list call per cycle via
+  `start-after` (and cannot detect deletes, which is why it is opt-in),
+  `--no-fetch` is metadata-only at zero Class B operations, `--dry-run` prices
+  a poll and records nothing at all (no read, no event, no journal) though the
+  listing it makes is real and billed like any other cycle, changed
+  objects are fetched 8 at a time with the events still emitted in listing
+  order, keys come back from the listing byte for byte (whitespace and entity
+  references included), an edit past `--max-object-mb` is always emitted
+  because a prefix digest cannot prove the bytes are unchanged, and one
+  transient listing failure after the first cycle is retried at the next poll
+  rather than ending the watch (five in a row end it), and every cycle reports list calls, reads, bytes
+  and wall time to stderr plus a status file an operator can read without
+  attaching to the process. Cycles never overlap: the schedule is fixed at
+  `t0 + k*interval` and deadlines a long cycle passed through are counted and
+  reported, because an overrun means the effective interval is longer than the
+  one the budget was computed from. Event-driven delivery (S3 Event
+  Notifications, R2 event notifications) is **not implemented**; what it would
+  take, including the reconciling pass that at-least-once delivery makes
+  mandatory, is written down in
+  [`docs/WATCHING_OBJECT_STORAGE.md`](docs/WATCHING_OBJECT_STORAGE.md).
 
 - **`hybrid: true` in `POST /_memory/{ns}/_recall` fuses BM25 and server-side
   semantic recall inside the memory API**
@@ -25,6 +245,178 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never silently degrades to one leg. The MCP `xerj_memory_recall` tool
   exposes the same two parameters. Raised by @Vinz2168 from a shared-memory
   agent integration where neither single mode was enough.
+- **`rerank` stage on `_search`: hand the top hits to an external relevance
+  judge and reorder by the calibrated probability that comes back.**
+  `"rerank": {}` sends the question and the text of the top `window` hits
+  (default 30, max 300) to TypeSafe AI's Jev; the 0–1 probability replaces
+  `_score`, so `rerank.min_score` is an absolute cut-off, which a BM25 score
+  cannot be. **It is the only search-time feature that sends document text
+  off the node** (`[embedding] default_endpoint` and the WAL tap also send text
+  off the node when an operator configures them; docs/RERANK.md lists every
+  outbound connection a node can open, and a test fails when the engine source
+  gains one that list does not name): inert until
+  an operator sets `[rerank] api_key` (or
+  `TYPESAFE_API_KEY`; config wins over env), opt-in per request, forbidden
+  outright by `[rerank] enabled = false`, and only fields the response returns
+  are sent — `rerank.fields` is an exhaustive allow-list. Failure policy is
+  *degrade on deadline, surface on contract*: a slow provider is a 200 with the
+  engine's order and `_rerank.applied: false`; no key is 503, disabled 403, a
+  rejected key or malformed body 502, all with no hits; a provider that answers
+  for nothing it was sent is a 200 with `applied: false`. When applied, every
+  `_score` is a probability or `null` (a hit with no verdict, counted in
+  `_rerank.unjudged`, sorts last) — never an engine score beside probabilities.
+  `hits.total` and `aggs`
+  stay the engine's; paging happens inside the window; `sort`, `search_after`,
+  `collapse`, scroll and `size: 0` are 400s; and `_msearch`, search templates,
+  `_async_search`, `_rank_eval` (per request, under `failures`), the native
+  `/v1` search API and gRPC refuse the block instead of dropping it. Every
+  caller-chosen cost knob has a server-side ceiling, the strings included:
+  `instructions` is capped at 2,000 characters because the provider's wire
+  format repeats it once per judged document, the question at 4,000 and
+  `model` at 128; a provider response over 2 MiB is a 502, not an allocation.
+  `GET /_xerj/rerank` reports whether a provider is configured
+  and never the key; `/v1/metrics` gains `xerj_rerank_requests_total{outcome}`,
+  `xerj_rerank_documents_judged_total` and
+  `xerj_rerank_provider_tokens_total{kind}`; the MCP `xerj_search` and
+  `xerj_hybrid_search` tools take an optional `rerank` argument. **Ranking
+  quality with the real model is not verified** — no provider key was
+  available, and every HTTP test runs against an in-process test double.
+  New crate `xerj-rerank`; reference in `docs/RERANK.md`; two benchmarks,
+  `benchmarks/beir-hybrid` and `benchmarks/decisions-as-retrieval`, both
+  measured with `--embed-mode neural`, not the default lexical embedder. The
+  one-question-per-document request shape follows `hev/jev-rerank`
+  (Apache-2.0); the failure policy and the retry back-off constants follow
+  Meilisearch's personalization module (MIT; adapted, cited in code).
+
+### Fixed
+
+- **`xerj autoindex`: one dataset the server refuses no longer aborts the run,
+  `--no-graph` progress reports the phase it is in, and `xc-index.sh --fresh`
+  works on a corpus that was indexed before**
+  ([#929](https://github.com/xerj-org/xerj/issues/929),
+  [#931](https://github.com/xerj-org/xerj/issues/931),
+  [#930](https://github.com/xerj-org/xerj/issues/930)). On rc.74 a single HTTP
+  400 on one dataset's mapping ended a 48,533-file run with `exit=1
+  reason=aborted` and nothing indexed. A 400 on create-index / put-mapping is
+  now a refusal of *that dataset*: its files are recorded as junk with the
+  server's reason, every other dataset is indexed, the run exits 3, and
+  `xerj-done`, the catalog run document and `xerj autoindex map` all carry
+  `datasets_refused` / `files_refused`, so a generation that lacks a dataset
+  cannot read as a whole one. 401/403/404/408/429/5xx still abort. On the
+  `--no-graph` path the stream used to print `phase=scan pct=100.0
+  eta_quality=stalled` for the whole time documents were landing (48 such lines
+  in the rc.74 capture) — indistinguishable from a real hang; mapping install,
+  sealing, indexing and the read-back barrier are now the `prepare`, `snapshot`,
+  `index`, `finalize-catalog`, `finalize-refresh` and `finalize-verify` phases
+  with real denominators. `tools/xerj-code/scripts/xc-index.sh --fresh` no
+  longer forwards the flag to autoindex (which refuses it once a generation has
+  committed): it builds a replacement beside the old index, verifies
+  `_count > 0`, switches the state file atomically and only then retires the old
+  indices by exact name; a record count the node does not answer is never read
+  as zero, so it cannot get a working index retired or a finished build
+  deleted. A first build that is interrupted after writing
+  records is kept rather than leave no corpus, and `xc.py` now reads the
+  `salvaged` / `autoindex_exit` the script always recorded: it warns on every
+  query that coverage is INCOMPLETE, so a miss against a partial index cannot
+  read as "this code does not exist". Found while verifying the above on the full corpus
+  ([#944](https://github.com/xerj-org/xerj/issues/944)): a per-item HTTP 429
+  inside one bulk — the node's memory circuit breaker, which engages and
+  releases within seconds — aborted the 48,533-file run at 60% after 85
+  minutes. The rejected items are now re-sent, and only those, after a backoff,
+  until the node takes them or the bulk's 600 s of patience runs out — a
+  429 on the whole bulk request is the same back-pressure, not six transport
+  attempts (that split ended the resumed run);
+  only then is it exit 1, resumable, with an error line that says so. The
+  terminal line carries `bulk_retries=N` when it happened, and the
+  `raising bulk concurrency` line is printed at most once per 10 s (117 lines
+  for 11 shrinks in the capture). Captures: `benchmarks/autoindex-resilience/`.
+
+- **`xerj autoindex`: a corpus whose catalog holds more documents than the
+  server takes in one request no longer fails at the very end**
+  ([#955](https://github.com/xerj-org/xerj/issues/955)). Both indexing paths
+  sent the catalog (one document per file, per dataset, per run) as ONE
+  `_bulk`. On the 48,533-file reference corpus that was 51,129 actions in
+  31.9 MB against the engine's default `limits.max_actions_per_bulk` of 50,000:
+  the `--no-graph` run applied all 47,444 operations, then ended
+  `exit=1 reason=aborted` in `finalize-catalog` after 10,336 s. On the default
+  path the same answer was silent: exit 0 with an empty catalog (reproduced by
+  a test against a stub that returns the engine's literal 413). Every `_bulk`
+  body now goes out in windows of at most 10,000 actions, and the catalog also
+  under `--bulk-mb`. A request the server still refuses as too large (HTTP 413,
+  or one item answered 413 for a body of several actions) is halved and
+  re-sent, and the bound is kept for the rest of the run; the terminal line
+  carries `bulk_splits=N` when that happened. Resuming that same generation
+  with the fix committed it (`ok=true exit=3 … records=821840`, 51,129 catalog
+  documents). A `--no-graph` run that runs out of back-pressure patience now
+  ends `reason=server-backpressure` with `ops_applied` / `ops_remaining`
+  instead of `reason=aborted`; it is still exit 1 and resumable.
+
+- **Reference-code passage windows preserve their match score.** `xc.py`
+  could select relevant source and then discard its matches while aligning
+  the excerpt to line boundaries, including on long source lines. Line
+  alignment now keeps the selected term score or falls back to the bounded
+  original window. Window scoring also uses original-source offsets when
+  Unicode lowercasing expands characters. This affects the fallback when no
+  matching symbol is available and explicit `--no-symbol` output.
+
+- **`xc.py --mode hybrid` keeps BM25 results when the optional vector arm has
+  a transport failure.** Connection failures, read timeouts, and interrupted
+  HTTP responses during semantic mapping discovery or search now take the
+  existing BM25-only fallback instead of aborting and discarding valid hits.
+  Primary BM25 failures still exit with an error. Standalone `--mode semantic`
+  now reports mapping/search HTTP and transport failures as errors (exit `2`)
+  instead of treating failed requests as empty search results (exit `1`).
+
+- **`xc.py --json` emits JSON for empty search results.** Previously, a query
+  with no hits printed the human-readable no-match message before reaching the
+  JSON output branch, breaking callers that parse stdout. Empty results now
+  preserve the JSON response and still exit `1`; matching results exit `0`, and
+  a corpus with no live indices retains its distinct exit `3` diagnostic.
+
+### Documentation
+
+- **`llms.txt` proposals, revised and fact-checked**
+  (`docs/research/llms-txt-2026-09/proposals/`). A proposed `llms.txt`, an
+  `llms-install.md` and ten paste-ready install prompts, following the study's
+  twelve rules: three complete entry paths (shell, MCP-only, HTTP-only), the
+  lexical-by-default correction first, per-client MCP registration with the
+  key, a verify line after every step, and a feedback ask that is optional
+  and needs no git. Every quote is re-fetched (259 claims, 258 confirmed, the
+  one failure removed) and the XERJ commands the proposals print were run on
+  Linux against v1.0.0-rc.74, except the ones the record's own "Not run" list
+  names — the `curl | sh` installer, macOS and Windows, `--embed-mode neural`,
+  `claude mcp add --scope local` and the per-client registration lines, which
+  are quoted from each client's own documentation with a fact-check id. Two product findings came out of it:
+  `xerj feedback --open-pr` branches, commits and pushes in whatever
+  repository it is run from, and `xerj init` writes an MCP entry without
+  `XERJ_AUTH`, so against a default node every tool call returns 401. The
+  live `landing/llms.txt` is unchanged; the report's ship checklist says what
+  has to exist first.
+
+- **ROADMAP: the zero-token direction, with every status checked against the
+  tree** ([#941](https://github.com/xerj-org/xerj/issues/941)). A new roadmap
+  section and [docs/ZERO_TOKEN_DIRECTION.md](./docs/ZERO_TOKEN_DIRECTION.md)
+  lay out judged search, share links and a guest reading room, mail ingest,
+  semantic detections, a real object-storage backend, a block index mode for
+  logs, user-code ingest plugins and a corpus hub of signed packs — and say
+  plainly what exists today: `S3Backend` was a local-directory simulation and
+  `storage.backend = "s3"` refuses to start on purpose — the first half of that
+  is no longer true in this same release, see the object-storage backend entry
+  above; the refusal stands, because the index segment path is still local —
+  `_watcher` stores
+  watches and never evaluates them, alert rules have schemas and no
+  evaluator, `xerj-logs` has no caller, and there is no wasmtime backend in
+  the tree. The measuring behind it
+  ([benchmarks/neural-path-triage/](./benchmarks/neural-path-triage/)) filed
+  four defects with literal reproductions:
+  [#937](https://github.com/xerj-org/xerj/issues/937) a declared analyzer
+  stops applying at flush, [#938](https://github.com/xerj-org/xerj/issues/938)
+  neural ingest keeps ~3.4 of 32 threads busy,
+  [#939](https://github.com/xerj-org/xerj/issues/939) `semantic` over
+  multi-passage documents is an exact scan that copies every `_source`
+  (~410 ms p50 on 5,183 documents, forward pass ~14 ms), and
+  [#940](https://github.com/xerj-org/xerj/issues/940) tied RRF scores change
+  order across a restart. All four stay open; nothing is fixed by this entry.
 
 ## [1.0.0-rc.74] - 2026-09-08
 

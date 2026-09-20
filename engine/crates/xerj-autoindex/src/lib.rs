@@ -24,6 +24,13 @@ pub mod ids;
 pub mod ignore_rules;
 pub mod infer;
 pub mod init;
+pub mod objsource;
+#[cfg(test)]
+mod objsource_minio_tests;
+#[cfg(test)]
+mod objsource_s3_tests;
+/// `--watch` for object storage: poll a bucket, feed a change feed, count the cost.
+pub mod objwatch;
 pub mod order;
 pub mod pool;
 pub mod progress;
@@ -31,10 +38,12 @@ mod reconcile_plan;
 pub mod resources;
 pub mod search;
 pub mod sniff;
+pub mod source;
 pub mod state;
 mod sync;
 mod sync_executor;
 pub mod walk;
+pub mod watch;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -250,18 +259,79 @@ pub(crate) mod frozen_contract {
     }
 }
 
-pub(crate) fn ensure_generation_mappings(es: &Es, plan: &Plan, pr: &Progress) -> Result<()> {
+/// One dataset the server refused to map: `(slug, the server's refusal)`.
+pub(crate) type MappingRefusal = (String, String);
+
+/// Longest refusal reason that is recorded, in characters.
+///
+/// Generous next to a real engine's answer — the refusal in #929 is under 500 —
+/// and small next to what it multiplies into: see [`refusal_reason`].
+const REFUSAL_REASON_MAX: usize = 1024;
+
+/// The reason a refusal is recorded under: the error chain, bounded and with
+/// control characters replaced.
+///
+/// The text is the SERVER's response body, verbatim, so it is outside input,
+/// and it does not stay in one place. It is frozen into the plan and the
+/// committed manifest, republished in the catalog's run document by every
+/// later generation, copied into the catalog entry of EVERY file the refusal
+/// cost, printed on stdout, and rendered by `xerj autoindex map`. Unbounded, a
+/// verbose proxy error page under a 10,000-file dataset is tens of megabytes
+/// of catalog; unsanitized, a body containing a newline can start a line of
+/// its own on stdout — for instance a second, forged `REFUSED dataset` line.
+/// [`progress::sanitize`] already solves both for the progress surface (it
+/// counts characters, so it cannot split a code point), so the reason goes
+/// through it once, here, before anything stores it.
+fn refusal_reason(error: &anyhow::Error) -> String {
+    progress::sanitize(&format!("{error:#}"), REFUSAL_REASON_MAX)
+}
+
+/// Create every dataset index in `plan` and install its mapping.
+///
+/// A server *refusal* of one dataset's mapping (HTTP 400, see
+/// [`esclient::MappingRefused`]) is returned, not propagated: it is a statement
+/// about that one dataset and says nothing about the others, so the caller
+/// decides what it costs. Every other failure — transport, auth, 5xx — is an
+/// endpoint failure, is not specific to any dataset, and still aborts.
+///
+/// This used to be a bare `?` inside the loop, which let ONE unmappable field
+/// name abort a 48,533-file, 1,526-dataset run with zero documents indexed
+/// (#929). The precedent for the split is Meilisearch's batch processing,
+/// read for approach only: a per-operation user error marks that one task
+/// `Failed` while the batch carries on, and only an internal error aborts it
+/// (`meilisearch/crates/index-scheduler/src/scheduler/process_index_operation.rs:173`).
+fn install_dataset_mappings(
+    es: &Es,
+    plan: &Plan,
+    mut installed_one: impl FnMut(),
+) -> Result<Vec<MappingRefusal>> {
+    let mut refused = Vec::new();
     for dataset in &plan.datasets {
         let mut create_body = build_mapping(&dataset.specs);
         create_body["mappings"]["properties"]["ax_paths"] = json!({"type": "keyword"});
         let update_body = json!({
             "properties": create_body["mappings"]["properties"].clone()
         });
-        es.ensure_index(&dataset.index, &create_body)
-            .with_context(|| format!("create generation index {}", dataset.index))?;
-        es.update_mapping(&dataset.index, &update_body)
-            .with_context(|| format!("install generation mapping for {}", dataset.index))?;
+        let installed = es
+            .ensure_index(&dataset.index, &create_body)
+            .with_context(|| format!("create generation index {}", dataset.index))
+            .and_then(|()| {
+                es.update_mapping(&dataset.index, &update_body)
+                    .with_context(|| format!("install generation mapping for {}", dataset.index))
+            });
+        match installed {
+            Ok(()) => {}
+            Err(error) if error.downcast_ref::<esclient::MappingRefused>().is_some() => {
+                refused.push((dataset.slug.clone(), refusal_reason(&error)));
+            }
+            Err(error) => return Err(error),
+        }
+        installed_one();
     }
+    Ok(refused)
+}
+
+fn ensure_generation_catalog_mapping(es: &Es, pr: &Progress) -> Result<()> {
     let mut catalog_create_body = catalog::catalog_mapping();
     catalog_create_body["mappings"]["properties"]["duplicate_of"] = json!({"type": "keyword"});
     // #755: the corpus-scope field rides here, beside `duplicate_of`, and NOT
@@ -278,6 +348,177 @@ pub(crate) fn ensure_generation_mappings(es: &Es, plan: &Plan, pr: &Progress) ->
     es.ensure_index(catalog::CATALOG_INDEX, &catalog_create_body)?;
     install_catalog_mapping(es, &catalog_update_body, pr)
         .context("install generation catalog mapping")
+}
+
+/// Provision a SEALED generation: every dataset mapping must install.
+///
+/// By the time a generation is provisioned its plan is frozen in the journal
+/// and its records are sealed in a snapshot, so a dataset cannot be dropped
+/// here without the manifest, the snapshot and the catalog disagreeing about
+/// what the generation contains. A refusal at this point is therefore fatal —
+/// but it names EVERY refused dataset (not just the first the loop met) and the
+/// one recovery that works. [`preflight_generation_mappings`] is what keeps a
+/// fresh run from ever getting here with an unmappable dataset.
+pub(crate) fn ensure_generation_mappings(es: &Es, plan: &Plan, pr: &Progress) -> Result<()> {
+    let refused = install_dataset_mappings(es, plan, || {})?;
+    if !refused.is_empty() {
+        let named = refused
+            .iter()
+            .map(|(slug, reason)| format!("{slug} ({reason})"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!(
+            "the server refused the mapping of {} dataset(s) in a generation that is already \
+             sealed: {named}. A sealed generation cannot drop a dataset, so re-running will \
+             repeat this refusal. No document was published. Rebuild with a new --state-dir and \
+             a new --prefix: a fresh run records a refused dataset (exit 3) and indexes the rest",
+            refused.len()
+        );
+    }
+    ensure_generation_catalog_mapping(es, pr)
+}
+
+/// Install a NOT-YET-SEALED plan's mappings and drop what the server refuses.
+///
+/// Runs before [`begin_non_graph_generation`] seals anything, which is the only
+/// point at which a dataset can still leave the plan coherently: the manifest,
+/// the snapshot, the contract digests and the catalog are all derived from the
+/// plan this returns, so they agree about the refused dataset by construction.
+///
+/// A refusal is loud on purpose. It costs the corpus real files, so it goes out
+/// through `pr.warn` (which `--quiet` does not silence), is recorded in the
+/// plan's `refused_datasets`, turns each of its files into a catalogued junk
+/// file carrying the server's own words, and keeps the exit code at 3.
+///
+/// Returns the plan to seal and the `index_identity` whose dataset mappings are
+/// now installed, so provisioning the generation in this same process does not
+/// pay the same two round trips per dataset a second time.
+pub(crate) fn preflight_generation_mappings(
+    es: &Es,
+    mut plan: Plan,
+    sizes: &HashMap<&str, u64>,
+    pr: &Progress,
+) -> Result<(Plan, String)> {
+    // Two round trips per dataset; a 1,526-dataset plan is a real wait, so it
+    // is a phase with a denominator rather than part of a stalled `scan`.
+    pr.phase("prepare", plan.datasets.len() as u64, 0);
+    let refused = install_dataset_mappings(es, &plan, || pr.item_done(0))?;
+    if !refused.is_empty() {
+        let before = plan.files.len();
+        refuse_datasets(&mut plan, &refused, sizes);
+        for refusal in &plan.refused_datasets {
+            pr.warn(&format!(
+                "autoindex: dataset {} REFUSED by the server — {} file(s) recorded as junk and NOT \
+                 indexed; every other dataset continues. {}",
+                refusal.dataset.slug,
+                refusal.file_keys.len(),
+                refusal.reason
+            ));
+        }
+        pr.warn(&format!(
+            "autoindex: {} of {} dataset(s) refused, {} of {before} file(s) not indexed — this run \
+             will exit 3 and name them in its summary (`datasets_refused`)",
+            plan.refused_datasets.len(),
+            plan.refused_datasets.len() + plan.datasets.len(),
+            before - plan.files.len(),
+        ));
+    }
+    let (_, index_identity) = generation_contract_identities(&plan)?;
+    Ok((plan, index_identity))
+}
+
+/// Remove refused datasets from a plan that has not been sealed yet.
+///
+/// A file is dropped WHOLE when any dataset it feeds was refused. Splitting it
+/// — keeping the accepted tables of a multi-table dump and dropping one — is
+/// not expressible downstream: `prepare_artifact` routes a record with no
+/// assignment of its own to the file's group-less dataset, or aborts the run
+/// when there is none, so a partially assigned file would either mis-file the
+/// refused records or fail the generation this exists to save.
+///
+/// Everything the manifest invariants tie to `plan.files` moves with it: the
+/// duplicate aliases of a dropped file go (`validate_plan_projection` requires
+/// aliases to belong to a live group, #283), and each surviving dataset's
+/// `file_count` is recounted. Ordering is canonical throughout, because the
+/// incremental projection must reproduce this plan byte for byte.
+pub(crate) fn refuse_datasets(
+    plan: &mut Plan,
+    refusals: &[MappingRefusal],
+    sizes: &HashMap<&str, u64>,
+) {
+    if refusals.is_empty() {
+        return;
+    }
+    let reasons: HashMap<&str, &str> = refusals
+        .iter()
+        .map(|(slug, reason)| (slug.as_str(), reason.as_str()))
+        .collect();
+    let (kept, dropped): (Vec<state::PlanDataset>, Vec<state::PlanDataset>) =
+        std::mem::take(&mut plan.datasets)
+            .into_iter()
+            .partition(|dataset| !reasons.contains_key(dataset.slug.as_str()));
+    plan.datasets = kept;
+    let mut refused: Vec<state::RefusedDataset> = dropped
+        .into_iter()
+        .map(|dataset| state::RefusedDataset {
+            reason: reasons[dataset.slug.as_str()].to_owned(),
+            dataset,
+            file_keys: Vec::new(),
+        })
+        .collect();
+    refused.sort_by(|left, right| left.dataset.slug.cmp(&right.dataset.slug));
+
+    // A file that feeds several refused datasets is attributed to the first by
+    // slug, so the attribution does not depend on `HashMap` iteration order.
+    let mut lost: Vec<(String, usize)> = plan
+        .files
+        .iter()
+        .filter_map(|(key, assignment)| {
+            refused
+                .iter()
+                .position(|refusal| {
+                    assignment
+                        .assignments
+                        .iter()
+                        .any(|(_, slug)| *slug == refusal.dataset.slug)
+                })
+                .map(|owner| (key.clone(), owner))
+        })
+        .collect();
+    lost.sort();
+    for (key, owner) in lost {
+        let assignment = plan.files.remove(&key).expect("key came from plan.files");
+        plan.junk_files.push(state::JunkFile {
+            file_key: key.clone(),
+            rel: assignment.rel,
+            format: if assignment.gzip {
+                format!("{}(gzip)", assignment.family)
+            } else {
+                assignment.family
+            },
+            status: "junk".into(),
+            reason: refused[owner].junk_reason(),
+            bytes: sizes.get(key.as_str()).copied().unwrap_or(0),
+        });
+        refused[owner].file_keys.push(key);
+    }
+    plan.duplicate_files
+        .retain(|alias| plan.files.contains_key(&alias.file_key));
+    for dataset in &mut plan.datasets {
+        dataset.file_count = plan
+            .files
+            .values()
+            .filter(|assignment| {
+                assignment
+                    .assignments
+                    .iter()
+                    .any(|(_, slug)| *slug == dataset.slug)
+            })
+            .count();
+    }
+    plan.refused_datasets.extend(refused);
+    plan.refused_datasets
+        .sort_by(|left, right| left.dataset.slug.cmp(&right.dataset.slug));
 }
 
 /// Install the catalog mapping without letting a legacy field type abort the
@@ -580,7 +821,14 @@ fn project_reconcile_plan(
                     .get(content_id.as_str())
                     .and_then(|o| o.content_digest.as_deref())
                     == Some(digest.as_str());
-                if unchanged {
+                // #929: a file a refused dataset already cost is projected by
+                // content identity alone (`reconcile_plan` carries its junk
+                // entry forward), so it needs no fresh parse either.
+                let refused = base_plan
+                    .refused_datasets
+                    .iter()
+                    .any(|refusal| refusal.file_keys.binary_search(content_id).is_ok());
+                if unchanged || refused {
                     return FileScan {
                         sniffed: None,
                         sketches: Vec::new(),
@@ -1000,6 +1248,25 @@ fn finish_generated_progress(pr: &Progress, code: i32, summary: &Value) {
         ("records", count("records_total")),
         ("generation", count("generation")),
     ];
+    // #929: present only when a dataset was refused, so the terminal line of a
+    // run that lost nothing is unchanged — and one that did cannot print the
+    // same line as a whole corpus.
+    if count("datasets_refused") > 0 {
+        extra.push(("datasets_refused", count("datasets_refused")));
+        extra.push(("files_refused", count("files_refused")));
+    }
+    // #944: present only when the run re-sent items the server answered 429,
+    // so a run that fought back-pressure cannot print the same line as one
+    // that did not.
+    if count("bulk_retries") > 0 {
+        extra.push(("bulk_retries", count("bulk_retries")));
+    }
+    // #955: present only when the server refused a request as too large and
+    // the run halved it — a node with a tight `max_actions_per_bulk` or
+    // `max_body_bytes` is worth knowing about even when the run finished.
+    if count("bulk_splits") > 0 {
+        extra.push(("bulk_splits", count("bulk_splits")));
+    }
     extra.extend(coverage.fields());
     pr.finish(
         true,
@@ -1042,13 +1309,14 @@ fn begin_non_graph_generation(
         .clone();
     let tx_id = format!("{}-g{}", journal.run_id, base.generation + 1);
     let preparation_contract = preparation_contract_digest(cfg, &plan)?;
-    let snapshot = sync_executor::create_prepared_snapshot(
+    let snapshot = sync_executor::create_prepared_snapshot_reporting(
         state_dir,
         &tx_id,
         inventory,
         &plan,
         &preparation_contract,
         cfg.snapshot_max_bytes,
+        pr,
     )?;
     // #381: the per-file record cap dropped a file's tail during preparation.
     // The generated path seals before the graph worker loop runs, so report it
@@ -1258,6 +1526,7 @@ pub fn run_cli() -> i32 {
         Cmd::Index(cfg) => run_index(*cfg),
         Cmd::Map(cfg) => run_map(cfg),
         Cmd::Status(cfg) => run_status(cfg),
+        Cmd::Watch(cfg) => objwatch::run::run(*cfg),
     };
     match res {
         Ok(code) => code,
@@ -1335,6 +1604,40 @@ const UNITY_SAMPLE_LIMIT: u64 = 512 << 20;
 /// the only fixture that reaches it naturally is a half-gigabyte file, which
 /// is why that path shipped untested. `SampleLimitOverride` gives the suite a
 /// fixture it can afford.
+/// Share of a container file's progress credited while it is being split and
+/// staged; the rest is credited as the staged records reach the engine.
+///
+/// A chosen split, informed by one measurement: on the 1 GB synthetic mailbox
+/// in `benchmarks/mbox-ingest/` (uncapped node, idle box) the whole mailbox
+/// was staged 39 s after its index was created and its records had all been
+/// accepted ~170 s in, so extraction was ~23 % of the file's Phase-B time;
+/// on a memory-capped node the sending half stretches by minutes while the
+/// extraction half does not, so a middle value is used rather than either
+/// measured extreme. It only shapes how the bar moves between 0 and 100 —
+/// both ends are exact whatever this is — so a mailbox with a different mix
+/// (all text, or all attachments) sees a bar that is uneven, never wrong.
+const CONTAINER_EXTRACT_PERCENT: u64 = 45;
+
+/// Progress position for "the splitter has reached `offset`" in a file of
+/// `size` bytes. `offset` is clamped to `size`: in a gzipped mailbox it counts
+/// DECOMPRESSED bytes and runs past the size on disk, and extraction must not
+/// spend the share that belongs to sending.
+fn container_extract_credit(size: u64, offset: u64) -> u64 {
+    // u128: a u64 byte position times 45 can overflow a u64.
+    ((u128::from(offset.min(size)) * u128::from(CONTAINER_EXTRACT_PERCENT)) / 100) as u64
+}
+
+/// Progress position for "`sent` of `staged` bytes have reached the engine",
+/// for a file of `size` bytes.
+fn container_send_credit(size: u64, sent: u64, staged: u64) -> u64 {
+    let base = container_extract_credit(size, size);
+    if staged == 0 {
+        return base;
+    }
+    let span = u128::from(size - base);
+    base + ((span * u128::from(sent.min(staged))) / u128::from(staged)) as u64
+}
+
 fn sample_limit_bytes(family: Family, path: &Path) -> Option<u64> {
     // Only the test override reads the path; the shipped caps are per-family.
     #[cfg(not(test))]
@@ -1360,6 +1663,10 @@ fn sample_limit_bytes(family: Family, path: &Path) -> Option<u64> {
         Family::SqlDump => Some(SQLDUMP_SAMPLE_LIMIT),
         Family::UnityYaml => Some(UNITY_SAMPLE_LIMIT),
         Family::Jsonl | Family::Logs | Family::Csv | Family::TxtLines => Some(SAMPLE_LIMIT_BYTES),
+        // A mailbox is a stream of whole messages: the splitter checks this
+        // limit BETWEEN messages, so a sample never ends mid-MIME-part, and a
+        // multi-GB Takeout export costs phase A a few MB of reading.
+        Family::Mbox => Some(SAMPLE_LIMIT_BYTES),
         Family::Sqlite => Some(1), // signals per-table row cap inside the extractor
         _ => None,                 // whole-file extractors cap themselves
     }
@@ -1393,15 +1700,43 @@ impl Drop for SampleLimitOverride {
     }
 }
 
+/// Test-only crash injection for the replacement path: the boundary to fail
+/// at AND the state directory of the one run it is meant for.
+///
+/// This was a bare process-wide `AtomicU8` holding only the boundary, consumed
+/// by whichever run reached that boundary first. The tests that arm it
+/// serialize on `FAILPOINT_TEST_LOCK`, but every OTHER test that drives the
+/// legacy path passes the same boundaries under a different lock (or none), so
+/// a concurrent test could take the injected crash and fail with someone
+/// else's error while the arming test ran clean and failed its `unwrap_err`.
+/// Reproduced 2 runs out of 2 on a 32-core machine at load average 50:
+/// `this_corpus_finalize_leaves_a_sibling_corpus_alias_document_alone` died of
+/// "injected replacement crash boundary 4" and
+/// `resume_repairs_kills_after_plan_delete_and_final_bulk_before_file_done`
+/// got `Ok(0)`; both pass alone. A lock cannot fix that without naming every
+/// present and future consumer; keying the failpoint on the state directory —
+/// which every test owns as its own tempdir — makes it unstealable instead.
 #[cfg(test)]
-static REPLACEMENT_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static REPLACEMENT_FAILPOINT: Mutex<Option<(u8, std::path::PathBuf)>> = Mutex::new(None);
+
+/// Arm [`replacement_failpoint`] for the run that uses `state_dir`, once.
+#[cfg(test)]
+pub(crate) fn arm_replacement_failpoint(boundary: u8, state_dir: &Path) {
+    *REPLACEMENT_FAILPOINT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some((boundary, state_dir.to_path_buf()));
+}
 
 #[cfg(test)]
-fn replacement_failpoint(boundary: u8) -> Result<()> {
-    if REPLACEMENT_FAILPOINT
-        .compare_exchange(boundary, 0, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
+fn replacement_failpoint(boundary: u8, state_dir: &Path) -> Result<()> {
+    let mut armed = REPLACEMENT_FAILPOINT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if armed
+        .as_ref()
+        .is_some_and(|(at, dir)| *at == boundary && dir == state_dir)
     {
+        *armed = None;
         anyhow::bail!("injected replacement crash boundary {boundary}");
     }
     Ok(())
@@ -1409,7 +1744,7 @@ fn replacement_failpoint(boundary: u8) -> Result<()> {
 
 #[cfg(not(test))]
 #[inline]
-fn replacement_failpoint(_boundary: u8) -> Result<()> {
+fn replacement_failpoint(_boundary: u8, _state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1436,9 +1771,13 @@ fn record_bulk_outcome(
     match es.bulk(body) {
         Ok(outcome) => {
             if outcome.server_errors > 0 {
+                // Per-item 429s were already re-sent inside `Es::bulk` for as
+                // long as the server accepted anything (#944); what reaches
+                // here did not clear.
                 *send_err = Some(format!(
                     "bulk backend failed for {} item(s): {}. Source file was not journaled \
-                     complete; fix the server/embedding configuration and rerun autoindex",
+                     complete; fix the server condition (or wait for it to clear) and rerun \
+                     autoindex — the run resumes from the journal",
                     outcome.server_errors,
                     outcome
                         .first_server_error
@@ -1488,8 +1827,10 @@ struct GraphRt {
     /// detector tag → edges written this run (run-summary honesty §6.6.4).
     written: Mutex<std::collections::BTreeMap<&'static str, u64>>,
     self_dropped: AtomicU64,
-    /// Prior-generation edges soft-invalidated before this run's writes.
-    invalidated: u64,
+    /// Edges soft-invalidated by this run: prior-generation edges of replaced
+    /// files (before this run's writes) plus edges of un-re-read mail files
+    /// that the corpus-wide pass superseded (after them).
+    invalidated: AtomicU64,
 }
 
 /// Text-section locator → human label ("section 3", "page 2 section 0").
@@ -1816,13 +2157,13 @@ fn scan_file(
         }
     };
     if sn.family == Family::Binary {
-        out.junk = Some((
-            "junk".into(),
-            format!(
-                "binary content ({})",
-                sn.binary_kind.clone().unwrap_or_else(|| "unknown".into())
-            ),
-        ));
+        let kind = sn.binary_kind.clone().unwrap_or_else(|| "unknown".into());
+        // An archive gets the action, not just the verdict: a Google Takeout
+        // download IS one `.zip`/`.tgz`, and "binary content (zip)" tells its
+        // owner nothing about why their mail is not searchable.
+        let reason = sniff::archive_advice(&kind, sn.gzip)
+            .unwrap_or_else(|| format!("binary content ({kind})"));
+        out.junk = Some(("junk".into(), reason));
         out.sniffed = Some(sn);
         return out;
     }
@@ -2085,6 +2426,7 @@ mod phase_a_grouping_tests {
     pub(super) fn cfg_for(root: &Path) -> IndexCfg {
         IndexCfg {
             root: root.to_path_buf(),
+            endpoint_url: None,
             stub_globs: Vec::new(),
             url: "http://unused.invalid".into(),
             api_key: None,
@@ -2120,6 +2462,8 @@ mod phase_a_grouping_tests {
             quiet: true,
             progress: crate::progress::ProgressMode::None,
             progress_interval: None,
+            watch: false,
+            debounce: std::time::Duration::from_millis(0),
         }
     }
 
@@ -2589,6 +2933,7 @@ fn build_phase_a(
         junk_files,
         duplicate_files,
         alias_paths_indexed: true,
+        refused_datasets: Vec::new(),
     };
     PhaseA {
         plan,
@@ -3663,6 +4008,24 @@ fn finish_generated_run(es: &Es, journal: &mut state::Journal, cfg: &IndexCfg) -
         .context("generated run finished without execution identity")?;
     let generation = committed.generation;
     let dataset_count = committed.plan.datasets.len();
+    let committed_refusals: Vec<(String, usize, String)> = committed
+        .plan
+        .refused_datasets
+        .iter()
+        .map(|refusal| {
+            (
+                refusal.dataset.slug.clone(),
+                refusal.file_keys.len(),
+                refusal.reason.clone(),
+            )
+        })
+        .collect();
+    // Same lines the graph route prints (`unextracted_archive_lines`): the
+    // `--no-graph` route has its own, shorter summary and said nothing either.
+    let unextracted_archives = {
+        let junk: Vec<&JunkFile> = committed.plan.junk_files.iter().collect();
+        unextracted_archive_lines(&junk)
+    };
     let sync::SourceExecutionPolicy::DurableSnapshot { reference, .. } = &execution.source_policy
     else {
         anyhow::bail!("generated run does not reference a durable snapshot");
@@ -3698,6 +4061,20 @@ fn finish_generated_run(es: &Es, journal: &mut state::Journal, cfg: &IndexCfg) -
         summary.get("generation").and_then(Value::as_u64) == Some(generation),
         "generated run summary generation disagrees with committed authority"
     );
+    // #944: THIS run's re-sends of items the server answered 429, not a
+    // property of the committed generation — a re-run that sent nothing
+    // reports nothing. Present only when it happened.
+    let mut summary = summary;
+    let bulk_retries = es.bulk_backpressure_retries();
+    if bulk_retries > 0 {
+        summary["bulk_retries"] = json!(bulk_retries);
+        summary["bulk_items_reissued"] = json!(es.bulk_items_reissued());
+    }
+    // #955: requests the server refused as too large and this run halved.
+    // Present only when it happened, like the line above.
+    if es.bulk_requests_split() > 0 {
+        summary["bulk_splits"] = json!(es.bulk_requests_split());
+    }
     journal.finish(&summary)?;
     if cfg.json {
         println!("{summary}");
@@ -3711,6 +4088,20 @@ fn finish_generated_run(es: &Es, journal: &mut state::Journal, cfg: &IndexCfg) -
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
         );
+        // #929: read from the committed manifest, so a no-op re-run names the
+        // refused datasets again instead of only the run that met the refusal.
+        for refusal in &committed_refusals {
+            println!(
+                "REFUSED dataset {} ({} file(s) recorded as junk, not indexed): {}",
+                refusal.0, refusal.1, refusal.2
+            );
+        }
+        if !unextracted_archives.is_empty() {
+            println!("not indexed — archives are never opened; extract, then run this command on the extracted folder:");
+            for line in &unextracted_archives {
+                println!("  {line}");
+            }
+        }
     }
     Ok(summary)
 }
@@ -4029,6 +4420,117 @@ fn sweep_excluded_groups(
     Ok(())
 }
 
+/// What [`carry_over_unread_mail`] loaded.
+#[derive(Default)]
+struct CarriedMail {
+    /// Rel paths of the mail files that were carried over (sorted).
+    rels: std::collections::BTreeSet<String>,
+    /// Message nodes offered to the detectors.
+    messages: u64,
+}
+
+/// Offer the detectors the message nodes of every mail file this run did NOT
+/// re-read, loaded back from the index (`EdgeDetector::carry_over`).
+///
+/// `email-thread@1` resolves replies at the end of a run, over the messages it
+/// was shown. Shown only the files an incremental run re-read, a reply in a
+/// changed `Inbox` to a message in an unchanged `Sent` resolved against
+/// nothing and its edge was lost; and an unchanged file's reply into a
+/// compacted mailbox kept a live edge to a node id that no longer existed
+/// (review finding on PR #949). Both are the same defect — resolution over the
+/// run instead of over the corpus — and this is the other half of the corpus.
+///
+/// It runs only when it can matter: some mail file was NOT re-read, and either
+/// some mail file WAS, or the previous invocation never reached its summary
+/// (its corpus pass may not have run), or an exclusion sweep removed files
+/// (`force`). A one-mailbox Takeout never pays for it — a changed mailbox is
+/// re-read whole, an unchanged one changes nothing — and neither does a no-op
+/// re-run of a finished corpus.
+///
+/// Read-only. The scan names the files it wants (`ax_file`, in slices) and the
+/// one locator shape that is a message node, and asks for five small fields.
+fn carry_over_unread_mail(
+    es: &Es,
+    gr: &GraphRt,
+    index_of_slug: &HashMap<&str, &str>,
+    reread: &std::collections::HashSet<&str>,
+    force: bool,
+) -> Result<CarriedMail> {
+    let is_mail = |f: &detect::CorpusFile| matches!(f.family.as_str(), "eml" | "mbox");
+    let mut unread: Vec<&detect::CorpusFile> = Vec::new();
+    let mut reread_mail = false;
+    for f in gr.corpus.files.values().filter(|f| is_mail(f)) {
+        if reread.contains(f.rel.as_str()) {
+            reread_mail = true;
+        } else {
+            unread.push(f);
+        }
+    }
+    if unread.is_empty() || !(reread_mail || force) {
+        return Ok(CarriedMail::default());
+    }
+    // One scan per (index, slice of files). BTreeMap: request order is a
+    // function of the corpus.
+    let mut by_index: std::collections::BTreeMap<&str, Vec<&detect::CorpusFile>> =
+        std::collections::BTreeMap::new();
+    for f in &unread {
+        if let Some(index) = index_of_slug.get(f.dataset_slug.as_str()) {
+            by_index.entry(index).or_default().push(f);
+        }
+    }
+    let source = json!([
+        "ax_path",
+        "ax_locator",
+        "email_message_id",
+        "email_in_reply_to",
+        "email_references"
+    ]);
+    let mut carried = CarriedMail::default();
+    for (index, group) in by_index {
+        // What an interrupted run published is not searchable until refreshed.
+        es.refresh(index)
+            .with_context(|| format!("refresh {index} before the mail carry-over scan"))?;
+        for slice in group.chunks(detect::SCAN_TERMS) {
+            let keys: Vec<&str> = slice.iter().map(|f| f.file_key.as_str()).collect();
+            let query = json!({"bool": {"filter": [
+                {"terms": {"ax_file": keys}},
+                {"bool": {"should": [
+                    {"term": {"ax_locator": "msg-s0"}},
+                    {"wildcard": {"ax_locator": "m*-msg-s0"}}
+                ], "minimum_should_match": 1}}
+            ]}});
+            detect::scan_by_id(es, index, &query, &source, &mut |id, fields| {
+                let file = fields
+                    .get("ax_path")
+                    .and_then(Value::as_str)
+                    .and_then(|rel| gr.corpus.files.get(rel))
+                    .filter(|f| is_mail(f) && !reread.contains(f.rel.as_str()));
+                let (Some(file), Some(locator)) =
+                    (file, fields.get("ax_locator").and_then(Value::as_str))
+                else {
+                    return;
+                };
+                let ctx = detect::RecordCtx {
+                    corpus: &gr.corpus,
+                    file,
+                    locator,
+                    doc_id: id,
+                    fields,
+                };
+                for det in &gr.detectors {
+                    det.carry_over(&ctx);
+                }
+                carried.messages += 1;
+            })
+            .with_context(|| format!("scan {index} for the message nodes of un-re-read mail"))?;
+        }
+    }
+    // Every un-re-read mail file is "carried", including one whose scan found
+    // nothing: its live edges are re-judged either way.
+    carried.rels = unread.iter().map(|f| f.rel.clone()).collect();
+    Ok(carried)
+}
+
 /// The edges index this run's graph writes to, or `None` when there is none to
 /// sweep: `--no-graph`, or a brain name that fails validation (a run that could
 /// never have written edges — the graph phase bails on it before any write).
@@ -4118,6 +4620,9 @@ mod tcorr_id_tests {
 }
 
 fn run_index(cfg: IndexCfg) -> Result<i32> {
+    if cfg.watch {
+        return watch::run(cfg);
+    }
     run_index_report(cfg).map(|(code, _)| code)
 }
 
@@ -4127,6 +4632,91 @@ fn run_index(cfg: IndexCfg) -> Result<i32> {
 #[cfg(test)]
 fn run_index_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<i32> {
     run_index_report_tallied(cfg, tally).map(|(code, _)| code)
+}
+
+/// Prefix of the junk reason `sniff::archive_advice` writes for an archive.
+const UNEXTRACTED_PREFIX: &str = "unextracted ";
+
+/// The junk files whose reason is an ACTION the user can take right now — an
+/// archive autoindex will not open — as `path — reason` lines, sorted, capped.
+///
+/// A junk reason normally lives in the catalog and in `xerj autoindex map`, and
+/// the run prints only a count. For an archive that is the wrong place: someone
+/// whose whole Google Takeout download is one `.zip` saw `0 datasets, 0 records
+/// live … 1 junk/skipped files … ok=true exit=3` and nothing else — a
+/// "successful" empty index with the one sentence that explains it filed where
+/// they would never look (review finding on PR #949). These few lines are the
+/// run saying it.
+fn unextracted_archive_lines(junk: &[&JunkFile]) -> Vec<String> {
+    const SHOWN: usize = 10;
+    let mut hits: Vec<&&JunkFile> = junk
+        .iter()
+        .filter(|jf| jf.reason.starts_with(UNEXTRACTED_PREFIX))
+        .collect();
+    hits.sort_by(|a, b| a.rel.cmp(&b.rel));
+    let mut lines: Vec<String> = hits
+        .iter()
+        .take(SHOWN)
+        .map(|jf| format!("{} — {}", jf.rel, jf.reason))
+        .collect();
+    if hits.len() > SHOWN {
+        lines.push(format!(
+            "… and {} more archive(s); `xerj autoindex map` lists every one",
+            hits.len() - SHOWN
+        ));
+    }
+    lines
+}
+
+#[cfg(test)]
+mod unextracted_archive_tests {
+    use super::{unextracted_archive_lines, JunkFile};
+
+    fn junk(rel: &str, reason: &str) -> JunkFile {
+        JunkFile {
+            file_key: rel.into(),
+            rel: rel.into(),
+            format: "binary".into(),
+            status: "junk".into(),
+            reason: reason.into(),
+            bytes: 1,
+        }
+    }
+
+    #[test]
+    fn names_archives_with_their_command_and_nothing_else() {
+        let zip = junk(
+            "takeout-001.zip",
+            &crate::sniff::archive_advice("zip", false).unwrap(),
+        );
+        let tgz = junk(
+            "a/backup.tgz",
+            &crate::sniff::archive_advice("tar", true).unwrap(),
+        );
+        let png = junk("logo.png", "binary content (png)");
+        let lines = unextracted_archive_lines(&[&zip, &png, &tgz]);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        // Sorted by path; each line carries the file AND the command to run.
+        assert!(
+            lines[0].starts_with("a/backup.tgz — unextracted") && lines[0].contains("tar -xzf")
+        );
+        assert!(
+            lines[1].starts_with("takeout-001.zip — unextracted") && lines[1].contains("unzip")
+        );
+        assert!(unextracted_archive_lines(&[&png]).is_empty());
+    }
+
+    #[test]
+    fn a_folder_of_archives_is_capped_and_says_so() {
+        let reason = crate::sniff::archive_advice("zip", false).unwrap();
+        let many: Vec<JunkFile> = (0..14)
+            .map(|i| junk(&format!("p{i:02}.zip"), &reason))
+            .collect();
+        let refs: Vec<&JunkFile> = many.iter().collect();
+        let lines = unextracted_archive_lines(&refs);
+        assert_eq!(lines.len(), 11);
+        assert!(lines[10].contains("4 more archive(s)"), "{}", lines[10]);
+    }
 }
 
 /// #381/#759: the per-file record cap dropped these files' tails. Name them (up
@@ -4152,11 +4742,27 @@ fn truncation_note_message(rels: &[String]) -> Option<String> {
     } else {
         String::new()
     };
+    // Three different caps set `ExtractStats::truncated`, and the note used to
+    // name only the first — so a mailbox holding one 2.3 GB message was told it
+    // had "hit the per-file record cap (4096)" with 205 records, and to "raise
+    // the cap", which is advice for a cap it never reached (review finding on
+    // PR #949). The flag does not say which cap fired, so the note names all
+    // three and what each one kept.
+    //
+    // "The file's tail" is right only for the first cause. A mailbox with one
+    // oversized message loses THAT message's tail; every message after it is
+    // indexed (review of PR #949: 201 of 201 messages after a 2.3 GB one were
+    // found), so the note says what was dropped per cause.
     Some(format!(
-        "{} file(s) hit the per-file record cap ({}) and were truncated: {listed}{tail} — \
-         split them or raise the cap if the dropped tail matters (#381)",
+        "{} file(s) had content cut short that was NOT indexed: {listed}{tail} — one of: a \
+         single document over the per-document record cap ({} sections; its later sections \
+         were dropped), a mail message over the {} MB per-message cap (only that message's \
+         head was parsed; the messages after it are indexed), or a message with more MIME \
+         parts than the attachment cap (its later parts were dropped). Split the document or \
+         the message if the dropped part matters (#381)",
         names.len(),
-        extract::MAX_RECORDS_PER_FILE
+        extract::MAX_RECORDS_PER_FILE,
+        extract::eml::MAX_EML >> 20,
     ))
 }
 
@@ -4186,6 +4792,15 @@ mod truncation_note_tests {
         );
         assert!(msg.contains("4096") && msg.contains("#381"), "{msg}");
         assert!(!msg.contains("and 0 more"), "{msg}");
+        // Every cap that can set the flag is named — an oversized mail message
+        // is not a "record cap" and must not be reported as one.
+        assert!(msg.contains("64 MB per-message cap"), "{msg}");
+        assert!(msg.contains("MIME parts"), "{msg}");
+        assert!(!msg.contains("raise the cap"), "{msg}");
+        // An oversized message costs that message's tail, not the mailbox's:
+        // the note must not tell a mailbox owner the rest of the file is gone.
+        assert!(!msg.contains("their tail"), "{msg}");
+        assert!(msg.contains("the messages after it are indexed"), "{msg}");
     }
 
     #[test]
@@ -4217,6 +4832,28 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
 /// generated route's `project_reconcile_plan` — is handed this one tally, so
 /// "files parsed by this run" is exactly what it holds.
 fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Option<Value>)> {
+    run_index_report_inner(cfg, tally, None)
+}
+
+/// One pass of a `--watch` session.
+///
+/// Identical to [`run_index_report`] in every respect but one: the pass carries
+/// a digest cache ([`watch::Pass`]) that lets a file the watcher knows did not
+/// change skip its re-hash. Nothing else about the run changes — same journal,
+/// same plan projection, same publish path, same summary — because a second
+/// indexing path is exactly what a watcher must not be.
+pub(crate) fn run_index_report_watched(
+    cfg: IndexCfg,
+    pass: &watch::Pass,
+) -> Result<(i32, Option<Value>)> {
+    run_index_report_inner(cfg, &ScanTally::default(), Some(pass))
+}
+
+fn run_index_report_inner(
+    mut cfg: IndexCfg,
+    tally: &ScanTally,
+    watch: Option<&watch::Pass>,
+) -> Result<(i32, Option<Value>)> {
     // The very first statement of the function, deliberately: `started` must
     // be when this invocation began, not when its summary was built.
     let invocation_started = chrono::Utc::now();
@@ -4232,6 +4869,9 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
     let scan_threads = pool::scan_pool().current_num_threads();
     extract::pdf::configure_workers(cfg.pdf_workers);
     extract::pdf::configure_timeout(cfg.pdf_timeout_secs);
+    // A mailbox is one file on one Phase-B worker; inside it, messages are
+    // parsed on a pool of this width, shared by every mailbox in the run.
+    extract::mbox::configure_parallelism(cfg.workers);
     let t0 = Instant::now();
     // The progress surface and its ticker are the FIRST things built: every
     // later phase reports through them, and the ticker guarantees the stream
@@ -4287,12 +4927,25 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
     es.ping()?;
 
     let stub_matcher = StubMatcher::compile(&cfg.stub_globs)?;
-    let root_str = cfg
-        .root
-        .canonicalize()
-        .unwrap_or_else(|_| cfg.root.clone())
-        .to_string_lossy()
-        .to_string();
+    // An `s3://`/`r2://` positional argument becomes a local mirror directory
+    // here, before any state is opened: `cfg.root` is rewritten to that mirror,
+    // so every later phase — walk, hash, plan, journal, reconcile — is the code
+    // that has always run over a folder. `None` means the argument was a folder
+    // and nothing at all changes. See `crate::objsource`.
+    let object_run = objsource::prepare(&mut cfg)?;
+    // The run's identity. For an object source it is the bucket URL rather than
+    // the mirror path: the mirror is a cache whose location may move (it follows
+    // --state-dir), and hashing a cache path into the state key would start a
+    // second index — re-downloading every object — the first time it did.
+    let root_str = match &object_run {
+        Some(run) => run.identity.clone(),
+        None => cfg
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| cfg.root.clone())
+            .to_string_lossy()
+            .to_string(),
+    };
     let state_dir = cfg
         .state_dir
         .clone()
@@ -4433,7 +5086,12 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
         pr.phase("replay", 0, 0);
         let mut backend =
             sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20, &pr);
-        sync_executor::replay_pending_operations(&state_dir, &mut journal, &mut backend)?;
+        sync_executor::replay_pending_operations_reporting(
+            &state_dir,
+            &mut journal,
+            &mut backend,
+            &pr,
+        )?;
         // Through the progress surface, never a bare `eprintln!`: stderr
         // belongs to that surface, so `--progress none` stays silent and
         // `--progress json` stays one parseable stream (#241).
@@ -4482,6 +5140,67 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
             state_dir.join("journal.ndjson").display()
         );
     }
+    // The object-store transfer phase. It runs AFTER state authority has been
+    // acquired (two runs over one source must not fetch into the same mirror at
+    // once) and BEFORE the walk, which then sees ordinary local files.
+    let mut object_report: Option<objsource::MaterializeReport> = None;
+    if let Some(run) = &object_run {
+        pr.note(&format!(
+            "autoindex: object source {} — mirroring into {}",
+            run.identity,
+            run.mirror.display()
+        ));
+        let mode = if cfg.dry_run {
+            objsource::MaterializeMode::PlanOnly
+        } else {
+            objsource::MaterializeMode::Fetch
+        };
+        let report = objsource::materialize(run, &pr, cfg.scan_workers, mode)?;
+        for line in report.summary_lines() {
+            pr.note(&format!("autoindex: {line}"));
+        }
+        // Not a `note`: what a run costs at the object store is the kind of fact
+        // an operator has to see even when they asked for quiet, because the
+        // mistake it prevents is a cron entry that spends a monthly allowance.
+        for line in report.cost_lines() {
+            pr.warn(&format!("autoindex: {line}"));
+        }
+        if cfg.dry_run && report.pending > 0 {
+            // stdout is the RESULT. A dry run over an object source that would
+            // have to transfer bytes stops here instead of transferring them.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "source": run.identity,
+                    "objects_listed": report.objects_listed,
+                    "objects_admitted": report.admitted,
+                    "objects_to_fetch": report.pending,
+                    "bytes_to_fetch": report.pending_bytes,
+                    "objects_already_local": report.unchanged,
+                    "list_requests_class_a": report.list_requests,
+                    "mirror": run.mirror.display().to_string(),
+                }))?
+            );
+            pr.note(
+                "(dry run — nothing downloaded and nothing indexed. A discovery plan needs the \
+                 object bytes, and a preview must not pay for them: run without --dry-run to \
+                 fetch and index, or re-run --dry-run once the mirror is current to get the \
+                 plan projection for free.)",
+            );
+            pr.finish(
+                true,
+                0,
+                "dry-run-object-source",
+                &[
+                    ("objects", report.admitted),
+                    ("objects_to_fetch", report.pending),
+                    ("list_requests", report.list_requests),
+                ],
+            );
+            return Ok((0, None));
+        }
+        object_report = Some(report);
+    }
     // Totals are unknown until the walk returns, so this phase honestly
     // reports `pct=unknown` and proves liveness with the clock alone.
     pr.phase("walk", 0, 0);
@@ -4507,7 +5226,7 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
     // state: with a journal present, zero files is a deletion of the whole
     // corpus and has to be reconciled, not shrugged off.
     if discovered_files.is_empty() && !preflight.journal_exists {
-        println!("no files found under {}", cfg.root.display());
+        println!("no files found under {root_str}");
         pr.finish(true, 0, "no-files", &[]);
         return Ok((0, None));
     }
@@ -4517,8 +5236,38 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
     // forever after a same-size rewrite with restored or stale timestamps.
     // Hashing reads every byte of the corpus. On a large tree it is minutes of
     // real work, and before #241 it was minutes with no output at all.
-    pr.phase("hash", discovered_files.len() as u64, discovered_bytes);
-    let mut inventory = content::resolve_reporting(discovered_files, &|bytes| pr.item_done(bytes))?;
+    let mut inventory = match watch {
+        // A plain run hashes the whole corpus, every time, on purpose: see
+        // `content::resolve_reporting`.
+        None => {
+            pr.phase("hash", discovered_files.len() as u64, discovered_bytes);
+            content::resolve_reporting(discovered_files, &|bytes| pr.item_done(bytes))?
+        }
+        // A `--watch` pass hashes what the watcher could not prove unchanged.
+        // The phase's totals are the files this pass will actually read, so the
+        // percent and the ETA describe the work being done rather than the work
+        // a full run would have done.
+        Some(pass) => {
+            let plan = pass.plan(&discovered_files);
+            let (carried_files, carried_bytes) = (plan.carried_files, plan.carried_bytes);
+            pr.phase("hash", plan.hash_files, plan.hash_bytes);
+            pr.note(&format!(
+                "autoindex: --watch: re-hashing {} file(s) ({} MB); {carried_files} file(s) \
+                 ({} MB) carried from the previous pass",
+                plan.hash_files,
+                plan.hash_bytes >> 20,
+                carried_bytes >> 20,
+            ));
+            let inventory = content::resolve_reporting_carried(
+                discovered_files,
+                &|entry| plan.carried(entry),
+                &|entry, digest, fresh| plan.observe(entry, digest, fresh),
+                &|bytes| pr.item_done(bytes),
+            )?;
+            pass.commit(plan);
+            inventory
+        }
+    };
     if cfg.no_graph && preflight.committed_manifest.is_some() && !genesis_recovery {
         if cfg.dry_run {
             let base = preflight
@@ -4663,7 +5412,12 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
         )?;
         let mut backend =
             sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20, &pr);
-        sync_executor::replay_pending_operations(&state_dir, &mut journal, &mut backend)?;
+        sync_executor::replay_pending_operations_reporting(
+            &state_dir,
+            &mut journal,
+            &mut backend,
+            &pr,
+        )?;
         let summary = finish_generated_run(&es, &mut journal, &cfg)?;
         let code = generated_exit_code(&summary);
         finish_generated_progress(&pr, code, &summary);
@@ -4815,7 +5569,7 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
     sync_executor::gc_snapshots(&state_dir, &journal)?;
     let resumed_with_plan = journal.plan.is_some() && !genesis_recovery;
     if inventory.files.is_empty() && !resumed_with_plan {
-        println!("no files found under {}", cfg.root.display());
+        println!("no files found under {root_str}");
         pr.finish(true, 0, "no-files", &[]);
         return Ok((0, None));
     }
@@ -5066,6 +5820,11 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
     //
     // It runs before the #238 junk sweep below on purpose: a refused rerun
     // must compute nothing and mutate nothing.
+    // An exclusion sweep removes a file's documents without this run re-reading
+    // anything; a reply edge from a surviving mailbox into the swept one would
+    // stay live. The corpus-wide mail pass below re-derives those edges when
+    // this is set (see `carry_over_unread_mail`).
+    let mut swept_excluded = false;
     if resumed_with_plan {
         let delta = UnsupportedInventoryDelta::between(&cfg.root, &files, &keys, &plan);
         if delta.refuses() {
@@ -5074,6 +5833,7 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
         // #589: sweep documents left behind by a widened exclusion (see gate
         // above). Genuine deletions still refuse; never mutate under --dry-run.
         if !delta.excluded_content_groups.is_empty() && !cfg.dry_run {
+            swept_excluded = true;
             let edges_index = graph_edges_index(&cfg);
             sweep_excluded_groups(
                 &es,
@@ -5344,6 +6104,16 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
     }
 
     if cfg.no_graph && !resumed_with_plan {
+        // #929: install the mappings BEFORE anything is sealed, so a dataset
+        // the server refuses leaves the plan while it still coherently can. The
+        // generation is then derived from the plan that was actually accepted.
+        let sizes: HashMap<&str, u64> = inventory
+            .keys
+            .iter()
+            .zip(&inventory.files)
+            .map(|(key, file)| (key.as_str(), file.size))
+            .collect();
+        let (plan, installed_identity) = preflight_generation_mappings(&es, plan, &sizes, &pr)?;
         begin_non_graph_generation(
             &es,
             &mut journal,
@@ -5355,8 +6125,14 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
             plan,
         )?;
         let mut backend =
-            sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20, &pr);
-        sync_executor::replay_pending_operations(&state_dir, &mut journal, &mut backend)?;
+            sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20, &pr)
+                .with_installed_mappings(installed_identity);
+        sync_executor::replay_pending_operations_reporting(
+            &state_dir,
+            &mut journal,
+            &mut backend,
+            &pr,
+        )?;
         let summary = finish_generated_run(&es, &mut journal, &cfg)?;
         let code = generated_exit_code(&summary);
         finish_generated_progress(&pr, code, &summary);
@@ -5381,15 +6157,60 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
     // ── create indices with explicit mappings ────────────────────────────
     // Two round trips per dataset; a 135-dataset plan is a real wait.
     pr.phase("prepare", plan.datasets.len() as u64, 0);
+    // #929: the same split the generated path makes (`install_dataset_mappings`).
+    // A server REFUSAL of one dataset's mapping costs that dataset, not the run
+    // — but only while the plan is still this invocation's to change. A resumed
+    // plan is already durable and may already have published files under the
+    // dataset, so dropping it there would strand live documents; that case
+    // stays fatal, exactly as before.
+    let mut refused: Vec<MappingRefusal> = Vec::new();
     for d in &plan.datasets {
-        es.ensure_index(&d.index, &build_mapping(&d.specs))
-            .with_context(|| format!("create index {}", d.index))?;
-        es.update_mapping(
-            &d.index,
-            &json!({"properties": {"ax_paths": {"type": "keyword"}}}),
-        )
-        .with_context(|| format!("upgrade alias-path mapping for {}", d.index))?;
+        let installed = es
+            .ensure_index(&d.index, &build_mapping(&d.specs))
+            .with_context(|| format!("create index {}", d.index))
+            .and_then(|()| {
+                es.update_mapping(
+                    &d.index,
+                    &json!({"properties": {"ax_paths": {"type": "keyword"}}}),
+                )
+                .with_context(|| format!("upgrade alias-path mapping for {}", d.index))
+            });
+        match installed {
+            Ok(()) => {}
+            Err(error)
+                if !resumed_with_plan
+                    && error.downcast_ref::<esclient::MappingRefused>().is_some() =>
+            {
+                refused.push((d.slug.clone(), refusal_reason(&error)));
+            }
+            Err(error) => return Err(error),
+        }
         pr.item_done(0);
+    }
+    if !refused.is_empty() {
+        let sizes: HashMap<&str, u64> = keys
+            .iter()
+            .zip(&files)
+            .map(|(key, file)| (key.as_str(), file.size))
+            .collect();
+        let before = plan.files.len();
+        refuse_datasets(&mut plan, &refused, &sizes);
+        for refusal in &plan.refused_datasets {
+            pr.warn(&format!(
+                "autoindex: dataset {} REFUSED by the server — {} file(s) recorded as junk and NOT \
+                 indexed; every other dataset continues. {}",
+                refusal.dataset.slug,
+                refusal.file_keys.len(),
+                refusal.reason
+            ));
+        }
+        pr.warn(&format!(
+            "autoindex: {} dataset(s) refused, {} of {before} file(s) not indexed — this run will \
+             exit 3 and name them in its summary (`datasets_refused`)",
+            plan.refused_datasets.len(),
+            before - plan.files.len(),
+        ));
+        plan_changed = true;
     }
     es.ensure_index(catalog::CATALOG_INDEX, &catalog::catalog_mapping())?;
     es.update_mapping(
@@ -5444,6 +6265,9 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
     // Snapshot whether live records may already exist before this run starts
     // any new publication intents. Fresh first publications can skip the
     // delete/refresh round trip; replacements and crash repairs cannot.
+    // Read before the journal moves behind its mutex: did the previous
+    // invocation reach its summary? (`Journal::interrupted`.)
+    let journal_interrupted = journal.interrupted;
     let mut cleanup_required: std::collections::HashSet<String> = journal
         .done
         .keys()
@@ -5476,7 +6300,7 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
     if plan_changed {
         journal.write_plan(&plan)?;
     }
-    replacement_failpoint(1).context("after durable replacement plan")?;
+    replacement_failpoint(1, &state_dir).context("after durable replacement plan")?;
 
     let unity_guid_map = build_unity_guid_map(&files, &plan, &pr);
     report_unity_guid_map(&unity_guid_map, &pr);
@@ -5783,7 +6607,7 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
             created_at_ms,
             written: Mutex::new(written),
             self_dropped: AtomicU64::new(assembled.self_dropped),
-            invalidated,
+            invalidated: AtomicU64::new(invalidated),
         })
     };
 
@@ -5875,7 +6699,7 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
                     // included: progress measures work drained from the queue,
                     // and a `continue` that skipped the count would park the
                     // bar short of 100% forever.
-                    let _in_flight = pr.file(&f.rel, f.size);
+                    let in_flight = pr.file(&f.rel, f.size);
                     let key = &keys[i];
                     let expected_digest = &digests[i];
                     let fa = plan.files.get(key).unwrap();
@@ -6019,6 +6843,17 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
                                 file_junk += 1;
                                 return true;
                             };
+                            // Progress INSIDE a mailbox. One Takeout mbox is
+                            // the whole corpus, so crediting its bytes only
+                            // when the file finishes left the bar at 0.0% and
+                            // `since_progress_s` climbing for the entire run.
+                            // Every mbox record says how far into the file its
+                            // message began; that is the position.
+                            if sn.family == Family::Mbox {
+                                if let Some(offset) = extract::mbox::locator_offset(&rec.locator) {
+                                    in_flight.advance_to(container_extract_credit(f.size, offset));
+                                }
+                            }
                             let mut fields = rec.fields;
                             // BEFORE coercion, not after: these are ordinary
                             // record fields once stamped, and a field that
@@ -6076,6 +6911,25 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
                             // string the node doc carries, and `id` is the
                             // section node the evidence lives in.
                             if let Some(gr) = graph.as_ref() {
+                                // Structured (field-level) detection first: it
+                                // is offered every record, text section or not
+                                // — an email's locators (`m{off}-msg-s0`) are
+                                // deliberately not text sections, and its
+                                // thread edges come from parsed headers.
+                                if let (Some(cf), Some(staged_fields)) =
+                                    (gr.corpus.files.get(&f.rel), doc.as_object())
+                                {
+                                    let ctx = detect::RecordCtx {
+                                        corpus: &gr.corpus,
+                                        file: cf,
+                                        locator: &rec.locator,
+                                        doc_id: &id,
+                                        fields: staged_fields,
+                                    };
+                                    for det in &gr.detectors {
+                                        det.detect_record(&ctx, &mut edge_drafts);
+                                    }
+                                }
                                 if let Some(label) = section_label(&rec.locator) {
                                     if let (Some(cf), Some(body)) = (
                                         gr.corpus.files.get(&f.rel),
@@ -6277,7 +7131,7 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
                             }
                         }
                         if send_err.is_none() {
-                            if let Err(error) = replacement_failpoint(2) {
+                            if let Err(error) = replacement_failpoint(2, &state_dir) {
                                 send_err = Some(format!("{error:#}"));
                             }
                         }
@@ -6289,6 +7143,11 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
                         }
                     }
                     if send_err.is_none() {
+                        // The second half of a mailbox's bar: staged bytes
+                        // handed to the engine, out of staged bytes in total.
+                        let credit_send = sn.family == Family::Mbox;
+                        let staged_len = staged.as_file().metadata().map(|m| m.len()).unwrap_or(0);
+                        let mut staged_sent = 0u64;
                         let mut reader = BufReader::new(staged.as_file_mut());
                         let mut buf = Vec::with_capacity(bulk_cut + (1 << 20));
                         let mut docs = 0usize;
@@ -6323,6 +7182,7 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
                             }
                             buf.extend_from_slice(&action);
                             buf.extend_from_slice(&document);
+                            staged_sent += (action.len() + document.len()) as u64;
                             docs += 1;
                             if (buf.len() >= bulk_cut || docs >= 5000)
                                 && record_bulk_outcome(
@@ -6338,6 +7198,13 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
                             if buf.is_empty() {
                                 docs = 0;
                                 buf.reserve(bulk_cut);
+                                if credit_send {
+                                    in_flight.advance_to(container_send_credit(
+                                        f.size,
+                                        staged_sent,
+                                        staged_len,
+                                    ));
+                                }
                             }
                         }
                         if !buf.is_empty() && send_err.is_none() {
@@ -6402,7 +7269,7 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
                         }
                         continue;
                     }
-                    if let Err(error) = replacement_failpoint(4) {
+                    if let Err(error) = replacement_failpoint(4, &state_dir) {
                         let mut errors = bulk_errors.lock().unwrap();
                         if errors.len() < 5 {
                             errors.push(format!("{error:#}"));
@@ -6459,11 +7326,55 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
     if let Some(gr) = &graph {
         if bulk_errors.lock().unwrap().is_empty() {
             pr.phase("graph-corpus", gr.detectors.len() as u64, 0);
+            // Mail files this run did not re-read still belong to the corpus
+            // the thread edges are a function of. Their message nodes come
+            // back from the index BEFORE the corpus pass, so the pass resolves
+            // over every message, not over the ones this invocation read.
+            let reread: std::collections::HashSet<&str> =
+                todo_set.iter().map(|&i| files[i].rel.as_str()).collect();
+            let index_of_slug: HashMap<&str, &str> = ds_rt
+                .iter()
+                .map(|(slug, rt)| (slug.as_str(), rt.index.as_str()))
+                .collect();
+            let carried = match carry_over_unread_mail(
+                &es,
+                gr,
+                &index_of_slug,
+                &reread,
+                journal_interrupted || swept_excluded,
+            ) {
+                Ok(carried) => carried,
+                Err(e) => {
+                    bulk_errors.lock().unwrap().push(format!(
+                        "carry over un-re-read mail for thread edges: {e:#}"
+                    ));
+                    CarriedMail::default()
+                }
+            };
+            if carried.messages > 0 {
+                pr.note(&format!(
+                    "graph: {} message(s) of {} mail file(s) this run did not re-read were \
+                     loaded back from the index so reply edges resolve over the whole corpus",
+                    carried.messages,
+                    carried.rels.len()
+                ));
+            }
             let mut drafts = Vec::new();
             for det in &gr.detectors {
                 det.detect_corpus(&gr.corpus, &mut drafts);
                 pr.item_done(0);
             }
+            // The edges of carried files that STILL hold, by id. Anything live
+            // under those files that is not in here was superseded.
+            let carried_keep: std::collections::HashSet<String> = drafts
+                .iter()
+                .filter(|d| {
+                    d.edge_type == detect::emailthread::REPLIES_TO
+                        && carried.rels.contains(&d.src_file)
+                        && d.src != d.dst
+                })
+                .map(|d| detect::edge_id(&d.src, d.edge_type, &d.dst, d.valid_at_ms))
+                .collect();
             if !drafts.is_empty() {
                 let out = detect::assemble(&drafts, &gr.edges_index, gr.created_at_ms);
                 gr.self_dropped
@@ -6498,6 +7409,28 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
                             *written.entry(edge.detector).or_default() += 1;
                         }
                     }
+                }
+            }
+            // AFTER the new edges are written, never before: a crash between
+            // the two leaves a superseded edge live for one more run, not a
+            // reply with no edge at all.
+            if !carried.rels.is_empty() && bulk_errors.lock().unwrap().is_empty() {
+                let rels: Vec<&str> = carried.rels.iter().map(String::as_str).collect();
+                match detect::invalidate_edges_except(
+                    &es,
+                    &gr.edges_index,
+                    detect::emailthread::REPLIES_TO,
+                    &rels,
+                    &carried_keep,
+                    gr.created_at_ms,
+                ) {
+                    Ok(n) => {
+                        gr.invalidated.fetch_add(n, Ordering::Relaxed);
+                    }
+                    Err(e) => bulk_errors
+                        .lock()
+                        .unwrap()
+                        .push(format!("invalidate superseded reply edges: {e:#}")),
                 }
             }
         }
@@ -6908,6 +7841,7 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
     // `all_junk` holds on `plan` and `new_unplanned`, which the durable
     // junk-plan update below mutates.
     let junk_file_count = all_junk.len();
+    let unextracted_archives = unextracted_archive_lines(&all_junk);
     for jf in &all_junk {
         code_coverage.observe(&jf.format, 0);
         let (id, doc) = catalog::file_doc(
@@ -7001,16 +7935,40 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
             "edges_ambiguous": counters.ambiguous,
             "edges_capped": counters.capped,
             "edges_self_dropped": gr.self_dropped.load(Ordering::Relaxed),
-            "edges_invalidated": gr.invalidated,
+            "edges_invalidated": gr.invalidated.load(Ordering::Relaxed),
         })
     });
     // A resume intentionally reuses and upserts the durable run id. Timing
     // and detector counters therefore describe this latest invocation,
     // while corpus descriptors describe the durable live run state.
+    // What the object store was asked for, when the source was one. Part of the
+    // run document because "how much did indexing this bucket cost" has to be
+    // answerable after the fact, not only from a terminal that has scrolled.
+    let object_source_summary = object_report.as_ref().map(|report| {
+        json!({
+            "objects_listed": report.objects_listed,
+            "objects_admitted": report.admitted,
+            "objects_downloaded": report.downloaded,
+            "bytes_downloaded": report.bytes_downloaded,
+            "objects_unchanged_not_downloaded": report.unchanged,
+            "objects_removed_locally": report.removed,
+            "objects_vanished_between_list_and_get": report.vanished,
+            "objects_without_etag": report.without_etag,
+            "list_requests_class_a": report.list_requests,
+            "get_requests_class_b": report.read_requests,
+            "transfer_ms": report.elapsed_ms,
+            "keys_skipped_by_rule": report
+                .skipped
+                .iter()
+                .map(|(rule, count)| (rule.clone(), json!(count)))
+                .collect::<Map<String, Value>>(),
+        })
+    });
     let mut run_doc = json!({
         "doc_kind": "run",
         "run_id": run_id,
         "root": root_str,
+        "object_source": object_source_summary,
         "url": cfg.url,
         "prefix": cfg.prefix,
         "started": started,
@@ -7021,6 +7979,10 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
         "files_indexed": journal_mx.lock().unwrap().done.len(),
         "duplicate_files": plan.duplicate_files.len(),
         "files_junk": junk_file_count,
+        // The junk a user can act on, by name and with the command to run —
+        // so a `--json` caller sees why a Takeout `.zip` indexed nothing
+        // without a second command (`unextracted_archive_lines`).
+        "unextracted_archives": unextracted_archives,
         "records_total": total_records,
         // Two numbers, one definition each, neither of them overlapping.
         //
@@ -7083,6 +8045,10 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
     if let Some(g) = &graph_summary {
         run_doc["graph"] = g.clone();
     }
+    // #929: a corpus that lacks a dataset says so in its own run document.
+    for (key, value) in plan.refused_run_fields() {
+        run_doc[key] = value;
+    }
     // Appended rather than written into the literal above: `serde_json::json!`
     // recurses once per key and that literal is already 30 deep — the same
     // reason `catalog::catalog_mapping` inserts its tail fields.
@@ -7106,7 +8072,14 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
     push_doc(&format!("run:{run_id}"), &run_doc, &mut cat_buf);
 
     if !cat_buf.is_empty() {
-        let outcome = es.bulk(cat_buf).context("write catalog")?;
+        // #955: one document per file — this body grows with the corpus, and
+        // it used to go out as ONE request whatever `--bulk-mb` said. Past the
+        // engine's 50,000-action limit the answer is a single 413 item, which
+        // is not a `server_error`, so the check below let a run report success
+        // with NO catalog written. Windowed like every other bulk.
+        let outcome = es
+            .bulk_windowed(cat_buf, cfg.bulk_mb << 20)
+            .context("write catalog")?;
         // The catalog is the data map every later `map`/`status`/agent query
         // reads; a rejected catalog bulk (e.g. a write block that engaged
         // mid-run) must not be swallowed into a "success" exit (#195).
@@ -7120,6 +8093,17 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
                     .as_deref()
                     .unwrap_or("unknown server error")
             );
+        }
+        // A catalog document the server refused is a file or dataset that
+        // `xerj autoindex map` will not show. It has never ended a run and
+        // does not now, but it is no longer silent either (#955).
+        if outcome.item_errors > 0 {
+            pr.note(&format!(
+                "autoindex: WARNING — the server refused {} catalog document(s): {}. The \
+                 records are indexed; `xerj autoindex map` will be missing those entries",
+                outcome.item_errors,
+                outcome.first_error.as_deref().unwrap_or("no reason given")
+            ));
         }
     }
     es.refresh(catalog::CATALOG_INDEX).ok();
@@ -7166,6 +8150,12 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
             records_total.load(Ordering::Relaxed),
             files_done.load(Ordering::Relaxed),
         );
+        if !unextracted_archives.is_empty() {
+            println!("not indexed — archives are never opened; extract, then run this command on the extracted folder:");
+            for line in &unextracted_archives {
+                println!("  {line}");
+            }
+        }
         let mut rows: Vec<(&String, u64)> = plan
             .datasets
             .iter()
@@ -7280,6 +8270,26 @@ fn run_index_report_tallied(cfg: IndexCfg, tally: &ScanTally) -> Result<(i32, Op
         ("junk_files", junk_file_count as u64),
     ];
     done_fields.extend(code_coverage.fields());
+    // #944: present only when the run re-sent items the server answered 429.
+    if es.bulk_backpressure_retries() > 0 {
+        done_fields.push(("bulk_retries", es.bulk_backpressure_retries()));
+    }
+    // #955: present only when the server refused a request as too large.
+    if es.bulk_requests_split() > 0 {
+        done_fields.push(("bulk_splits", es.bulk_requests_split()));
+    }
+    // #929: only when it happened, so a whole corpus prints the line it always
+    // did and one that lost a dataset cannot print the same one.
+    if !plan.refused_datasets.is_empty() {
+        done_fields.push(("datasets_refused", plan.refused_datasets.len() as u64));
+        done_fields.push((
+            "files_refused",
+            plan.refused_datasets
+                .iter()
+                .map(|refusal| refusal.file_keys.len() as u64)
+                .sum(),
+        ));
+    }
     if alias_sweep_error.is_some() {
         done_fields.push((
             "catalog_alias_sweep_failures",
@@ -8980,6 +9990,8 @@ mod code_coverage_tests {
 mod failure_resume_http_tests;
 #[cfg(test)]
 mod incremental_reconcile_http_tests;
+#[cfg(test)]
+mod refused_dataset_tests;
 
 /// The Unity PIPELINE half — `build_unity_guid_map` + `enrich_unity_fields`
 /// + the plan's field registration, driven through the real phase-A planner.
@@ -9229,6 +10241,58 @@ mod unity_pipeline_tests {
             g.no_guid,
             vec!["Assets/Broken.cs.meta".to_string()],
             "the .meta with no usable guid must be named, not silently skipped"
+        );
+    }
+}
+
+#[cfg(test)]
+mod container_progress_tests {
+    use super::{container_extract_credit, container_send_credit, CONTAINER_EXTRACT_PERCENT};
+
+    /// Whatever the split, the two stages together cover the file EXACTLY:
+    /// extraction ends where sending starts, sending ends on the file's size.
+    #[test]
+    fn the_two_stages_meet_and_end_on_the_file_size() {
+        for size in [0u64, 1, 99, 100, 1_073_777_879, u64::MAX] {
+            let seam = container_extract_credit(size, size);
+            assert_eq!(container_send_credit(size, 0, 1000), seam, "size={size}");
+            assert_eq!(container_send_credit(size, 1000, 1000), size, "size={size}");
+            assert!(seam <= size);
+            // Nothing staged (every entry was junk): stay at the seam; the
+            // guard's drop credits the rest.
+            assert_eq!(container_send_credit(size, 0, 0), seam);
+        }
+        assert_eq!(
+            container_extract_credit(1000, 1000),
+            10 * CONTAINER_EXTRACT_PERCENT
+        );
+    }
+
+    #[test]
+    fn credit_is_monotonic_and_never_overflows() {
+        let size = u64::MAX;
+        let mut last = 0;
+        for offset in [0, 1, u64::MAX / 3, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
+            let c = container_extract_credit(size, offset);
+            assert!(c >= last && c <= size);
+            last = c;
+        }
+        let mut last = container_extract_credit(size, size);
+        for sent in [0u64, 1, 500, 999, 1000, 5000] {
+            let c = container_send_credit(size, sent, 1000);
+            assert!(c >= last && c <= size, "sent={sent}");
+            last = c;
+        }
+    }
+
+    /// A gzipped mailbox reports DECOMPRESSED offsets, which run past the size
+    /// on disk. Extraction must stop at its own share.
+    #[test]
+    fn a_decompressed_offset_past_the_file_size_is_clamped() {
+        let size = 1000;
+        assert_eq!(
+            container_extract_credit(size, 50_000),
+            container_extract_credit(size, size)
         );
     }
 }
