@@ -111,7 +111,8 @@ pub const DEFAULT_MAX_DOC_CHARS: usize = 1200;
 /// Ceiling on `rerank.instructions`, in characters.
 ///
 /// The instructions are not sent once: the System One wire format carries them
-/// inside EVERY per-document question, so whatever the caller writes here is
+/// inside EVERY per-document question, alongside that question's candidate
+/// text (clipped by `max_doc_chars`), so whatever the caller writes here is
 /// multiplied by the window. Uncapped, a 1 MB string at `window: 40` and
 /// `max_doc_chars: 1` put 40 MB on the wire to the provider (measured in
 /// review), and an 8 MB one grew the node's peak RSS by 700 MB for a single
@@ -651,40 +652,50 @@ fn error_body(text: &str, api_key: &str) -> String {
 /// construction rather than by every caller remembering to validate. For a
 /// request that came through the parser the cuts change nothing.
 pub fn build_jev_request(query: &str, batch: &[Candidate], cfg: &RerankConfig) -> Value {
-    let mut documents = Map::new();
     let mut questions = Map::new();
-    let instructions = clip(cfg.question(), MAX_INSTRUCTIONS_CHARS);
     let max_doc_chars = cfg.max_doc_chars.min(MAX_DOC_CHARS);
+
+    // Each question carries its own candidate inside `instructions`, and the
+    // question names that field in backticks — the reference pattern the
+    // System One API documents for pointing a question at structured data.
+    // The previous shape kept every candidate in shared `state` and asked an
+    // untargeted "does this document answer the query" per key, which the
+    // model read as one question about the pile: measured 0.3822 nDCG@10 over
+    // 40 SciFact shortlists against 0.8389 for this shape, root cause isolated
+    // at the raw API (docs/research/typesafe-skill-2026-09/NOTES.md, 2026-09-20).
+    // hev/jev-reranker formats its listwise nouls the same way.
+    let question = match cfg.instructions.as_deref() {
+        Some(custom) => format!(
+            "{} Judge `document` against the query in the state.",
+            clip(custom, MAX_INSTRUCTIONS_CHARS)
+        ),
+        None => "Does `document` contain information that answers the query in the state? \
+                 Judge only whether `document` is relevant to the query, not whether it is \
+                 well written."
+            .to_string(),
+    };
 
     for cand in batch {
         // Keyed by the caller's ordinal, so a reordered or partial response
         // still maps back to the right hit.
         let key = format!("d{}", cand.ordinal);
-        let mut doc = Map::new();
+        let mut doc = String::new();
         if let Some(t) = &cand.title {
-            doc.insert("title".into(), json!(clip(t, max_doc_chars)));
+            doc.push_str(clip(t, max_doc_chars));
+            doc.push_str(". ");
         }
-        doc.insert("text".into(), json!(clip(&cand.text, max_doc_chars)));
-        documents.insert(key.clone(), Value::Object(doc));
-
+        doc.push_str(clip(&cand.text, max_doc_chars));
         questions.insert(
             key,
             json!({
                 "type": "noul",
-                "instructions": instructions,
-                "criteria": {
-                    "true":  "The document is relevant to the query.",
-                    "false": "The document is not relevant to the query."
-                }
+                "instructions": { "question": question.as_str(), "document": doc }
             }),
         );
     }
 
     json!({
-        "state": {
-            "query": clip(query, MAX_QUERY_CHARS),
-            "documents": Value::Object(documents),
-        },
+        "state": clip(query, MAX_QUERY_CHARS),
         "model": clip(&cfg.model, MAX_MODEL_CHARS),
         "questions": Value::Object(questions),
     })
@@ -1492,12 +1503,19 @@ mod tests {
         let body = build_jev_request("vitamin d bone density", &cands(2), &cfg);
 
         assert_eq!(body["model"], "jev-latest");
-        assert_eq!(body["state"]["query"], "vitamin d bone density");
-        assert_eq!(body["state"]["documents"]["d0"]["text"], "body 0");
-        // One noul question per document, keyed identically to the document.
+        assert_eq!(body["state"], "vitamin d bone density");
+        // One noul question per candidate, and the candidate rides inside the
+        // question it is judged by — the question names `document` in backticks,
+        // so the model cannot judge the batch as one pile.
         assert_eq!(body["questions"]["d0"]["type"], "noul");
         assert_eq!(body["questions"]["d1"]["type"], "noul");
-        assert!(body["questions"]["d0"]["criteria"]["true"].is_string());
+        let instr = &body["questions"]["d0"]["instructions"];
+        assert!(
+            instr["question"].as_str().unwrap().contains("`document`"),
+            "the question must target `document`: {}",
+            instr["question"]
+        );
+        assert_eq!(instr["document"], "title 0. body 0");
         assert_eq!(body["questions"].as_object().unwrap().len(), 2);
     }
 
