@@ -7515,6 +7515,8 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "aws-sdk-s3",
+ "aws-smithy-http-client",
  "byteorder",
  "bytes",
  "crc32fast",
