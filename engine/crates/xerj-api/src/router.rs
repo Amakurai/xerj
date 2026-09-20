@@ -29,7 +29,7 @@ use xerj_common::config::CorsConfig;
 
 use crate::{
     audit_mw, auth::auth_middleware, authz, es_compat, graph_api, ism_api, memory_api, native,
-    share, state::AppState, wal_tap_api,
+    share, state::AppState, systemone_api, wal_tap_api,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -124,6 +124,11 @@ pub fn build_native_router(state: AppState) -> Router {
         .route("/health/live", get(native::liveness))
         .route("/health/ready", get(native::readiness))
         .route("/v1/metrics", get(native::metrics))
+        // The local judge: System One wire-compatible decisions from a
+        // labelled-history vote. Answers nothing until [decisions] index is
+        // set — and then nothing leaves the node to answer it.
+        .route("/v1/systemone", post(systemone_api::systemone))
+        .route("/v1/models", get(systemone_api::models))
         // Admin: cluster-wide flush + backup (snapshot to disk)
         .route("/v1/admin/flush", post(native::admin_flush))
         .route("/v1/admin/backup", post(native::admin_backup))
@@ -252,6 +257,11 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         // firewalled off) can still scrape metrics. Same handler as the native
         // router; gated by the optional read-only `auth.metrics_token`.
         .route("/v1/metrics", get(native::metrics))
+        // The local judge: System One wire-compatible decisions from a
+        // labelled-history vote. Answers nothing until [decisions] index is
+        // set — and then nothing leaves the node to answer it.
+        .route("/v1/systemone", post(systemone_api::systemone))
+        .route("/v1/models", get(systemone_api::models))
         // Autoindex defaults to the ES-compatible listener, so the native
         // embedding identity contract must be available here as well as on
         // the dedicated native listener.
@@ -283,6 +293,9 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         .route("/_cat/count/:index", get(es_compat::cat_count))
         .route("/_cat/shards", get(es_compat::cat_shards))
         .route("/_bulk", post(es_compat::global_bulk))
+        // The audit twin of /v1/systemone: same vote, named index, neighbours
+        // and abstain instead of a wire-shaped error.
+        .route("/_decide", post(systemone_api::decide))
         .route("/_mget", post(es_compat::mget))
         // Index-scoped multi-get — the path index defaults entries that omit `_index`.
         .route(

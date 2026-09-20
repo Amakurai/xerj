@@ -80,6 +80,7 @@ pub mod router;
 pub mod share;
 pub mod state;
 pub mod stub;
+pub mod systemone_api;
 pub mod wal_tap_api;
 
 // ── Convenience re-exports ────────────────────────────────────────────────────

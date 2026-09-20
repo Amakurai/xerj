@@ -553,13 +553,6 @@ impl RerankConfig {
         Ok(cfg)
     }
 
-    fn question(&self) -> &str {
-        self.instructions.as_deref().unwrap_or(
-            "Does this document contain information that answers the query? \
-             Judge only whether it is relevant to the query, not whether it is \
-             well written.",
-        )
-    }
 }
 
 /// Truncate on a char boundary. Byte slicing a `&str` here would panic on any
