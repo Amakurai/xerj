@@ -3453,6 +3453,14 @@ pub struct EsSearchBody {
     /// word would return lexical order to a caller who asked for something else.
     #[serde(default)]
     pub rerank: Option<Value>,
+    /// `post_filter` — accepted-and-ignored for ordinary queries (it never
+    /// reaches the engine; implementing it generally is #204), but captured
+    /// here because beside a `hybrid` query it must be REJECTED (#943): the
+    /// fused hits came back unfiltered with a 200, the exact
+    /// accepted-and-wrong class. `build_search_request` refuses that one
+    /// combination with a 400 naming the supported spellings.
+    #[serde(default)]
+    pub post_filter: Option<Value>,
 }
 
 impl Default for EsSearchBody {
@@ -3489,6 +3497,7 @@ impl Default for EsSearchBody {
             pit: None,
             timeout: None,
             rerank: None,
+            post_filter: None,
         }
     }
 }
@@ -3504,8 +3513,10 @@ impl Default for EsSearchBody {
 /// Full set of top-level keys ES 8.13.4 accepts on the `_search` request
 /// source (live-probed against the reference cluster), NOT merely the subset
 /// `EsSearchBody` models. Keys ES accepts but xerj does not act on
-/// (`terminate_after`, `post_filter`, `stats`, `ext`) stay accepted-and-ignored
-/// exactly as before — only genuinely-unknown keys are rejected.
+/// (`terminate_after`, `stats`, `ext`) stay accepted-and-ignored exactly as
+/// before — only genuinely-unknown keys are rejected. `post_filter` is
+/// accepted-and-ignored too, EXCEPT beside a hybrid query, where it is
+/// rejected (#943): the fused hits used to come back unfiltered with a 200.
 const ES_SEARCH_TOP_LEVEL_KEYS: &[&str] = &[
     "query",
     "from",
@@ -6131,6 +6142,21 @@ fn build_search_request(
 
     let mut req = parse_request(&query_body)
         .map_err(|e| xerj_common::XerjError::invalid_query(e.to_string()))?;
+
+    // #943: `post_filter` never reaches the engine (accepted-and-ignored for
+    // ordinary queries — implementing it generally is #204), but beside a
+    // hybrid query it answered 200 with the UNFILTERED fused hits, which is
+    // the accepted-and-wrong class. Reject that one combination with the
+    // same 400 style the engine already uses for aggs-beside-hybrid,
+    // naming the supported spellings (the filter inside each leg, or the
+    // bool{must, filter} wrapper the engine now pushes into every leg).
+    if body.post_filter.is_some() && req.query.contains_hybrid() {
+        return Err(xerj_common::XerjError::invalid_query(
+            "post_filter is not supported with hybrid/fusion queries; put the \
+             filter inside each leg (hybrid.queries[].query) or beside the hybrid \
+             as bool{must: [hybrid], filter: […]} so it is applied to every leg",
+        ));
+    }
 
     // Make sure size is respected exactly (parse_request uses default_size).
     req.size = body.size;
@@ -21066,6 +21092,9 @@ pub async fn search_with_scroll(
         pit: body.pit.clone(),
         timeout: body.timeout.clone(),
         rerank: None,
+        // #943: forward so the post_filter-beside-hybrid rejection in
+        // `build_search_request` covers scroll requests too.
+        post_filter: body.post_filter.clone(),
     };
     // page_size: what the caller requested (or default 10)
     let page_size = body.size;
