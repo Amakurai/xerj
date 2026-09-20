@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.75] - 2026-09-20
+
 ### Added
 
 - **`xerj share <index|folder>` — give one person read-only search over one

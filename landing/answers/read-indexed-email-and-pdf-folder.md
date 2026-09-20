@@ -2,7 +2,7 @@
 ---
 title: "How do I read email and PDFs after indexing a folder?"
 canonical: "https://xerj.org/answers/read-indexed-email-and-pdf-folder"
-updated: "2026-09-19"
+updated: "2026-09-20"
 source: "content/answers/read-indexed-email-and-pdf-folder.md"
 ---
 
