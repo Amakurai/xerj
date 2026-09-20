@@ -2,7 +2,7 @@
 ---
 title: "How do I keep a XERJ index up to date as files change?"
 canonical: "https://xerj.org/answers/keep-index-current-as-files-change"
-updated: "2026-09-19"
+updated: "2026-09-20"
 source: "content/answers/keep-index-current-as-files-change.md"
 ---
 
