@@ -27,7 +27,7 @@ use xerj_common::config::Config;
 use xerj_console_api::{
     auth::{sessions, store},
     state::ClusterMode,
-    xerj_console_router, ConsoleState,
+    xerj_console_router, ConsoleState, RpConfig,
 };
 use xerj_engine::Engine;
 
@@ -54,6 +54,36 @@ async fn boot() -> (Engine, Router, TempDir, String) {
         ClusterMode::Standalone,
     );
     (engine, xerj_console_router(state), dir, token)
+}
+
+/// Boot the console the way `xerj-server` does after #935: derive the
+/// WebAuthn relying party from the console bind URL instead of the
+/// hard-coded `http://localhost:9200`.
+async fn boot_on_bind_url(bind_url: &str) -> (Router, TempDir, String) {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::default();
+    cfg.server.data_dir = dir.path().to_str().unwrap().to_string();
+    let engine = Engine::new(cfg).expect("engine");
+    let outcome = xerj_console_api::bootstrap::run(&engine, dir.path(), bind_url)
+        .await
+        .expect("bootstrap");
+    let token = outcome
+        .magic_link
+        .clone()
+        .unwrap()
+        .rsplit_once("token=")
+        .unwrap()
+        .1
+        .to_string();
+    let rp = RpConfig::from_bind_url(bind_url).expect("derive rp from bind url");
+    let state = ConsoleState::new_with_rp(
+        engine,
+        "local".into(),
+        outcome.master_key,
+        ClusterMode::Standalone,
+        rp,
+    );
+    (xerj_console_router(state), dir, token)
 }
 
 async fn body_json(resp: axum::response::Response) -> (axum::http::StatusCode, Value) {
@@ -228,6 +258,55 @@ async fn passkey_begin_returns_creation_options_for_valid_enrollment() {
     );
     assert!(opts["rp"].is_object());
     assert!(opts["user"].is_object());
+}
+
+/// Issue #935: a node bound to a loopback IP on a port other than 9200 used
+/// to run its WebAuthn relying party as the hard-coded
+/// `http://localhost:9200`, so the first-launch enrolment was refused with
+/// "the clients relying party origin does not match our servers information"
+/// and nobody could sign in to the console. Deriving the RP from the bind
+/// URL must name `localhost` on the *bound* port, whatever the port is.
+#[tokio::test]
+async fn passkey_begin_on_a_loopback_non_9200_port_names_localhost_as_rp() {
+    let (router, _dir, token) = boot_on_bind_url("http://127.0.0.1:9550").await;
+
+    let r = router
+        .clone()
+        .oneshot(post_json(
+            "/_xerj-console/api/v1/auth/magic/redeem",
+            json!({ "token": token }),
+        ))
+        .await
+        .unwrap();
+    let (_, redeem_body) = body_json(r).await;
+    let enroll_id = redeem_body["data"]["enrollment_session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let r = router
+        .oneshot(post_json(
+            "/_xerj-console/api/v1/auth/passkey/begin",
+            json!({
+                "enrollment_session_id": enroll_id,
+                "email": "owner@example.com",
+                "display_name": "Owner"
+            }),
+        ))
+        .await
+        .unwrap();
+    let (status, body) = body_json(r).await;
+    assert_eq!(status, 200, "body: {body}");
+    let opts = &body["data"]["creation_options"]["publicKey"];
+    assert_eq!(
+        opts["rp"]["id"].as_str(),
+        Some("localhost"),
+        "the relying party must be localhost regardless of the bound IP/port: {body}"
+    );
+    assert!(
+        opts["challenge"].is_string(),
+        "creation_options missing challenge: {body}"
+    );
 }
 
 #[tokio::test]
