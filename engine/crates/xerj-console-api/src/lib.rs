@@ -66,4 +66,4 @@ pub mod views;
 pub use client_ip::ClientIp;
 pub use error::{ConsoleApiError, ConsoleResult};
 pub use router::xerj_console_router;
-pub use state::ConsoleState;
+pub use state::{public_bind_host, ConsoleState, RpConfig};

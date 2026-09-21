@@ -6713,6 +6713,17 @@ fn run_filter(
     docs: &[Value],
     all_docs: &[Value],
 ) -> Value {
+    // #959: reject a clause the query parser itself rejects instead of
+    // counting it. `doc_matches_filter`'s catch-all used to treat ANY
+    // clause type it did not know as "matches every document", so a
+    // typo'd or unsupported clause silently inflated the bucket. The
+    // parser is the single source of truth for "is this a query at all";
+    // terms lookups are already resolved to concrete arrays before the
+    // aggs run (es_compat `resolve_terms_lookups` walks the aggs subtree),
+    // so an unresolved lookup object is also correctly caught here.
+    if let Err(e) = xerj_query::parser::parse_query(filter_query) {
+        return json!({"error": format!("failed to parse `filter` aggregation query: {e}")});
+    }
     let filtered_docs: Vec<Value> = docs
         .iter()
         .filter(|doc| doc_matches_filter(doc, filter_query))
@@ -6761,6 +6772,21 @@ fn run_filters(
         Some(v) => v,
         None => return json!({"buckets": {}}),
     };
+
+    // #959: same entry validation as `run_filter` — a clause the query
+    // parser rejects must surface as an error, never as a bucket that
+    // counts every document (the old catch-all behaviour). Applies to both
+    // the named map and the anonymous array form.
+    let clauses: Vec<&Value> = match filters_val {
+        Value::Object(map) => map.values().collect(),
+        Value::Array(arr) => arr.iter().collect(),
+        _ => Vec::new(),
+    };
+    for q in clauses {
+        if let Err(e) = xerj_query::parser::parse_query(q) {
+            return json!({"error": format!("failed to parse `filters` aggregation query: {e}")});
+        }
+    }
 
     // ES `keyed` defaults to true for a named `filters` map and false for
     // an anonymous array. `keyed:false` on a named map rewrites to an
@@ -6906,7 +6932,11 @@ fn run_filters(
     }
 }
 
-/// Minimal filter matcher — supports term, terms, match_all, bool (must/filter).
+/// Minimal filter matcher — supports match_all, term, terms, match,
+/// match_phrase, prefix, wildcard, regexp, exists, range, and bool
+/// (must/filter/must_not/should). Unknown clause types are NOT a match
+/// (#959); clauses the query parser rejects are surfaced as an error at
+/// run_filter/run_filters entry instead.
 pub(crate) fn doc_matches_filter(doc: &Value, filter: &Value) -> bool {
     let obj = match filter.as_object() {
         Some(o) => o,
@@ -6992,23 +7022,65 @@ pub(crate) fn doc_matches_filter(doc: &Value, filter: &Value) -> bool {
                 if let Some(field_map) = query_body.as_object() {
                     for (field, expected) in field_map {
                         let actual_values = extract_field_values(doc, field);
+                        let (pattern, case_insensitive) = match expected {
+                            Value::Object(o) => (
+                                o.get("value").map(value_to_string).unwrap_or_default(),
+                                o.get("case_insensitive")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false),
+                            ),
+                            other => (value_to_string(other), false),
+                        };
+                        // #959: this arm used to be a hand-rolled
+                        // `*` / `x*` / `*x` / `==` ladder, so a pattern
+                        // with an INNER `*` (`m*-msg-s0`) fell to `==`,
+                        // `*lunch*` became `ends_with("lunch*")`, `?` was
+                        // literal, and `case_insensitive` was ignored —
+                        // every such filter agg counted 0 while `_count`
+                        // was right. Reuse the query path's glob matcher
+                        // (`index::wildcard_match`: `?` = one char, `*` =
+                        // zero or more) so both paths agree. `case_insensitive`
+                        // folds both sides, mirroring the keyword branch of
+                        // `QueryNode::Wildcard` (index.rs).
+                        let matched = if case_insensitive {
+                            let pat_lc = pattern.to_lowercase();
+                            actual_values
+                                .iter()
+                                .any(|v| crate::index::wildcard_match(&v.to_lowercase(), &pat_lc))
+                        } else {
+                            actual_values
+                                .iter()
+                                .any(|v| crate::index::wildcard_match(v, &pattern))
+                        };
+                        if !matched {
+                            return false;
+                        }
+                    }
+                }
+            }
+            "regexp" => {
+                if let Some(field_map) = query_body.as_object() {
+                    for (field, expected) in field_map {
+                        let actual_values = extract_field_values(doc, field);
                         let pattern = match expected {
                             Value::Object(o) => {
                                 o.get("value").map(value_to_string).unwrap_or_default()
                             }
                             other => value_to_string(other),
                         };
-                        let matched = actual_values.iter().any(|v| {
-                            if pattern == "*" {
-                                true
-                            } else if let Some(suffix) = pattern.strip_prefix('*') {
-                                v.ends_with(suffix)
-                            } else if let Some(prefix) = pattern.strip_suffix('*') {
-                                v.starts_with(prefix)
-                            } else {
-                                v == &pattern
-                            }
-                        });
+                        // #959: `regexp` had no arm at all and fell through
+                        // the catch-all ("unknown filter type — pass
+                        // through"), so the filter/filters agg counted
+                        // EVERY document. Compile through the query path's
+                        // anchored-regex cache (`index::
+                        // compiled_anchored_regex`, full-string match like
+                        // ES) and accept any extracted value of a
+                        // multi-valued field — mirroring `QueryNode::Regexp`
+                        // (index.rs). An invalid pattern matches nothing,
+                        // same as the doc-scan arm.
+                        let matched = crate::index::compiled_anchored_regex(&pattern)
+                            .map(|re| actual_values.iter().any(|v| re.is_match(v)))
+                            .unwrap_or(false);
                         if !matched {
                             return false;
                         }
@@ -7171,7 +7243,19 @@ pub(crate) fn doc_matches_filter(doc: &Value, filter: &Value) -> bool {
                     }
                 }
             }
-            _ => {} // Unknown filter type — pass through
+            // #959: an unknown clause type used to "pass through" — it
+            // matched EVERY document, the agg-side twin of the
+            // accepted-and-ignored class of #204 (a `regexp` filter agg
+            // counted the whole index). A clause we cannot evaluate can
+            // never honestly count as a match: return false so such docs
+            // land in the filters-agg `other` bucket instead of silently
+            // inflating counts. Genuinely malformed clauses are rejected
+            // earlier, at run_filter/run_filters entry, via parse_query.
+            // NB: a clause type the parser ACCEPTS but this matcher does
+            // not implement (e.g. `ids`, `fuzzy`) also lands here — it
+            // counts 0, conservative rather than silently wrong. Full
+            // unification with `doc_matches_query_typed` is the follow-up.
+            _ => return false,
         }
     }
     true
@@ -15315,6 +15399,186 @@ mod date_range_filter_tests {
         let f = json!({"range": {"status": {"gte": 500}}});
         assert!(doc_matches_filter(&json!({"status": 503}), &f));
         assert!(!doc_matches_filter(&json!({"status": 200}), &f));
+    }
+}
+
+/// #959: `wildcard` (inner `*`, `?`, `case_insensitive`) and `regexp`
+/// inside a `filter`/`filters` aggregation. The three docs and every
+/// pattern are the issue's exact repro table.
+#[cfg(test)]
+mod wildcard_regexp_filter_tests {
+    use super::{doc_matches_filter, run_filter, run_filters};
+    use serde_json::json;
+
+    fn repro_docs() -> Vec<serde_json::Value> {
+        vec![
+            json!({"loc": "m0-msg-s0",   "subject": "Lunch on Friday?"}),
+            json!({"loc": "m812-msg-s0", "subject": "Quarterly report"}),
+            json!({"loc": "m812-att0-s0", "subject": "Quarterly report"}),
+        ]
+    }
+
+    /// `m*-msg-s0` — an inner `*`. Pre-fix the arm compared the whole
+    /// pattern with `==`, counting 0.
+    #[test]
+    fn wildcard_inner_star_matches() {
+        let f = json!({"wildcard": {"loc": {"value": "m*-msg-s0"}}});
+        let docs = repro_docs();
+        assert!(doc_matches_filter(&docs[0], &f), "m0-msg-s0 must match");
+        assert!(doc_matches_filter(&docs[1], &f), "m812-msg-s0 must match");
+        assert!(
+            !doc_matches_filter(&docs[2], &f),
+            "m812-att0-s0 must NOT match"
+        );
+    }
+
+    /// `*lunch*` with `case_insensitive: true` — a `*` at BOTH ends.
+    /// Pre-fix this degenerated to `ends_with("lunch*")` and the flag was
+    /// never read, counting 0.
+    #[test]
+    fn wildcard_surround_star_case_insensitive_matches() {
+        let f = json!({"wildcard": {"subject": {"value": "*lunch*", "case_insensitive": true}}});
+        let docs = repro_docs();
+        assert!(
+            doc_matches_filter(&docs[0], &f),
+            "\"Lunch on Friday?\" must match case-insensitively"
+        );
+        assert!(!doc_matches_filter(&docs[1], &f));
+        // Case-SENSITIVE (ES default): the capital-L subject must not match.
+        let cs = json!({"wildcard": {"subject": {"value": "*lunch*"}}});
+        assert!(
+            !doc_matches_filter(&docs[0], &cs),
+            "case-sensitive `*lunch*` must NOT match \"Lunch on Friday?\""
+        );
+    }
+
+    /// `m0-msg-s?` — `?` = exactly one character. Pre-fix `?` was literal.
+    #[test]
+    fn wildcard_question_mark_matches_one_char() {
+        let f = json!({"wildcard": {"loc": {"value": "m0-msg-s?"}}});
+        let docs = repro_docs();
+        assert!(doc_matches_filter(&docs[0], &f), "m0-msg-s0 must match");
+        assert!(
+            !doc_matches_filter(&docs[1], &f),
+            "m812-msg-s0 must NOT match"
+        );
+        assert!(!doc_matches_filter(&docs[2], &f));
+    }
+
+    /// `regexp` — pre-fix it fell through the catch-all and matched EVERY
+    /// document (the agg counted 3).
+    #[test]
+    fn regexp_matches_only_the_pattern() {
+        let f = json!({"regexp": {"loc": "m[0-9]+-msg-s0"}});
+        let docs = repro_docs();
+        assert!(doc_matches_filter(&docs[0], &f), "m0-msg-s0 must match");
+        assert!(doc_matches_filter(&docs[1], &f), "m812-msg-s0 must match");
+        assert!(
+            !doc_matches_filter(&docs[2], &f),
+            "m812-att0-s0 must NOT match — pre-fix regexp matched every doc"
+        );
+    }
+
+    /// An invalid regexp pattern matches nothing (query-path parity).
+    #[test]
+    fn regexp_invalid_pattern_matches_nothing() {
+        let f = json!({"regexp": {"loc": "m[0-9+-msg-s0"}});
+        for doc in repro_docs() {
+            assert!(!doc_matches_filter(&doc, &f));
+        }
+    }
+
+    /// A clause nothing satisfies still counts 0 (was already correct —
+    /// guards against over-matching in the other direction).
+    #[test]
+    fn match_nothing_clause_still_counts_zero() {
+        let f = json!({"match": {"subject": "nothing-matches-this"}});
+        for doc in repro_docs() {
+            assert!(!doc_matches_filter(&doc, &f));
+        }
+    }
+
+    /// An unknown clause type is NOT a match. Pre-fix the catch-all
+    /// "passed through" (matched every document).
+    #[test]
+    fn unknown_clause_type_is_not_a_match() {
+        let f = json!({"not_a_real_query_type": {"loc": "m0-msg-s0"}});
+        for doc in repro_docs() {
+            assert!(
+                !doc_matches_filter(&doc, &f),
+                "unknown clause type must not count as a match"
+            );
+        }
+    }
+
+    /// End-to-end through `run_filter`: the issue's five rows, as
+    /// doc_counts over the repro corpus (2 / 1 / 1 / 2 / 0).
+    #[test]
+    fn filter_agg_counts_match_the_issue_table() {
+        let docs = repro_docs();
+        for (filter, expected) in [
+            (json!({"wildcard": {"loc": {"value": "m*-msg-s0"}}}), 2u64),
+            (
+                json!({"wildcard": {"subject": {"value": "*lunch*", "case_insensitive": true}}}),
+                1,
+            ),
+            (json!({"wildcard": {"loc": {"value": "m0-msg-s?"}}}), 1),
+            (json!({"regexp": {"loc": "m[0-9]+-msg-s0"}}), 2),
+            (json!({"match": {"subject": "nothing-matches-this"}}), 0),
+        ] {
+            let out = run_filter(&filter, None, &docs, &docs);
+            assert_eq!(
+                out["doc_count"].as_u64(),
+                Some(expected),
+                "filter {filter} counted {}",
+                out["doc_count"]
+            );
+        }
+    }
+
+    /// End-to-end through `run_filters` (named map form) for the same rows.
+    #[test]
+    fn filters_agg_counts_match_the_issue_table() {
+        let docs = repro_docs();
+        let params = json!({"filters": {
+            "inner_star":   {"wildcard": {"loc": {"value": "m*-msg-s0"}}},
+            "ci_surround":  {"wildcard": {"subject": {"value": "*lunch*", "case_insensitive": true}}},
+            "one_char":     {"wildcard": {"loc": {"value": "m0-msg-s?"}}},
+            "regexp":       {"regexp": {"loc": "m[0-9]+-msg-s0"}},
+            "match_nothing": {"match": {"subject": "nothing-matches-this"}},
+        }});
+        let out = run_filters(&params, None, &docs, &docs);
+        for (key, expected) in [
+            ("inner_star", 2u64),
+            ("ci_surround", 1),
+            ("one_char", 1),
+            ("regexp", 2),
+            ("match_nothing", 0),
+        ] {
+            assert_eq!(
+                out["buckets"][key]["doc_count"].as_u64(),
+                Some(expected),
+                "filters bucket `{key}`"
+            );
+        }
+    }
+
+    /// A clause the query parser rejects surfaces as an error from BOTH
+    /// agg entry points — never as a bucket counting every document.
+    #[test]
+    fn unparseable_clause_yields_an_error_not_a_bucket() {
+        let docs = repro_docs();
+        let bogus = json!({"not_a_real_query_type": {"loc": "m0-msg-s0"}});
+        let filter_out = run_filter(&bogus, None, &docs, &docs);
+        assert!(
+            filter_out.get("error").is_some(),
+            "run_filter must return an error object, got {filter_out}"
+        );
+        let filters_out = run_filters(&json!({"filters": {"b": bogus}}), None, &docs, &docs);
+        assert!(
+            filters_out.get("error").is_some(),
+            "run_filters must return an error object, got {filters_out}"
+        );
     }
 }
 

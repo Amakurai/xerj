@@ -38,3 +38,9 @@ xerj-common = { path = "../xerj-common" }
 # ceilings and the builder refuses exactly what the node would refuse — the
 # two cannot drift. A light leaf: it adds no dependency this crate lacks.
 xerj-rerank = { path = "../xerj-rerank" }
+
+[dev-dependencies]
+# The loopback admin-key fallback tests sandbox cwd + HOME so discovery sees
+# only the key files the test wrote (same pattern as xerj-autoindex's cli
+# tests, where the helper was born).
+tempfile = { workspace = true }

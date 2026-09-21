@@ -3453,6 +3453,14 @@ pub struct EsSearchBody {
     /// word would return lexical order to a caller who asked for something else.
     #[serde(default)]
     pub rerank: Option<Value>,
+    /// `post_filter` — accepted-and-ignored for ordinary queries (it never
+    /// reaches the engine; implementing it generally is #204), but captured
+    /// here because beside a `hybrid` query it must be REJECTED (#943): the
+    /// fused hits came back unfiltered with a 200, the exact
+    /// accepted-and-wrong class. `build_search_request` refuses that one
+    /// combination with a 400 naming the supported spellings.
+    #[serde(default)]
+    pub post_filter: Option<Value>,
 }
 
 impl Default for EsSearchBody {
@@ -3489,6 +3497,7 @@ impl Default for EsSearchBody {
             pit: None,
             timeout: None,
             rerank: None,
+            post_filter: None,
         }
     }
 }
@@ -3504,8 +3513,10 @@ impl Default for EsSearchBody {
 /// Full set of top-level keys ES 8.13.4 accepts on the `_search` request
 /// source (live-probed against the reference cluster), NOT merely the subset
 /// `EsSearchBody` models. Keys ES accepts but xerj does not act on
-/// (`terminate_after`, `post_filter`, `stats`, `ext`) stay accepted-and-ignored
-/// exactly as before — only genuinely-unknown keys are rejected.
+/// (`terminate_after`, `stats`, `ext`) stay accepted-and-ignored exactly as
+/// before — only genuinely-unknown keys are rejected. `post_filter` is
+/// accepted-and-ignored too, EXCEPT beside a hybrid query, where it is
+/// rejected (#943): the fused hits used to come back unfiltered with a 200.
 const ES_SEARCH_TOP_LEVEL_KEYS: &[&str] = &[
     "query",
     "from",
@@ -6091,6 +6102,60 @@ fn value_bearing_field_names(body: &EsSearchBody, fields: &[String]) -> Vec<Stri
     names
 }
 
+/// #932: would an explicit `_source` includes/excludes projection DROP a name
+/// the request pulls a value out of (`fields` / `docvalue_fields`)?
+///
+/// Answered by running the production projection (`xerj_engine::filter_object`)
+/// over probe documents instead of re-deriving its wildcard/dotted semantics —
+/// whatever the projection does to a document that carries ONLY the named
+/// field is what it would do to the real one. Both spellings the fields
+/// builder resolves (`get_source_value_by_path`: the whole dotted path as a
+/// literal key, then the nested walk) are probed, and a name counts as covered
+/// only when BOTH survive — a parent include (`_source: ["a"]`) keeps the
+/// nested `{"a": {"b": …}}` spelling but not a literal `a.b` key, so "either"
+/// would still let a stored flat key be silently dropped. A name that itself
+/// carries a wildcard can select fields the includes list never names, so it
+/// always counts as dropped — the safe direction: piercing re-applies the
+/// caller's filter at emission, so an unnecessary pierce costs only the
+/// `_savings` note, while a missed one is the silent 200 of #932.
+fn source_filter_drops_a_name(
+    includes: &[String],
+    excludes: &[String],
+    value_bearing_names: &[String],
+) -> bool {
+    const PROBE: &str = "__xy_source_cover_probe__";
+    let survives = |doc: &Value, name: &str| -> bool {
+        let filtered = xerj_engine::filter_object(doc, includes, excludes);
+        // Literal spelling: the whole dotted name as one top-level key.
+        if filtered.get(name).and_then(Value::as_str) == Some(PROBE) {
+            return true;
+        }
+        // Nested spelling: walk the name's segments.
+        let mut cur = &filtered;
+        for seg in name.split('.') {
+            match cur.get(seg) {
+                Some(v) => cur = v,
+                None => return false,
+            }
+        }
+        cur.as_str() == Some(PROBE)
+    };
+    value_bearing_names.iter().any(|name| {
+        if name.contains('*') {
+            return true;
+        }
+        let mut flat = serde_json::Map::new();
+        flat.insert(name.clone(), Value::String(PROBE.to_string()));
+        let mut nested = Value::String(PROBE.to_string());
+        for seg in name.rsplit('.') {
+            let mut m = serde_json::Map::new();
+            m.insert(seg.to_string(), nested);
+            nested = Value::Object(m);
+        }
+        !(survives(&Value::Object(flat), name) && survives(&nested, name))
+    })
+}
+
 /// Build a `SearchRequest` from the ES body, forwarding all relevant options.
 fn build_search_request(
     body: &EsSearchBody,
@@ -6131,6 +6196,21 @@ fn build_search_request(
 
     let mut req = parse_request(&query_body)
         .map_err(|e| xerj_common::XerjError::invalid_query(e.to_string()))?;
+
+    // #943: `post_filter` never reaches the engine (accepted-and-ignored for
+    // ordinary queries — implementing it generally is #204), but beside a
+    // hybrid query it answered 200 with the UNFILTERED fused hits, which is
+    // the accepted-and-wrong class. Reject that one combination with the
+    // same 400 style the engine already uses for aggs-beside-hybrid,
+    // naming the supported spellings (the filter inside each leg, or the
+    // bool{must, filter} wrapper the engine now pushes into every leg).
+    if body.post_filter.is_some() && req.query.contains_hybrid() {
+        return Err(xerj_common::XerjError::invalid_query(
+            "post_filter is not supported with hybrid/fusion queries; put the \
+             filter inside each leg (hybrid.queries[].query) or beside the hybrid \
+             as bool{must: [hybrid], filter: […]} so it is applied to every leg",
+        ));
+    }
 
     // Make sure size is respected exactly (parse_request uses default_size).
     req.size = body.size;
@@ -11211,11 +11291,10 @@ async fn search_impl(
     // teaching the engine to treat `Default` as `Enabled(true)` would put
     // companions back into every internal `SearchRequest::default()`.
     let default_source_projection = body.source.is_none();
-    let value_bearing_names = if default_source_projection {
-        value_bearing_field_names(&body, &search_req.fields)
-    } else {
-        Vec::new()
-    };
+    // Computed for BOTH projections (#932): for the default projection these
+    // names drive the companion pierce below; for an explicit narrowing
+    // filter they drive the explicit-filter pierce further down.
+    let value_bearing_names = value_bearing_field_names(&body, &search_req.fields);
     // One schema read-lock per participating index, and only for a request that
     // could actually consume the answer: a pierce (a companion named in
     // `fields`/`docvalue_fields`) OR a collapse `inner_hits` block, whose members
@@ -11240,6 +11319,50 @@ async fn search_impl(
         .iter()
         .any(|f| companions_by_index.values().any(|c| c.contains(f)));
     if pierce_default_source {
+        search_req.source = xerj_query::ast::SourceFilter::Enabled(true);
+    }
+
+    // ── #932: an EXPLICIT `_source` filter has the same blind spot ──
+    //
+    // A narrowing filter — `_source: ["title"]`, the object spelling, and
+    // the URL spellings (`?_source=`, `?_source_includes=`, all promoted
+    // into body.source above) — is applied by the ENGINE
+    // (`apply_source_filter`), which narrows `hit.source` before the
+    // response layer runs. `fields` and `docvalue_fields` resolve out of
+    // that same narrowed source, so `{"_source": ["title"], "fields":
+    // ["body"]}` legally omitted `fields.body`: a 200, no warning, nothing.
+    // The #310 pierce above cannot fire here — it is keyed on
+    // `default_source_projection`.
+    //
+    // Same fix, second path: when the caller's own includes/excludes drop a
+    // value-bearing name, ask the engine for the intact source
+    // (`Enabled(true)` — the shape `"_source": false` already uses for
+    // exactly this resolution) and re-apply the caller's filter at every
+    // `_source` emission site below. Unlike #310 this is not
+    // companion-gated: the field being dropped is the caller's own, text or
+    // keyword alike. A filter that already selects every named field does
+    // not pierce at all — its engine-side narrowing (and its `_savings`
+    // note) stays exactly as it was.
+    let pierce_explicit_source: Option<(Vec<String>, Vec<String>)> =
+        if !default_source_projection && !value_bearing_names.is_empty() {
+            match &search_req.source {
+                xerj_query::ast::SourceFilter::Includes(includes) => {
+                    source_filter_drops_a_name(includes, &[], &value_bearing_names)
+                        .then(|| (includes.clone(), Vec::new()))
+                }
+                xerj_query::ast::SourceFilter::Fields { includes, excludes } => {
+                    source_filter_drops_a_name(includes, excludes, &value_bearing_names)
+                        .then(|| (includes.clone(), excludes.clone()))
+                }
+                // `Enabled(true)` narrows nothing; `Enabled(false)` keeps the
+                // raw source on purpose (suppression is a response-time
+                // decision); `Default` never carries an explicit filter.
+                _ => None,
+            }
+        } else {
+            None
+        };
+    if pierce_explicit_source.is_some() {
         search_req.source = xerj_query::ast::SourceFilter::Enabled(true);
     }
     let search_req = search_req;
@@ -12144,6 +12267,35 @@ async fn search_impl(
                 }
             }
         }
+        // #932 emission site 3: the same obligation for the caller's EXPLICIT
+        // filter — continuation pages are rendered by `scroll_page_response`,
+        // which carries no `fields` clause, so the snapshot must be re-narrowed
+        // before the context is stored. The collapse sentinels are preserved
+        // across the filtering exactly as the engine's own Includes/Fields
+        // branches do (take → filter → reattach, #651), so a scroll+collapse
+        // context keeps rendering inner_hits on pages 2..n.
+        if let Some((includes, excludes)) = &pierce_explicit_source {
+            for (_, h) in snap.iter_mut() {
+                let sentinels: Vec<(&str, Value)> =
+                    ["__xy_collapse_group__", "__xy_collapse_spec__"]
+                        .into_iter()
+                        .filter_map(|k| {
+                            h.source
+                                .as_object()
+                                .and_then(|o| o.get(k))
+                                .map(|v| (k, v.clone()))
+                        })
+                        .collect();
+                h.source = xerj_engine::filter_object(&h.source, includes, excludes);
+                if !sentinels.is_empty() {
+                    if let Some(obj) = h.source.as_object_mut() {
+                        for (k, v) in sentinels {
+                            obj.insert(k.to_string(), v);
+                        }
+                    }
+                }
+            }
+        }
         Some(snap)
     } else {
         None
@@ -12363,6 +12515,19 @@ async fn search_impl(
                     ) {
                         obj.retain(|name, _| !companions.contains(name));
                     }
+                }
+                // #932 emission site 1: this request pierced the caller's
+                // own EXPLICIT `_source` filter so the `fields` builder below
+                // could resolve a name the filter drops. The pierce ends HERE
+                // — `fields` reads `h.source`, which is untouched, while the
+                // wire `_source` carries exactly what the engine-side filter
+                // would have produced (same `filter_object`, same input). The
+                // engine's Includes/Fields branches re-attach the collapse
+                // sentinels around their filtering; that dance is unnecessary
+                // here — the sentinels were already extracted above and
+                // stripped from `s`.
+                if let Some((includes, excludes)) = &pierce_explicit_source {
+                    s = xerj_engine::filter_object(&s, includes, excludes);
                 }
                 // Non-synthetic mode: strip the internal copy-to
                 // tracking marker; keep the copied values in the source
@@ -21066,6 +21231,9 @@ pub async fn search_with_scroll(
         pit: body.pit.clone(),
         timeout: body.timeout.clone(),
         rerank: None,
+        // #943: forward so the post_filter-beside-hybrid rejection in
+        // `build_search_request` covers scroll requests too.
+        post_filter: body.post_filter.clone(),
     };
     // page_size: what the caller requested (or default 10)
     let page_size = body.size;

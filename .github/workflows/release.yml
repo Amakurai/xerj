@@ -210,6 +210,31 @@ jobs:
           else
             shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
           fi
+          # .deb for the linux-gnu targets (issue #810), packed from the SAME
+          # staged binary the tar.gz above just packed — same file, no rebuild,
+          # so the two assets cannot drift. musl targets stay tar.gz-only.
+          # These legs all run on ubuntu-latest, where dpkg-deb is preinstalled.
+          # The control-file version must be a real Debian version string: on a
+          # tag that is the tag; on a main-push canary the ref name ("main") is
+          # not, so the engine workspace version ships instead while the ASSET
+          # keeps the stage name (xerj-main-<target>) to match its tar.gz
+          # sibling — build-deb.sh refuses a non-numeric version, which is the
+          # guard that keeps that honest.
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu)
+              command -v dpkg-deb >/dev/null 2>&1 \
+                || { echo "dpkg-deb not on PATH on ${RUNNER_OS} — cannot build the .deb asset" >&2; exit 1; }
+              case "${GITHUB_REF_NAME}" in
+                v[0-9]*) DEB_VERSION="${GITHUB_REF_NAME#v}" ;;
+                *)        DEB_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' ../engine/Cargo.toml | head -1) ;;
+              esac
+              ../scripts/build-deb.sh \
+                --stage-dir "../dist/${STAGE}" \
+                --target "${{ matrix.target }}" \
+                --version "${DEB_VERSION}" \
+                --out-dir ../dist
+              ;;
+          esac
 
       - name: Stage artifacts (Windows)
         if: matrix.windows == true
@@ -235,6 +260,7 @@ jobs:
           path: |
             dist/xerj-*.tar.gz
             dist/xerj-*.zip
+            dist/xerj-*.deb
             dist/xerj-*.sha256
           if-no-files-found: error
           retention-days: 7
@@ -266,4 +292,5 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.deb
             dist/*.sha256
