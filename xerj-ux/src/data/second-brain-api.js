@@ -252,12 +252,19 @@ const enc = encodeURIComponent;
  * Brains = what the console's brains listing returns (the reserved
  * `.xerj-memory-{brain}-edges` indices this session's role may read,
  * each with its meta-doc `nodes_index`). An empty listing is a normal
- * state (no brains / a role that may not read them), not an error; a
- * transport failure is.
+ * state (no brains), not an error; a transport failure is.
+ *
+ * A 401/403 listing is a REFUSAL, not "no brains": no session / a role
+ * that may not read brains means the page cannot know whether brains
+ * exist, and must say the read was refused — never teach `xerj brain`
+ * over a refusal, and never let the status pill claim LIVE for a read
+ * that did not run (liveSecondBrain's catch shapes this into the
+ * refused envelope; ux/ego-ledger.js#EmptyBrainNote renders it).
  */
 async function discoverBrains(_baseUrl, signal) {
   const r = await fetch(`${GRAPH}/brains`, { signal, credentials: 'same-origin', headers: { accept: 'application/json' } });
-  if (r.status === 401 || r.status === 403 || r.status === 404) return [];
+  if (r.status === 401 || r.status === 403) throw new Error(`graph/brains HTTP ${r.status}`);
+  if (r.status === 404) return []; // a console without the graph routes proves no brain either way
   if (!r.ok) throw new Error(`graph/brains HTTP ${r.status}`);
   const j = await r.json();
   return (((j && j.data && j.data.brains) || [])

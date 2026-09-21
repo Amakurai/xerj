@@ -176,10 +176,11 @@ test('operator reader: changing the query type runs the text in the box, not the
 });
 
 test('the link `xerj brain` prints (#/second-brain?brain=…) opens the Second Brain view even when the brains probe is refused — never a SAMPLE DATA dashboard', { skip }, async () => {
-  // On an auth-enabled engine `GET /_cat/indices/.xerj-memory-*` answers 401
-  // to a console session (this fake does the same without a key), so the
-  // Second Brain dashboard is "gated". The printed link is explicit and must
-  // resolve to it (PR #945 review: it fell through to System's host metrics).
+  // On an engine that refuses graph reads to this console session the brains
+  // listing `/_xerj-console/api/v1/graph/brains` answers 401 (this fake does
+  // so unless a test opens the graph), so the Second Brain dashboard is
+  // "gated". The printed link is explicit and must resolve to it (PR #945
+  // review: it fell through to System's host metrics).
   const page = await openOperator(ctx, '#/second-brain?brain=inbox');
   await page.waitFor(`document.getElementById('app')?.getAttribute('aria-busy') === 'false' && !!document.querySelector('h1.h-scene')`, { label: 'the routed view' });
   await new Promise((r) => setTimeout(r, 300));
@@ -201,9 +202,11 @@ test('the link `xerj brain` prints (#/second-brain?brain=…) opens the Second B
 
 test('operator graph panel: two brains over one index — the links come from the brain that has them, and the panel names both', { skip }, async () => {
   // PR #945 review: `xerj brain casefile` + `xerj brain vendors` on one node →
-  // two brains list ax-docs; the panel walked the first `_cat` listed and said
-  // "no links" for the other brain's records. `other` is listed first here and
-  // holds nothing for the fixtures; `inbox` holds the hostile ego.
+  // two brains list ax-docs; the panel walked the first brain the listing
+  // returned and said "no links" for the other brain's records. `other` is
+  // listed first here and holds nothing for the fixtures; `inbox` holds the
+  // hostile ego. The walk rides the console's session-authorized graph read
+  // path (issue #936), not the data plane.
   ctx.engine.state.openGraph = true;
   ctx.engine.state.brains = ['other', 'inbox'];
   ctx.engine.state.log.length = 0;
@@ -216,8 +219,8 @@ test('operator graph panel: two brains over one index — the links come from th
     assert.match(g.text, /3 linked records · brains other, inbox consulted · links in inbox · 1 hop/);
     const hrefs = await page.eval(`[...document.querySelectorAll('.rd-neigh')].map((a) => a.getAttribute('href'))`);
     assert.ok(hrefs.length === 3 && hrefs.every((h) => h.includes('brain=inbox')), `each neighbour links into the brain its link came from: ${hrefs}`);
-    const asked = ctx.engine.state.log.filter((r) => /^\/_graph\/[^/]+\/ego$/.test(r.path)).map((r) => r.path);
-    assert.deepEqual([...new Set(asked)], ['/_graph/other/ego', '/_graph/inbox/ego'], 'both candidates were asked');
+    const asked = ctx.engine.state.log.filter((r) => /^\/_xerj-console\/api\/v1\/graph\/[^/]+\/ego$/.test(r.path)).map((r) => r.path);
+    assert.deepEqual([...new Set(asked)], ['/_xerj-console/api/v1/graph/other/ego', '/_xerj-console/api/v1/graph/inbox/ego'], 'both candidates were asked, through the console session');
     // an explicit hint walks that brain alone
     await page.setHash(`${readerHash(HOSTILE_ID)}&brain=other`);
     await page.waitFor(`/Brain other records no links/.test(document.querySelector('.rd-graph').textContent)`, { label: 'the hint alone' });
