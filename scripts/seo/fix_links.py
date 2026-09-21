@@ -96,6 +96,7 @@ FOOTER_MAP: list[tuple[str, list[tuple[str, str]]]] = [
     ]),
     ("RESOURCES", [
         ("/resources/", "SALES KIT"),
+        ("/blog/", "BLOG"),
         ("/brand", "BRAND"),
         ("/brandbook/", "BRAND BOOK"),
         ("/llms.txt", "LLMS.TXT"),

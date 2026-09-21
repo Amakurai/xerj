@@ -21,6 +21,13 @@ Fields
                  already unique and correctly sized).
     title        overrides the file's <title>.  Omit to keep the existing one.
                  Target <= 60 characters.
+    og_image     optional per-page Open Graph card, as a landing-relative PNG
+                 path under og/ (e.g. "og/does-xerj-beat-jev.png").  Omit to
+                 keep the site-wide card.  og_image_alt accompanies it; both
+                 width and height stay the site-wide 1200x630.
+    published /  optional pinned dates for article-kind pages (the blog).
+    updated      When set they feed datePublished/dateModified verbatim, so
+                 the generated head does not drift with git history.
 
 Every description below was written against that page's actual body copy.
 None of them describe content the page does not contain — Google treats a
@@ -80,10 +87,28 @@ PAGES: dict[str, dict[str, str]] = {
         title="XERJ vs Elasticsearch — reproducible benchmarks",
         description="XERJ v1.0.0-rc.6 against Elasticsearch 8.13.4 across 88 measured cells — 55 win, 26 tie, 4 lose, 3 n/a — plus the four commands that reproduce every one.",
     ),
-    "benchmarks/decisions.html": dict(
-        label="Jev measured, wire spoken", kind="software",
-        title="XERJ.ai — We measured the Jev judge. Then we answered its wire.",
-        description="We broke our own Jev rerank stage in public (0.3822 nDCG@10), fixed it, then ran 1,271 judged queries on three public datasets. Then we made XERJ answer the System One wire locally. The pip client runs against it unmodified. Nothing leaves your machine.",
+    # ── blog ────────────────────────────────────────────────────────────────
+    # The Jev write-up lives under /blog since 2026-09-21; it was git-mv'd
+    # from benchmarks/decisions.html (which 301s to it via landing/_redirects).
+    # published/updated are pinned so datePublished/dateModified do not drift
+    # with git (issue #974's flake); in-body run dates stay 2026-09-20.
+    "blog/does-xerj-beat-jev.html": dict(
+        label="Jev measured, wire spoken", kind="article",
+        title="Does XERJ beat JEV? On the bill, outright. On FiQA, no.",
+        description="1,271 judged queries: Jev rerank takes SciFact 0.7410 and FiQA 0.3638 (+0.126), our zero-API-token hybrid keeps NFCorpus 0.3448, and the FiQA run cost $0.6375.",
+        published="2026-09-21", updated="2026-09-21",
+        og_image="og/does-xerj-beat-jev.png",
+        # alt text must describe only what the committed 1200x630 card
+        # renders — the token count is NOT on the image (strip: queries,
+        # $0.6375 vs $0, URL); scripts/seo/assets/og-blog-*.html is the
+        # source of record for what is on it.
+        og_image_alt="XERJ vs JEV, measured: SciFact, NFCorpus and FiQA nDCG@10 over 1,271 judged queries, and the FiQA judge bill — $0.6375 against $0 local",
+    ),
+    "blog/index.html": dict(
+        label="Blog", kind="collection",
+        title="XERJ.ai — Blog: the engineering log",
+        description="Measured results with the losses left in: the JEV verdict, benchmark autopsies, and the Jev wire XERJ answers locally.",
+        updated="2026-09-21",
     ),
     "demo/index.html": dict(
         label="Real-data demo", kind="software",
@@ -428,6 +453,7 @@ SECTION_HUBS: dict[str, tuple[str, str]] = {
     "use-cases": ("Use cases", "/use-cases"),
     "case-studies": ("Case studies", "/case-studies"),
     "industries": ("Industries", "/industries/"),
+    "blog": ("Blog", "/blog/"),
     "answers": ("Answers", "/answers/"),
     "compare": ("Comparisons", "/compare/"),
 }

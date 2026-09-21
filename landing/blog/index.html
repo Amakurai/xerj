@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="day">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XERJ.ai — Blog: the engineering log</title>
+<meta name="description" content="Measured results with the losses left in: the JEV verdict, benchmark autopsies, and the Jev wire XERJ answers locally.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230b0b0d'/><text x='50' y='68' font-size='60' font-family='Big Shoulders Display,sans-serif' font-weight='900' fill='%23ffc400' text-anchor='middle'>X</text></svg>">
+<link rel="stylesheet" href="/style.css?v=if9">
+<style>
+  /* page-local — blog index: dated cards, preview visual left, brand tokens
+     only, 1px lines, no icons, no shadows, no filled shapes. */
+  .blog-hero { padding: var(--sp-6) 0 var(--sp-8); }
+  .blog-hero .uc-eyebrow { margin-bottom: var(--sp-4); }
+
+  ol.blog-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-6); }
+  .bl-card {
+    display: grid;
+    grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+    gap: var(--sp-6);
+    border: 1px solid var(--z-line);
+    padding: var(--sp-5);
+    text-decoration: none;
+    color: inherit;
+  }
+  .bl-card:hover, .bl-card:focus-visible { border-color: var(--z-accent); }
+
+  /* preview slot — a theme-native miniature scorecard, pure divs; no image
+     file, correct in day and night by construction (site precedent: every
+     chart in the benchmarks pages is CSS bars). */
+  .bl-preview { border: 1px solid var(--z-line); padding: var(--sp-4); align-self: stretch; }
+  .blp-kicker { font-family: var(--font-data); font-size: var(--fs-11); font-weight: 600;
+                letter-spacing: var(--track-label); text-transform: uppercase;
+                color: var(--z-mute); padding-bottom: var(--sp-3);
+                border-bottom: 1px solid var(--z-line); }
+  .blp-row { padding: var(--sp-3) 0; border-bottom: 1px solid var(--z-line); }
+  .blp-row:last-of-type { border-bottom: 0; }
+  .blp-ds { font-family: var(--font-data); font-size: var(--fs-11); font-weight: 600;
+            letter-spacing: var(--track-label); text-transform: uppercase; color: var(--z-mute); }
+  .blp-pair { display: grid; grid-template-columns: minmax(92px, 116px) minmax(0, 1fr);
+              gap: var(--sp-2) var(--sp-3); align-items: center; margin-top: var(--sp-2); }
+  .blp-bar { height: 4px; min-width: 2px; }
+  .blp-bar.a { background: var(--z-accent); }
+  .blp-bar.b { background: var(--z-cmp); }
+  .blp-num { font-family: var(--font-mono); font-size: var(--fs-11); color: var(--z-ink);
+             white-space: nowrap; display: flex; align-items: baseline; gap: 6px; }
+  .blp-num i { font-style: normal; font-family: var(--font-data); font-size: 10px;
+               letter-spacing: .02em; color: var(--z-mute); }
+  .blp-num.b { color: var(--z-cmp); }
+  .blp-chip { color: var(--z-cmp); font-weight: 700; }
+  .blp-foot { margin: var(--sp-3) 0 0; padding-top: var(--sp-3); border-top: 1px solid var(--z-line);
+              font-family: var(--font-mono); font-size: var(--fs-11); line-height: 1.6; color: var(--z-mute); }
+
+  .bl-meta { min-width: 0; }
+  .bl-date { font-family: var(--font-data); font-size: var(--fs-11); font-weight: 600;
+             letter-spacing: var(--track-label); text-transform: uppercase; color: var(--z-mute);
+             font-variant-numeric: tabular-nums; }
+  .bl-title { margin: var(--sp-3) 0 0; font-family: var(--font-display); font-weight: 800;
+              font-size: var(--fs-32); line-height: 1.05; color: var(--z-ink); }
+  .bl-card:hover .bl-title, .bl-card:focus-visible .bl-title { color: var(--z-accent); }
+  .bl-excerpt { margin: var(--sp-3) 0 0; font-family: var(--font-prose); font-size: var(--fs-16);
+                line-height: 1.65; color: var(--z-mute); max-width: 68ch; }
+  .bl-excerpt strong { color: var(--z-ink); }
+  .bl-byline { margin: var(--sp-4) 0 0; font-family: var(--font-data); font-size: var(--fs-11);
+               font-weight: 600; letter-spacing: var(--track-label); text-transform: uppercase;
+               color: var(--z-mute); font-variant-numeric: tabular-nums; }
+  .bl-read { display: inline-block; margin-top: var(--sp-4); font-family: var(--font-data);
+             font-size: var(--fs-11); font-weight: 700; letter-spacing: var(--track-label);
+             text-transform: uppercase; color: var(--z-accent);
+             border-bottom: 1px solid var(--z-accent); padding-bottom: 1px; }
+
+  .blog-archive { margin: var(--sp-8) 0 0; padding-top: var(--sp-4); border-top: 1px solid var(--z-line);
+                  font-family: var(--font-data); font-size: var(--fs-13); color: var(--z-mute); }
+  .blog-archive a { color: var(--z-mute); border-bottom: 1px solid var(--z-line); padding-bottom: 1px; }
+  .blog-archive a:hover, .blog-archive a:focus-visible { color: var(--z-accent); border-color: var(--z-accent); }
+
+  @media (max-width: 720px) {
+    .bl-card { grid-template-columns: minmax(0, 1fr); gap: var(--sp-4); }
+    .bl-title { font-size: var(--fs-20); }
+  }
+</style>
+<!-- seo:begin — generated by scripts/seo/fix_heads.py · do not hand-edit -->
+<link rel="canonical" href="https://xerj.org/blog/">
+<meta property="og:site_name" content="XERJ.ai">
+<meta property="og:type" content="website">
+<meta property="og:title" content="XERJ.ai — Blog: the engineering log">
+<meta property="og:description" content="Measured results with the losses left in: the JEV verdict, benchmark autopsies, and the Jev wire XERJ answers locally.">
+<meta property="og:url" content="https://xerj.org/blog/">
+<meta property="og:image" content="https://xerj.org/og/xerj-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="XERJ.ai — the search engine built for AI agents">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="XERJ.ai — Blog: the engineering log">
+<meta name="twitter:description" content="Measured results with the losses left in: the JEV verdict, benchmark autopsies, and the Jev wire XERJ answers locally.">
+<meta name="twitter:image" content="https://xerj.org/og/xerj-card.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  "@id": "https://xerj.org/#organization",
+  "name": "XERJ",
+  "alternateName": "XERJ.ai",
+  "url": "https://xerj.org/",
+  "logo": "https://xerj.org/brandbook/xerj-mark.svg",
+  "sameAs": [
+    "https://github.com/xerj-org/xerj"
+  ]
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebSite",
+  "@id": "https://xerj.org/#website",
+  "name": "XERJ.ai",
+  "url": "https://xerj.org/",
+  "inLanguage": "en",
+  "publisher": {
+    "@id": "https://xerj.org/#organization"
+  }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "CollectionPage",
+  "name": "XERJ.ai — Blog: the engineering log",
+  "description": "Measured results with the losses left in: the JEV verdict, benchmark autopsies, and the Jev wire XERJ answers locally.",
+  "url": "https://xerj.org/blog/",
+  "image": "https://xerj.org/og/xerj-card.png",
+  "inLanguage": "en",
+  "dateModified": "2026-09-21",
+  "isPartOf": {
+    "@id": "https://xerj.org/#website"
+  },
+  "mainEntityOfPage": {
+    "@type": "WebPage",
+    "@id": "https://xerj.org/blog/"
+  }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://xerj.org/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Blog"
+    }
+  ]
+}
+</script>
+<!-- seo:end -->
+</head>
+<body>
+
+<nav class="nav" aria-label="Primary">
+  <a href="/" class="brand">XERJ.AI</a>
+  <a href="/">HOME</a>
+  <a href="/product">PRODUCT</a>
+  <span class="nav-drop"><a href="/use-cases">USE CASES</a></span>
+  <a href="/case-studies">CASE STUDIES</a>
+  <a href="/benchmarks/">BENCHMARKS</a>
+  <a href="/blog/" class="active">BLOG</a>
+  <span class="spacer"></span>
+  <a href="/for-agents">FOR AGENTS</a>
+  <a href="/docs/">DOCS</a>
+  <a href="/docs/recipes/">RECIPES</a>
+  <a href="/playground">DASHBOARDS</a>
+  <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
+  <span class="theme"><button type="button" data-theme="day" class="active">DAY</button><span class="dash">·</span><button type="button" data-theme="night">NIGHT</button></span>
+</nav>
+
+<div class="uc-hero blog-hero">
+  <div class="uc-eyebrow">XERJ · BLOG · THE ENGINEERING LOG</div>
+  <h1>MEASURED,<br><span class="accent">WRITTEN DOWN.</span></h1>
+  <p class="uc-lead">Results with the losses left in. Newest first.</p>
+  <p class="uc-lead" style="max-width:760px;">This is where the measurements get written up as they happen — the wins, the losses, and the bill. Every post is dated, cites the runs it came from, and leaves the losing rows in the tables, because a number you cannot trace is marketing. The entry below puts TypeSafe AI's Jev judge model over 1,271 judged BEIR queries against a XERJ first stage, then turns the wire around and answers it from a local node: no tokens, no egress, every figure reproduced from the artifacts it names.</p>
+</div>
+
+<section class="scene-section" style="border-top:0; padding-top:0;">
+  <!-- Reverse-chronological by hand while there is one post; new posts PREPEND.
+       Move to a generator only past ~10 posts. -->
+  <ol class="blog-list">
+    <li>
+      <a class="bl-card" href="/blog/does-xerj-beat-jev">
+        <!-- Preview bar widths are normalized against ONE global denominator,
+             0.7410 (the max across all rows), so lengths are comparable ACROSS
+             rows — the same convention as the og card and the homepage banner.
+             SciFact 0.6993/0.7410 · NFCorpus 0.3448/0.3312 · FiQA 0.2382/0.3638.
+             Arm suffixes name which arm each number is, verbatim from the post:
+             XERJ side hybrid on SciFact/NFCorpus, BM25 on FiQA (hybrid not run);
+             Jev side is BM25 top-30 + Jev throughout. The og raster stays clean. -->
+        <div class="bl-preview" aria-hidden="true">
+          <div class="blp-kicker">XERJ vs JEV · nDCG@10 · 1,271 QUERIES</div>
+          <div class="blp-row">
+            <div class="blp-ds">SCIFACT</div>
+            <div class="blp-pair">
+              <span class="blp-num">0.6993 <i>hybrid</i></span><span class="blp-bar a" style="width:94.4%"></span>
+              <span class="blp-num b">0.7410 <i>BM25+Jev</i></span><span class="blp-bar b" style="width:100%"></span>
+            </div>
+          </div>
+          <div class="blp-row">
+            <div class="blp-ds">NFCORPUS</div>
+            <div class="blp-pair">
+              <span class="blp-num">0.3448 <i>hybrid</i></span><span class="blp-bar a" style="width:46.5%"></span>
+              <span class="blp-num b">0.3312 <i>BM25+Jev</i></span><span class="blp-bar b" style="width:44.7%"></span>
+            </div>
+          </div>
+          <div class="blp-row">
+            <div class="blp-ds">FIQA</div>
+            <div class="blp-pair">
+              <span class="blp-num">0.2382 <i>BM25</i></span><span class="blp-bar a" style="width:32.1%"></span>
+              <span class="blp-num b">0.3638 <i>BM25+Jev</i> <span class="blp-chip">+0.126</span></span><span class="blp-bar b" style="width:49.1%"></span>
+            </div>
+          </div>
+          <p class="blp-foot">$0.6375 · 15,178,758 tokens (JEV, FiQA) vs $0 · 0 tokens (XERJ local)</p>
+        </div>
+        <div class="bl-meta">
+          <p class="bl-date"><time datetime="2026-09-21">2026-09-21</time> · BENCHMARKS · JEV</p>
+          <h2 class="bl-title">Does XERJ beat JEV? On the bill, outright. On FiQA, no.</h2>
+          <p class="bl-excerpt">Does XERJ beat JEV? On the bill, outright — the FiQA rerank run billed <strong>$0.6375</strong> and <strong>15,178,758 judge tokens</strong>, while our local node answers the same wire with zero. On relevance the hosted judge keeps SciFact (0.7410 vs 0.6993) and FiQA (0.3638 vs 0.2382, +0.126); our zero-API-token hybrid keeps NFCorpus (0.3448 vs 0.3312). And the unmodified pip jev-reranker passed its own gate against a XERJ node. Every win, every loss, with the receipt.</p>
+          <p class="bl-byline">AUTHOR · XERJ ENGINEERING TEAM · PUBLISHED · 2026-09-21 · UPDATED · 2026-09-21</p>
+          <span class="bl-read">READ THE POST →</span>
+        </div>
+      </a>
+    </li>
+  </ol>
+
+  <p class="blog-archive">More measured ground lives in the benchmarks hub: <a href="/benchmarks/">/benchmarks</a> — the ES conformance board, BEIR baselines, and the Jev tables, every number traced to a run.</p>
+</section>
+
+<!-- seo:footer-begin — generated by scripts/seo/fix_links.py · do not hand-edit -->
+<nav class="footer-map" aria-label="Site map">
+  <div class="fm-col">
+    <span class="fm-h">PRODUCT</span>
+    <a href="/product">PRODUCT</a>
+    <a href="/architecture/">ARCHITECTURE</a>
+    <a href="/benchmarks/">BENCHMARKS</a>
+    <a href="/pricing/">PRICING</a>
+    <a href="/security/">SECURITY</a>
+    <a href="/playground">DASHBOARDS</a>
+    <a href="/demo/">REAL-DATA DEMO</a>
+    <a href="/aise-demo">PRODUCT TOUR</a>
+  </div>
+  <div class="fm-col">
+    <span class="fm-h">SOLUTIONS</span>
+    <a href="/solutions/">SOLUTIONS</a>
+    <a href="/use-cases">USE CASES</a>
+    <a href="/case-studies">CASE STUDIES</a>
+    <a href="/industries/">INDUSTRIES</a>
+    <a href="/industries/finserv">FINANCIAL SERVICES</a>
+    <a href="/industries/public-sector">PUBLIC SECTOR</a>
+    <a href="/industries/healthcare">HEALTHCARE</a>
+    <a href="/industries/retail">RETAIL</a>
+    <a href="/use-cases/code-security-audit">AI CODE-SECURITY AUDIT</a>
+    <a href="/use-cases/semantic-analytics">SEMANTIC ANALYTICS</a>
+  </div>
+  <div class="fm-col">
+    <span class="fm-h">DOCS</span>
+    <a href="/docs/">DOCUMENTATION</a>
+    <a href="/docs/quickstart">QUICKSTART</a>
+    <a href="/docs/install">INSTALL</a>
+    <a href="/docs/migration-from-es">MIGRATE FROM ELASTICSEARCH</a>
+    <a href="/docs/recipes/">RECIPES</a>
+    <a href="/docs/agents/">DOCS FOR AI</a>
+    <a href="/for-agents">FOR AI AGENTS</a>
+    <a href="/agent-search/">AGENTIC SEARCH DEMO</a>
+    <a href="/answers/">ANSWERS</a>
+    <a href="/compare/">COMPARISONS</a>
+  </div>
+  <div class="fm-col">
+    <span class="fm-h">RESOURCES</span>
+    <a href="/resources/">SALES KIT</a>
+    <a href="/blog/">BLOG</a>
+    <a href="/brand">BRAND</a>
+    <a href="/brandbook/">BRAND BOOK</a>
+    <a href="/llms.txt">LLMS.TXT</a>
+    <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
+  </div>
+</nav>
+<!-- seo:footer-end -->
+<footer class="footer">
+  <span>XERJ.AI · V1.0.0-RC.75 · 2026</span>
+  <span>SEARCH FOR THE AGENT ERA</span>
+  <span><a href="/product">PRODUCT</a> · <a href="/docs/">DOCS</a> · <a href="/brand">BRAND</a> · <a href="/playground">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
+</footer>
+
+<script>
+  (function () {
+    const root = document.documentElement;
+    for (const btn of document.querySelectorAll('[data-theme]')) {
+      btn.addEventListener('click', () => {
+        const t = btn.getAttribute('data-theme');
+        root.setAttribute('data-theme', t);
+        for (const b of document.querySelectorAll('[data-theme]')) {
+          b.classList.toggle('active', b.getAttribute('data-theme') === t);
+        }
+      });
+    }
+  })();
+</script>
+
+</body>
+</html>

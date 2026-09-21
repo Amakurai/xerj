@@ -396,7 +396,8 @@
   call at all? <strong>Every vector and hybrid figure in this section was measured with
   <code class="inline">--embed-mode neural</code> and the built-in all-MiniLM-L6-v2 model — not with the default
   embedder, which is lexical feature hashing and has no model in it.</strong> The BM25 rows use no embedder and
-  hold on any node.</p>
+  hold on any node. The Jev rows below are written up verdict-first — wins, losses, and the judge's bill — in
+  <a href="/blog/does-xerj-beat-jev">the blog post: does XERJ beat JEV?</a></p>
 
   <div class="vt-wrap">
   <table class="vt">
@@ -411,7 +412,7 @@
       <tr><td><strong>XERJ hybrid RRF</strong> (<code class="inline">hybrid</code>, server-side)</td>
         <td class="n">0.6993</td><td class="n w">0.3448</td><td class="n t">not run</td><td>us · <code class="inline">--embed-mode neural</code></td></tr>
       <tr><td><strong>XERJ BM25 top-30, reordered by Jev</strong> (<code class="inline">jev-1.13.0</code>, pinned)</td>
-        <td class="n w">0.7410</td><td class="n">0.3312</td><td class="n w">0.3638</td><td>us · median of 3 repeats — <a href="/benchmarks/decisions">the write-up</a></td></tr>
+        <td class="n w">0.7410</td><td class="n">0.3312</td><td class="n w">0.3638</td><td>us · median of 3 repeats — <a href="/blog/does-xerj-beat-jev#fullrun">the write-up</a></td></tr>
       <tr><td>Jev (TypeSafe AI), hosted reranker</td>
         <td class="n">0.768</td><td class="n">0.358</td><td class="n t">no figure</td><td><strong>not run by us</strong> — published in the hev/jev-rerank README</td></tr>
       <tr><td>Voyage rerank-3, hosted reranker</td>
@@ -445,7 +446,7 @@
       are <strong>not calibrated to BEIR relevance</strong>. ECE runs 0.10–0.31 across the three datasets, and
       on FiQA documents rated 0.93 were relevant 34% of the time. Do not <code class="inline">min_score</code>
       the raw number.
-      <a href="/benchmarks/decisions">The full autopsy, run and gate</a>. The stage is also the one XERJ feature
+      <a href="/blog/does-xerj-beat-jev">The full autopsy, run and gate</a>. The stage is also the one XERJ feature
       that sends document text off the machine —
       <a href="/answers/rerank-search-results-calibrated-judge">read that before turning it on</a>.</li>
   </ul>
@@ -481,7 +482,7 @@
       history, 34.2 ms per item. The vote now also <strong>speaks TypeSafe's System One wire</strong> —
       <code class="inline">POST /v1/systemone</code> on the native port — so the pip-installed
       <code class="inline">jev-reranker</code> runs against a local XERJ node unmodified, zero egress:
-      <a href="/benchmarks/decisions">the write-up</a>.</li>
+      <a href="/blog/does-xerj-beat-jev#wire">the write-up</a>.</li>
     <li><strong>The engine under it got 2.0× faster with bit-identical results.</strong> A full news item is a
       ~40-clause disjunction whose match set is most of the index, and the generic search path paid full
       materialisation for it. A WAND-style pruned walk (Broder et al., the same idea tantivy uses) now scores a
@@ -500,7 +501,7 @@
     <a href="/answers/hybrid-search-quality-measured-ndcg">hybrid search quality</a> and
     <a href="/answers/classify-text-from-labelled-history-without-llm">decisions without a model call</a>.
     Hosted-reranker figures: <a href="https://github.com/hev/jev-rerank" rel="external">hev/jev-rerank</a> (MIT) ·
-    the measured Jev rows and the System One wire: <a href="/benchmarks/decisions">benchmarks/decisions</a>.</p>
+    the measured Jev rows and the System One wire: <a href="/blog/does-xerj-beat-jev">blog/does-xerj-beat-jev</a>.</p>
 </section>
 
 <!-- ============================ TOKEN SAVINGS ============================ -->
@@ -671,6 +672,7 @@
   <div class="fm-col">
     <span class="fm-h">RESOURCES</span>
     <a href="/resources/">SALES KIT</a>
+    <a href="/blog/">BLOG</a>
     <a href="/brand">BRAND</a>
     <a href="/brandbook/">BRAND BOOK</a>
     <a href="/llms.txt">LLMS.TXT</a>

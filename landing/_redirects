@@ -23,6 +23,15 @@
 /bench        /benchmarks/        301
 /github       https://github.com/xerj-org/xerj 302
 
+# The Jev write-up moved to the blog (2026-09-21). One canonical page — the
+# numbers must never live in two places. Named source only, never a catch-all;
+# #fragment requests keep their fragment through the 301. Deliberately NO
+# `.html` sibling rule: seo_lint rule 64 hard-gates any published `.html`
+# spelling (the site's URL contract is extensionless, and a `.html` source
+# here would be dead bytes after Pages' own 308) — legacy `.html` deep links
+# to the removed file get the real 404 page, which is the honest answer.
+/benchmarks/decisions  /blog/does-xerj-beat-jev  301
+
 # Installer fallback (#740). /get.sh is normally answered by functions/get.js
 # (it's in _routes.json), which counts the request and serves the installer.
 # This 200-rewrite only fires if Functions are disabled, so /get.sh serves the
