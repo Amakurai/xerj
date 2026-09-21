@@ -7467,6 +7467,7 @@ dependencies = [
  "chrono-tz",
  "criterion",
  "dashmap",
+ "futures-util",
  "libc",
  "memchr",
  "parking_lot",

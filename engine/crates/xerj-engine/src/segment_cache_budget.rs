@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::ingest_memory::{Category, Retained};
 
-pub const CATEGORY_COUNT: usize = 8;
+pub const CATEGORY_COUNT: usize = 9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -24,6 +24,9 @@ pub enum SegmentCacheCategory {
     DecodedStored,
     /// Decompressed `.post` + `.meta` blobs behind a cached `FtsIndexReader`.
     FtsReader,
+    /// Flat `f32` vectors of one field over one segment, derived from its
+    /// stored documents for the exact kNN scan (#939).
+    VectorColumn,
 }
 
 impl SegmentCacheCategory {
@@ -36,6 +39,7 @@ impl SegmentCacheCategory {
         Self::RowSequences,
         Self::DecodedStored,
         Self::FtsReader,
+        Self::VectorColumn,
     ];
 
     fn trace_category(self) -> Category {
@@ -48,6 +52,7 @@ impl SegmentCacheCategory {
             Self::RowSequences => Category::CacheRowSequences,
             Self::DecodedStored => Category::CacheDecodedStored,
             Self::FtsReader => Category::CacheFtsReader,
+            Self::VectorColumn => Category::CacheVectorColumn,
         }
     }
 }
