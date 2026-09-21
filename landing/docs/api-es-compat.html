@@ -215,7 +215,7 @@
   <h1>ES-compatible API</h1>
 
 
-  <p>Port <code class="inline">9200</code>. The compat layer exists so you can point an existing Elasticsearch client at XERJ and keep shipping. It handles the most-used operations. Unsupported calls return a structured <code class="inline">not_supported_yet</code> error rather than a 500.</p>
+  <p>Port <code class="inline">9200</code>. The compat layer exists so you can point an existing Elasticsearch client at XERJ and keep shipping. It handles the most-used operations. Unsupported calls return a structured <code class="inline">not_supported_yet</code> error rather than a 500. What the compatibility promise is tested against — ES version, conformance suite, clients — and the known semantic differences below it are stated in one place: <a href="/docs/migration-from-es#what-we-test-against">the compatibility boundary</a> on Migrate from ES.</p>
 
   <div class="api">
     <div class="head">METHOD</div>

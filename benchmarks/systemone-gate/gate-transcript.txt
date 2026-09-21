@@ -1,0 +1,13 @@
+client resolved model: ['xerj-history-vote-1']
+  0.5068  spam  money!!! you r a lucky winner ! 2 claim your prize text money 2 88600 
+  1.0000  spam  Please call our customer service representative on 0800 169 6031 betwe
+  1.0000  spam  Great News! Call FREEFONE 08006344447 to claim your guaranteed £1000 C
+  1.0000  spam  You have won ?1,000 cash or a ?2,000 prize! To claim, call09050000327.
+  1.0000  spam  URGENT! Your Mobile number has been awarded with a £2000 prize GUARANT
+  0.1024  ham   As per your request 'Maangalyam (Alaipayuthe)' has been set as your ca
+  0.0000  ham   If you're not in my car in an hour and a half I'm going apeshit
+  0.3414  ham   Awesome question with a cute answer: Someone asked a boy "how is ur li
+  0.0000  ham   Carlos says we can pick up from him later so yeah we're set
+  0.0341  ham   The greatest test of courage on earth is to bear defeat without losing
+mean noul  spam=0.9014  ham=0.0956  gap=0.8058
+GATE PASSED: unmodified jev-reranker ranked from the XERJ node

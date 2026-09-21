@@ -91,6 +91,16 @@ struct HttpState {
     oversize_bulks_refused: Vec<usize>,
     /// Line count of every bulk that got past `max_actions_per_bulk`.
     bulk_line_counts: Vec<usize>,
+    /// #933 opt-in: hold each DATA bulk for this many milliseconds before
+    /// applying it, outside the state lock. A serial client still sends one
+    /// request at a time, so for every existing test this changes nothing;
+    /// a multi-worker replay is forced into observable overlap.
+    data_bulk_delay_ms: u64,
+    /// #933: data bulks currently inside their delay window, and the most
+    /// that were ever inside it together. `1` forever is the fingerprint of
+    /// a serial index phase.
+    in_flight_data_bulks: usize,
+    max_concurrent_data_bulks: usize,
 }
 
 struct HttpEndpoint {
@@ -115,7 +125,15 @@ impl HttpEndpoint {
                     // BSD/macOS: accepted sockets inherit the listener's
                     // O_NONBLOCK; the handler does blocking reads.
                     stream.set_nonblocking(false).unwrap();
-                    handle_http(stream, &server_state)
+                    // #933: one thread per connection, so the parallel
+                    // durable replay can be served the way a real node is —
+                    // several requests inside the endpoint at once. Every
+                    // handler touches `HttpState` only through its Mutex and
+                    // never sleeps while holding it, and a serial client
+                    // still has at most one connection open, so every other
+                    // test sees the endpoint it always had.
+                    let server_state = Arc::clone(&server_state);
+                    thread::spawn(move || handle_http(stream, &server_state));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if server_state.lock().unwrap().stop {
@@ -376,6 +394,21 @@ fn bulk_http(body: &[u8], state: &Arc<Mutex<HttpState>>) -> (u16, Value) {
             })
             .unwrap_or(false)
     });
+    // #933: the artificial hold, OUTSIDE the state lock so concurrent data
+    // bulks hold at the same time — the overlap a parallel replay produces
+    // and a serial one never can.
+    let hold_ms = { state.lock().unwrap().data_bulk_delay_ms };
+    if is_data && hold_ms > 0 {
+        {
+            let mut locked = state.lock().unwrap();
+            locked.in_flight_data_bulks += 1;
+            locked.max_concurrent_data_bulks = locked
+                .max_concurrent_data_bulks
+                .max(locked.in_flight_data_bulks);
+        }
+        thread::sleep(std::time::Duration::from_millis(hold_ms));
+        state.lock().unwrap().in_flight_data_bulks -= 1;
+    }
     let mut locked = state.lock().unwrap();
     if let Some(max_actions) = locked.max_actions_per_bulk {
         // Checked first and by LINES, as `xerj-engine/src/bulk.rs` does.
@@ -5608,4 +5641,149 @@ fn watch_converges_under_a_randomised_change_sequence() {
         "seed {SEED:#x}: record count diverged"
     );
     assert_eq!(watched, fresh, "seed {SEED:#x}: document contents diverged");
+}
+
+/// #933: every operation's `Started` journal record must precede its own
+/// `Committed` — the durable order that makes a crash mid-window repeat
+/// exactly the operations whose accepted apply was not recorded. Holds
+/// trivially for the serial loop; the windowed scheduler is what could break
+/// it, so it is asserted where the scheduler runs.
+fn started_precedes_committed(state_dir: &Path) {
+    let mut started = std::collections::BTreeSet::new();
+    let mut committed = std::collections::BTreeSet::new();
+    for line in fs::read_to_string(state_dir.join("journal.ndjson"))
+        .unwrap()
+        .lines()
+    {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if event.get("kind").and_then(Value::as_str) != Some("sync_operation_state") {
+            continue;
+        }
+        let Some(operation) = event.get("operation_id").and_then(Value::as_str) else {
+            continue;
+        };
+        match event.get("state").and_then(Value::as_str) {
+            // The journal serializes the state enum lowercase.
+            Some("started") => {
+                started.insert(operation.to_owned());
+            }
+            Some("committed") => {
+                committed.insert(operation.to_owned());
+            }
+            _ => {}
+        }
+    }
+    let unstarted: Vec<_> = committed.difference(&started).collect();
+    assert!(
+        unstarted.is_empty(),
+        "operations committed without a Started record first: {unstarted:?}"
+    );
+}
+
+/// #933: the `--no-graph` index phase used to apply one file at a time —
+/// about 6 files/s on the reporter's 48,533-file corpus, ~3.5 h for the phase
+/// alone. The durable replay is now a bounded window (`--workers` wide) over
+/// operations that touch disjoint groups. End-to-end, against an endpoint
+/// that holds every data bulk for a moment: a serial replay can never have
+/// two data bulks inside the endpoint at once, a windowed one must. That
+/// count is the whole regression — everything else here is the convergence
+/// the change may not disturb.
+#[test]
+fn no_graph_replay_applies_files_in_parallel_and_converges() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    for file in 0..6 {
+        let rows: String = (0..5)
+            .map(|row| format!("{file}-{row},body of row {row} in file {file}\n"))
+            .collect();
+        fs::write(
+            corpus.path().join(format!("file{file}.csv")),
+            format!("id,body\n{rows}"),
+        )
+        .unwrap();
+    }
+    let endpoint = HttpEndpoint::start();
+    endpoint.state.lock().unwrap().data_bulk_delay_ms = 200;
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    config.workers = 4;
+
+    assert_eq!(run_index(config).unwrap(), 0);
+    let state = endpoint.state.lock().unwrap();
+    assert!(
+        (2..=4).contains(&state.max_concurrent_data_bulks),
+        "a 4-wide replay over 200 ms-held data bulks must overlap; max concurrent data \
+         bulks was {} (1 forever is the fingerprint of the serial index phase this \
+         fixes)",
+        state.max_concurrent_data_bulks
+    );
+    drop(state);
+    assert_eq!(
+        endpoint.data_bulk_requests(),
+        6,
+        "one sealed bulk per file, no duplicate sends"
+    );
+    let docs = endpoint.data_docs();
+    assert_eq!(docs.len(), 6 * 5, "every record landed exactly once");
+    assert_eq!(paths(&docs).len(), 6, "every file's records are searchable");
+    started_precedes_committed(state_dir.path());
+}
+
+/// #933: a bulk failing while other operations are in flight — the state the
+/// serial loop never had to think about. The run stops, everything already
+/// dispatched is drained and journaled, and the same command resumes to an
+/// exact, committed generation: no duplicate documents, no missing file.
+#[test]
+fn no_graph_parallel_replay_survives_a_bulk_failure_mid_window_and_resumes() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    for file in 0..6 {
+        let rows: String = (0..5)
+            .map(|row| format!("{file}-{row},body of row {row} in file {file}\n"))
+            .collect();
+        fs::write(
+            corpus.path().join(format!("file{file}.csv")),
+            format!("id,body\n{rows}"),
+        )
+        .unwrap();
+    }
+    let endpoint = HttpEndpoint::start();
+    endpoint.state.lock().unwrap().data_bulk_delay_ms = 60;
+    endpoint.state.lock().unwrap().fail_data_bulk_number = Some(3);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    config.workers = 4;
+
+    run_index(config.clone()).expect_err("the third data bulk is refused");
+    started_precedes_committed(state_dir.path());
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 0);
+    let committed = journal_events_of_state(state_dir.path(), "committed");
+    assert!(
+        (1..6).contains(&committed),
+        "some in-flight operations drained and committed, not all six: {committed}"
+    );
+
+    // Which file's bulk was refused is schedule-dependent; convergence is not.
+    assert_eq!(run_index(config).unwrap(), 0);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
+    let docs = endpoint.data_docs();
+    assert_eq!(docs.len(), 6 * 5, "every record landed exactly once");
+    assert_eq!(paths(&docs).len(), 6);
+    started_precedes_committed(state_dir.path());
+}
+
+/// Counts `sync_operation_state` records carrying one specific state, so a
+/// test can say how many operations reached `Committed` without caring which.
+fn journal_events_of_state(state_dir: &Path, state: &str) -> usize {
+    fs::read_to_string(state_dir.join("journal.ndjson"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("sync_operation_state")
+                && event.get("state").and_then(Value::as_str) == Some(state)
+        })
+        .count()
 }
