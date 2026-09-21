@@ -39,12 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tools/xerj-code/scripts/{xc.py,xc-index.sh,xc-corpus.sh}` and their
   Python/shell test suites. Most behaviour is ported and gated by scoped cargo
   tests (`xerj-common::xccode`, `xerj-autoindex::xc`, the MCP schema drift
-  test); one suite is NOT yet re-pinned: the 81-check `--fresh` swap contract
-  (fake node + fake binary) that guarded the destructive side of
-  `xerj corpus index --fresh` — its logic moved to
-  `xerj-autoindex/src/xc.rs` but needs the HTTP shell and autoindex runner
-  injected before it can run against fakes
-  ([#1004](https://github.com/xerj-org/xerj/issues/1004)). The deliberate
+  test); the `--fresh` swap contract — the destructive side of
+  `xerj corpus index --fresh` — is re-pinned in `xerj-autoindex/src/xc.rs` as
+  ten contract tests running the REAL flow against a fake node and a fake
+  autoindex runner behind injected seams
+  ([#1004](https://github.com/xerj-org/xerj/issues/1004)): switch-readers-
+  before-retiring, deletes by exact name only, a failed or empty build leaving
+  the old index untouched, a count the node never answered authorising no
+  delete and no switch, sibling corpora never touched, first-build salvage,
+  resume under the recorded prefix and state dir, build-id collisions inside
+  one second, and the legacy no-ledger path. The deliberate
   drops are the post-query field-report nudge (2026-09-18 llms.txt directive:
   no obligation language) and per-hit hybrid arm annotations (server-side RRF
   exposes no per-leg ranks).
