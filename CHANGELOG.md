@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Second Brain dashboard and the reader's graph panel are no longer 401
+  for a signed-in operator on an auth-enabled engine (the default).** The
+  console holds a passkey session, not an engine API key, so the SPA's direct
+  `/_graph/{brain}/*`, `_cat/indices/.xerj-memory-*` and reserved-namespace
+  `_search` reads were refused — while a share-link guest, who holds a key,
+  could read the graph. The console now serves its own brain-scoped,
+  session-authorized graph read path
+  (`GET /_xerj-console/api/v1/graph/brains`, `/{brain}/ego`, `/{brain}/overview`,
+  `POST /{brain}/edges/_search`, `POST /{brain}/nodes/_search`) in the same
+  `xerj-second-brain/1` contract as the data plane: console roles `owner` and
+  `admin` may read brains, a role-refused read and a nonexistent brain are
+  byte-identical 404s (no existence oracle), and the nodes/edges searches are
+  pinned server-side to the brain's own meta-doc indices, so the endpoints
+  cannot become a general search proxy and the generic data-sources proxy
+  still refuses the reserved namespace. `/v1/metrics` (the dashboard's
+  searches-per-index tile) stays key-only by decision; the tile shows the
+  refusal honestly. [#936](https://github.com/xerj-org/xerj/issues/936)
+
 ## [1.0.0-rc.75] - 2026-09-20
 
 ### Added
