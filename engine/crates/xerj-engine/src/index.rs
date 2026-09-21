@@ -53889,7 +53889,6 @@ mod pinned_knn_fts_892_tests {
     }
 }
 
-
 /// #940 — the fused order is total, and a function of the leg lists and the
 /// documents' arrival order alone.
 ///
@@ -54062,7 +54061,6 @@ mod hybrid_fused_order_tests {
         assert_eq!(fused[1].score.to_bits(), fused[2].score.to_bits());
     }
 }
-
 
 /// #939 — the exact kNN scan ranks addresses and hydrates only the winners.
 ///
