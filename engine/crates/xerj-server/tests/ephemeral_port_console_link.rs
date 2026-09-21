@@ -145,6 +145,23 @@ fn port_from_setup_link(stderr: &str) -> Option<u16> {
     port_str.parse().ok()
 }
 
+/// Pull the host out of the same `…http://HOST:port/_xerj-console/setup#token=…`.
+fn host_from_setup_link(stderr: &str) -> Option<String> {
+    let marker = "/_xerj-console/setup#token=";
+    let end = stderr.find(marker)?;
+    let authority_end = &stderr[..end];
+    let start = authority_end.rfind("http://")?;
+    let authority = &authority_end[start + "http://".len()..end];
+    let (host, port_str) = authority.rsplit_once(':').unwrap_or((authority, ""));
+    // Guard against a future authority shape confusing the split: whatever
+    // follows the colon must be the port for the host to mean anything.
+    if port_str.is_empty() || port_str.chars().all(|c| c.is_ascii_digit()) {
+        Some(host.to_string())
+    } else {
+        None
+    }
+}
+
 /// Pull the port out of the banner's `ES-compat    127.0.0.1:PORT [...]` line.
 fn port_from_banner(stdout: &str) -> Option<u16> {
     let line = stdout
@@ -204,5 +221,42 @@ fn ephemeral_es_port_console_link_names_the_bound_port() {
          is telling the operator to open a URL it is not listening \
          on\n--- stdout ---\n{}\n--- stderr ---\n{}",
         out.stdout, out.stderr
+    );
+}
+
+/// Issue #935: the first-launch link must be *usable*. A browser treats
+/// `http://127.0.0.1:<port>` as an IP-literal origin, and WebAuthn refuses
+/// IP-literal origins outright — so a setup link printed with the bind
+/// address could never complete passkey enrolment, whatever the relying
+/// party is configured as. Every loopback bind is therefore printed (and
+/// its relying party derived) as `localhost`.
+#[test]
+fn loopback_bind_prints_the_setup_link_as_localhost() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rest, grpc) = two_free_ports();
+
+    let out = boot_until(
+        &config_with_ephemeral_es_port(dir.path(), rest, grpc),
+        dir.path(),
+        Duration::from_secs(60),
+        |stdout, stderr| {
+            stdout.contains("ES-compat") && stderr.contains("/_xerj-console/setup#token=")
+        },
+    );
+
+    let host = host_from_setup_link(&out.stderr).unwrap_or_else(|| {
+        panic!(
+            "no parsable first-launch setup link found on stderr within the boot window\n\
+             --- stdout ---\n{}\n--- stderr ---\n{}",
+            out.stdout, out.stderr
+        )
+    });
+
+    assert_eq!(
+        host, "localhost",
+        "a loopback bind (127.0.0.1) must be printed as localhost in the \
+         setup link: an IP-literal origin cannot complete WebAuthn enrolment \
+         (#935)\n--- stderr ---\n{}",
+        out.stderr
     );
 }

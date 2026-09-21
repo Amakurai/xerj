@@ -217,6 +217,14 @@
 
   <p>XERJ runs a second API listener on <code class="inline">9200</code> that speaks the Elasticsearch wire format. The fast path to trying XERJ is to point your existing ES client at it and let the compat layer take the calls. It isn't 100% coverage; this page says exactly what is and isn't there.</p>
 
+  <h2 id="what-we-test-against">What we test against</h2>
+  <ul>
+    <li><strong>The wire target is Elasticsearch 8.13 REST.</strong> The compat listener advertises <code class="inline">8.13.0</code> at <code class="inline">GET /</code> and sends <code class="inline">X-Elastic-Product: Elasticsearch</code> on its responses — the two handshake gates Kibana and the official clients check before they will talk to a node. Suite cases gated on 8.14+ version predicates are not run; nothing above 8.13 is claimed.</li>
+    <li><strong>The ES REST API YAML conformance suite, on every commit, gated at zero failures.</strong> A full run on 2026-09-20 passes <!-- snapshot:2026-09-20 -->1,371 / 1,374 cases (3 skipped; the count grows as cases are added — the invariant the gate enforces is 0 failed, not a pass total). The suite is a curated 202-file subset of Elasticsearch's public <code class="inline">rest-api-spec</code> YAML tests, extended with XERJ-authored cases for the AI-native surface. Two limits stated plainly: the runner does not verify error behaviour (<code class="inline">catch:</code> expectations are unasserted), and it speaks raw HTTP — no ES client library is exercised in CI.</li>
+    <li><strong>A live Elasticsearch 8.13.4, head to head.</strong> The published benchmarks drive one keep-alive HTTP client, the same corpus and the same machine against both engines, and publish every cell including the losses — <a href="/compare/xerj-vs-elasticsearch-local">the matrix is public</a>.</li>
+    <li><strong>Clients, honestly.</strong> There is no Kibana end-to-end test and no client version matrix in this repo. What is verified is the wire itself: the YAML suite above, plus curl-shaped request recipes that run end to end. Verify the specific behaviour your client depends on against your own node before you cut over.</li>
+  </ul>
+
   <h2>What works day one</h2>
   <ul>
     <li><strong>Index CRUD:</strong> <code class="inline">PUT /:index</code>, <code class="inline">DELETE /:index</code>, <code class="inline">GET /:index</code>, <code class="inline">PUT /:index/_mapping</code>, <code class="inline">GET /:index/_mapping</code>.</li>
@@ -228,7 +236,7 @@
     <li><strong>Delete by query:</strong> <code class="inline">POST /:index/_delete_by_query</code>.</li>
   </ul>
 
-  <h2>What needs rewriting</h2>
+  <h2 id="what-needs-rewriting">What needs rewriting</h2>
   <ul>
     <li><strong>Whole-index scroll reads.</strong> <!-- generated:scroll-snapshot-cap -->10,000<!-- /generated:scroll-snapshot-cap --> documents is the ceiling on a <code class="inline">_search?scroll=</code> snapshot: XERJ materialises the snapshot up front, so a query whose exact total is larger is refused with a <code class="inline">400</code> rather than paged and silently truncated. Anything that scrolls an entire index — <code class="inline">helpers.scan()</code>, exports, reindex scripts — moves to <code class="inline">search_after</code> on a unique sort key, which is unbounded. Mind that <code class="inline">_id</code> sorts lexicographically; take each cursor from the previous page's last <code class="inline">sort</code> value rather than computing it. Details, and the one route that applies the ceiling per index instead, on the <a href="/docs/api-es-compat#scroll-cap">ES-compat API</a> page.</li>
     <li><strong>Scripted fields / scripted metrics.</strong> Painless is not implemented. Use <code class="inline">function_score</code> for the cases it covers.</li>
@@ -237,6 +245,15 @@
     <li><strong>Machine-learning jobs.</strong> Not a feature.</li>
     <li><strong>Watcher / alerting framework.</strong> Use the <code class="inline">/v1/explain-plan</code> endpoint + an external rule runner.</li>
     <li><strong>ILM (Index Lifecycle Management).</strong> Retention is controlled per-index via <code class="inline">[logs] retention_days</code>.</li>
+  </ul>
+
+  <h2 id="known-semantic-differences">Known semantic differences</h2>
+  <p>What follows are differences on APIs that <em>are</em> implemented: the call succeeds and returns the ES response shape, but the bytes are XERJ's own. They bite when a client asserts on details rather than shapes.</p>
+  <ul>
+    <li><strong>Scroll is a bounded snapshot, not a segment-walking cursor.</strong> The headline difference, because it can silently change results for tooling that paginates a live index: <code class="inline">_search?scroll=</code> materialises the whole snapshot up front, and a request whose exact total exceeds the window is refused with a <code class="inline">400</code> rather than paged past it. The ceiling, the per-index alias quirk, and the unbounded <code class="inline">search_after</code> replacement are in <a href="#what-needs-rewriting">What needs rewriting</a> above and on <a href="/docs/api-es-compat#scroll-cap">ES-compat API</a>.</li>
+    <li><strong>BM25 scores are XERJ's own.</strong> Ranking order matches the query's intent, but exact <code class="inline">_score</code> floats differ from ES and can shift for the same query as background merges move collection statistics — the same class of internal difference as between two ES minor versions. Relax tests that assert on exact score values.</li>
+    <li><strong>The default <code class="inline">_search</code> source is compact.</strong> With <code class="inline">_source</code> omitted, ordinary source fields come back but engine-generated <code class="inline">&lt;field&gt;_vector</code> and <code class="inline">&lt;field&gt;_vector_chunks</code> companions do not. Explicit <code class="inline">_source: true</code> returns them.</li>
+    <li><strong><code class="inline">_cat</code> headers.</strong> <code class="inline">_cat/indices?v</code> emits data rows only — no column-header row — though the column order is ES's, so positional parsing keeps working and header-line parsing does not. The per-index form <code class="inline">_cat/indices/:index</code> returns that index's row; an unknown index name is the <code class="inline">404</code>.</li>
   </ul>
 
   <h2>What's different (for the better)</h2>

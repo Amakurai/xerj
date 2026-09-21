@@ -944,13 +944,15 @@ RULES = [
         "sev": ERROR,
         "kind": "pattern",
         "code": True,
-        "pattern": r"\bxerj\s+(?:query|snapshot|cluster|migrate|restore|backup|admin|search)\b",
-        "reason": "The subcommands are `index`, `autoindex`, `brain`, `mcp` and `share`. There is no "
-                  "`xerj query`, `xerj snapshot`, `xerj cluster` or `xerj migrate`. (`xerj mcp` "
-                  "itself landed in rc.17 - on rc.16 it returns `unknown argument: mcp`.)",
+        "pattern": r"\bxerj\s+(?:query|snapshot|cluster|migrate|restore|backup|admin)\b",
+        "reason": "The subcommands are `index`, `autoindex` (+ `autoindex map`), `search`, `def`, "
+                  "`init`, `gain`, `brain`, `mcp`, `share` and `feedback`. There is no "
+                  "`xerj query`, `xerj snapshot`, `xerj cluster`, `xerj migrate`, `xerj restore`, "
+                  "`xerj backup` or `xerj admin` — those are HTTP calls against the running node.",
         "evidence": [LC + ":56", LC + ":641"],
-        "rewrite": "Use `xerj index`, `xerj autoindex`, `xerj brain`, `xerj mcp` or `xerj share`. Everything else "
-                   "is an HTTP call against the running node.",
+        "rewrite": "Use one of the real subcommands - `xerj index`, `xerj autoindex`, `xerj search`, "
+                   "`xerj def`, `xerj init`, `xerj gain`, `xerj brain`, `xerj mcp`, `xerj share`, "
+                   "`xerj feedback`. Everything else is an HTTP call against the running node.",
     },
     {
         "id": "FC-MEMORY-DECAY",

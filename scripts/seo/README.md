@@ -185,6 +185,7 @@ two spaces) or an inline `[a, b]`; nested map keys under a list item are
 | `question` | string | the search question the page answers |
 | `intent` | string | e.g. `informational`, `commercial` |
 | `published` | string | ISO `YYYY-MM-DD` |
+| `updated` | string | ISO `YYYY-MM-DD`. Required since #974: it is the page's `dateModified` and must be bumped on every real edit of the source (a new article normally starts with the same value as `published`). Before it was required, sources without it dated themselves from the content file's git committer date, which a squash merge rewrites — main then went red on `build_articles --check` the day the PR merged |
 | `author` | string | shown in the source note |
 | `reviewer` | string | shown in the source note |
 | `schema_type` | string | `TechArticle` or `Article` — nothing else |
@@ -195,7 +196,6 @@ two spaces) or an inline `[a, b]`; nested map keys under a list item are
 
 | Field | Type | Rules |
 |---|---|---|
-| `updated` | string | ISO date. **Omit it** unless you mean to pin the date — see trap 2 |
 | `evidence` | list of `{claim, source}` | `source` is an `https://` URL, a site path starting `/`, or a repo-relative path (optionally `path/to/file.rs:120`) that **must exist on disk**. Repo sources render as provenance text with no href |
 | `noindex` | bool | `true` adds `robots: noindex` **and** removes the page from `sitemap.xml` (`urlmap.is_noindex` reads it) |
 | `agent_prompt` | string | one logical line, must contain `https://xerj.org/llms.txt`, must not contain a Markdown fence |
@@ -236,6 +236,7 @@ cluster: "Site maintenance"
 question: "How do I add a new answer article?"
 intent: "informational"
 published: "2026-08-21"
+updated: "2026-08-21"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
@@ -613,9 +614,12 @@ to it.
 
 ### 2. `dateModified` comes from git, so the first commit is never the last one
 
-`<lastmod>` in the sitemap and `dateModified` in article JSON-LD both come from
-`git log -1 --format=%cs -- <file>` (`urlmap.DateSource`). That is deliberate:
-it is the condition Google states for trusting the field. It also means:
+Since #974 an article's `dateModified` comes from its **required `updated:`
+frontmatter field** — author-controlled data, immune to the loop below. What
+still comes from `git log -1 --format=%cs -- <file>` (`urlmap.DateSource`) is
+the sitemap's `<lastmod>`, which dates the *generated* HTML file itself. That
+is deliberate: it is the condition Google states for trusting the field. It
+also means:
 
 ```
 edit source  ->  build (date = today's mtime fallback)  ->  commit

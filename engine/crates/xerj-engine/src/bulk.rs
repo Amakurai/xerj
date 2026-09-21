@@ -564,6 +564,16 @@ pub async fn process_bulk_with_opts(
                         j
                     };
                     let inner = &bytes[p + 1..inner_end];
+                    // #954: a backslash inside the action object can only be
+                    // part of a string escape in valid JSON, and find_field
+                    // below scans for the next raw '"' without unescaping —
+                    // `{"_id":"a\"b"}` would yield `a\` and desync the rest of
+                    // the line, collapsing distinct ids. Any escaped content
+                    // (_id, _index, op_type alike) opts out of the fast path;
+                    // the serde_json fallback below parses it correctly.
+                    if inner.contains(&b'\\') {
+                        break 'fast (None, None, None);
+                    }
                     let find_field = |needle: &[u8]| -> Option<String> {
                         // Look for `"_key":"value"` (quoted) or `"_key":NUM`
                         // (numeric, e.g. `_id:1`) inside `inner`. ES bulk

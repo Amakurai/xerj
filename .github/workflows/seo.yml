@@ -55,6 +55,13 @@ jobs:
         with:
           python-version: '3.12'
 
+      # #974: `updated:` is required frontmatter. Before it was, an article
+      # could omit the field and silently date itself from the content file's
+      # git committer date, which a squash merge rewrites — main then went red
+      # on every check below the moment such a PR merged.
+      - name: Article frontmatter schema unit tests
+        run: python3 scripts/seo/test_article_schema.py
+
       - name: generated articles are current
         run: python3 scripts/seo/build_articles.py --check
 

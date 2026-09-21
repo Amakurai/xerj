@@ -1299,7 +1299,10 @@ impl IndexStore {
                 return false;
             }
             let rest = &name[prefix.len()..];
-            if matches!(rest, "seg" | "sidx" | "ids" | "dv" | "fts-layout-v2") {
+            if matches!(
+                rest,
+                "seg" | "sidx" | "ids" | "dv" | "fts-layout-v2" | "ftsan"
+            ) {
                 if !roles.insert(rest) {
                     return false;
                 }

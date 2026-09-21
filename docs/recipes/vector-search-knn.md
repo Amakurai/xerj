@@ -232,7 +232,12 @@ kNN, non-cosine metrics, SQ8-quantized fields, and small corpora run the
 exact brute-force scan. This recipe's 8-row corpus is far below that
 threshold, so its queries ran the **exact** path — the script above
 measures **recall@k = 1.000** against a brute-force cosine ground truth
-on every query. The knobs above only start to matter at scale.
+on every query. The knobs above only start to matter at scale. To measure
+the HNSW path itself the way the published number was measured, run
+[`scripts/bench/knn-recall.sh`](../../scripts/bench/knn-recall.sh): 50k
+generated 128-d vectors, 100 probe queries scored against a client-side
+brute-force ground truth, and a `GET /_cat/ann` check so a silent fallback
+to the exact scan cannot pass for the graph.
 
 ---
 

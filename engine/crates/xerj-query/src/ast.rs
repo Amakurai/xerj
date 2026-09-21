@@ -995,6 +995,85 @@ impl QueryNode {
         }
     }
 
+    /// Returns `true` if a `Hybrid` node appears anywhere in this subtree,
+    /// including inside every wrapper (bool clauses, boost/name/constant
+    /// decorators, knn/semantic filters, boosting/dis_max/pinned, span
+    /// clauses) and inside `hybrid.queries[].query` itself.
+    ///
+    /// #943: the engine executes a hybrid ONLY from the short-circuit ladder
+    /// in `search_inner` (root node, or a `bool{must:[hybrid], filter:[…]}`
+    /// wrapper); anywhere else the doc matcher's catch-all silently matches
+    /// nothing. Callers use this to fail loud (400) instead of answering with
+    /// the wrong hit set — the engine for unpeelable shapes, the API layer
+    /// for `post_filter` beside a hybrid (post_filter never reaches the
+    /// engine, so the filter was silently ignored).
+    pub fn contains_hybrid(&self) -> bool {
+        fn walk(q: &QueryNode) -> bool {
+            match q {
+                QueryNode::Hybrid { .. } => true,
+                QueryNode::MatchAll
+                | QueryNode::MatchNone
+                | QueryNode::Term { .. }
+                | QueryNode::Terms { .. }
+                | QueryNode::Range { .. }
+                | QueryNode::Prefix { .. }
+                | QueryNode::Wildcard { .. }
+                | QueryNode::Exists { .. }
+                | QueryNode::Ids { .. }
+                | QueryNode::Script { .. }
+                | QueryNode::Match { .. }
+                | QueryNode::MatchPhrase { .. }
+                | QueryNode::MultiMatch { .. }
+                | QueryNode::QueryString { .. }
+                | QueryNode::Fuzzy { .. }
+                | QueryNode::Regexp { .. }
+                | QueryNode::Intervals { .. }
+                | QueryNode::MatchPhrasePrefix { .. }
+                | QueryNode::SimpleQueryString { .. }
+                | QueryNode::GeoDistance { .. }
+                | QueryNode::GeoBoundingBox { .. }
+                | QueryNode::GeoPolygon { .. }
+                | QueryNode::GeoShape { .. }
+                | QueryNode::SpanTerm { .. }
+                | QueryNode::MoreLikeThis { .. }
+                | QueryNode::Percolate { .. } => false,
+                QueryNode::Bool {
+                    must,
+                    should,
+                    must_not,
+                    filter,
+                    ..
+                } => must
+                    .iter()
+                    .chain(should)
+                    .chain(must_not)
+                    .chain(filter)
+                    .any(walk),
+                QueryNode::Constant { query, .. }
+                | QueryNode::Boosted { query, .. }
+                | QueryNode::Named { query, .. }
+                | QueryNode::FunctionScore { query, .. }
+                | QueryNode::Nested { query, .. } => walk(query),
+                QueryNode::Boosting {
+                    positive, negative, ..
+                } => walk(positive) || walk(negative),
+                QueryNode::DisMax { queries, .. } => queries.iter().any(walk),
+                QueryNode::Pinned { organic, .. } => walk(organic),
+                QueryNode::Knn { filter, .. } | QueryNode::SemanticSearch { filter, .. } => {
+                    filter.as_deref().is_some_and(walk)
+                }
+                QueryNode::SpanNear { clauses, .. } | QueryNode::SpanOr { clauses } => {
+                    clauses.iter().any(walk)
+                }
+                QueryNode::SpanNot { include, exclude } => walk(include) || walk(exclude),
+                QueryNode::SpanFirst { match_query, .. } => walk(match_query),
+                QueryNode::SpanContaining { little, big }
+                | QueryNode::SpanWithin { little, big } => walk(little) || walk(big),
+            }
+        }
+        walk(self)
+    }
+
     /// Rough structural depth — used by the planner for cost estimation.
     pub fn depth(&self) -> usize {
         match self {
