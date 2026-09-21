@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<!-- og:image source for /blog/does-xerj-beat-jev — NOT deployed (lives outside
+     landing/ on purpose; Cloudflare Pages uploads landing/ verbatim).
+     Rendered to landing/og/does-xerj-beat-jev.png at exactly 1200x630.
+     FIXED night palette (rasters have no theme): hexes read from style.css :root.
+     Bar widths use ONE global denominator, 0.7410 (the max across all rows), so
+     lengths are comparable ACROSS rows — the /blog index preview and the
+     homepage banner use the same convention. All figures
+     verbatim from the post: SciFact 0.6993/0.7410 · NFCorpus 0.3448/0.3312 ·
+     FiQA 0.2382/0.3638. XERJ is always gold #ffc400; the Jev-in-the-loop
+     series is always #7f93aa — accent never marks a Jev-side win. -->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@800;900&family=IBM+Plex+Sans:wght@500;600&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0b0b0d; --ink: #f4f2ec; --mute: #8a8680;
+    --line: #3a3836; --xerj: #ffc400; --jev: #7f93aa;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1200px; height: 630px; overflow: hidden; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font-family: 'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif;
+    padding: 44px 56px 40px;
+    display: flex; flex-direction: column;
+  }
+  .eyebrow {
+    font-size: 19px; font-weight: 600; letter-spacing: .22em;
+    text-transform: uppercase; color: var(--mute);
+  }
+  h1 {
+    font-family: 'Big Shoulders Display', 'Arial Narrow', Impact, sans-serif;
+    font-weight: 900; font-size: 136px; line-height: .96;
+    letter-spacing: .01em; margin-top: 18px; color: var(--ink);
+    text-transform: uppercase; white-space: nowrap;
+  }
+  .sub {
+    font-family: 'Big Shoulders Display', 'Arial Narrow', Impact, sans-serif;
+    font-weight: 800; font-size: 54px; line-height: 1;
+    text-transform: uppercase; color: var(--xerj); margin-top: 6px;
+    letter-spacing: .02em; white-space: nowrap;
+  }
+  .chart { margin-top: 30px; border-top: 1px solid var(--line); }
+  .row {
+    display: grid; grid-template-columns: 150px 1fr 1fr;
+    gap: 0 24px; align-items: center;
+    padding: 13px 0; border-bottom: 1px solid var(--line);
+  }
+  .ds { font-size: 19px; font-weight: 600; letter-spacing: .18em;
+        text-transform: uppercase; color: var(--mute); }
+  .pair { display: flex; align-items: center; gap: 12px; }
+  .num { font-family: 'JetBrains Mono', 'Courier New', monospace;
+         font-size: 29px; font-weight: 700; }
+  .num.a { color: var(--ink); min-width: 176px; text-align: right; }
+  .num.b { color: var(--jev); min-width: 176px; }
+  .bar { height: 10px; min-width: 2px; }
+  .bar.a { background: var(--xerj); }
+  .bar.b { background: var(--jev); }
+  .strip {
+    margin-top: auto; padding-top: 16px; border-top: 1px solid var(--line);
+    font-family: 'JetBrains Mono', 'Courier New', monospace;
+    font-size: 21px; color: var(--mute); white-space: nowrap;
+  }
+  .strip b { color: var(--ink); font-weight: 700; }
+</style>
+</head>
+<body>
+  <div class="eyebrow">XERJ · ENGINEERING LOG · 2026-09-21</div>
+  <h1>Does XERJ beat JEV?</h1>
+  <div class="sub">On the bill, outright. On FiQA, no.</div>
+
+  <div class="chart">
+    <div class="row">
+      <span class="ds">SciFact</span>
+      <span class="pair"><span class="num a">0.6993</span><span class="bar a" style="width:94.4%"></span></span>
+      <span class="pair"><span class="bar b" style="width:100%"></span><span class="num b">0.7410</span></span>
+    </div>
+    <div class="row">
+      <span class="ds">NFCorpus</span>
+      <span class="pair"><span class="num a">0.3448</span><span class="bar a" style="width:46.5%"></span></span>
+      <span class="pair"><span class="bar b" style="width:44.7%"></span><span class="num b">0.3312</span></span>
+    </div>
+    <div class="row">
+      <span class="ds">FiQA</span>
+      <span class="pair"><span class="num a">0.2382</span><span class="bar a" style="width:32.1%"></span></span>
+      <span class="pair"><span class="bar b" style="width:49.1%"></span><span class="num b">0.3638</span></span>
+    </div>
+  </div>
+
+  <div class="strip">1,271 judged queries · <b>$0.6375</b> vs <b>$0</b> · xerj.org/blog/does-xerj-beat-jev</div>
+</body>
+</html>

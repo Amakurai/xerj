@@ -6,10 +6,13 @@
 //! constructing events.
 //!
 //! `summary` is the only enabled mode in v1: it emits bounded periodic
-//! start/snapshot/stop NDJSON. Lifecycle `EventKind` variants and merge/cache
-//! categories are reserved schema vocabulary; until their owners are wired,
-//! their measurements are `unavailable` and their gauges must not be treated
-//! as measured zero.
+//! start/snapshot/stop NDJSON. Lifecycle `EventKind` variants beyond the
+//! trace lifecycle remain reserved schema vocabulary; until their owners are
+//! wired, their measurements are `unavailable` and their gauges must not be
+//! treated as measured zero. The cache categories are charged by the segment
+//! hydration budget at every admission, and the merge categories are charged
+//! by the merge task (guards for whole buffers, sampled checkpoints for
+//! per-document streams) — see `run_merge_once` in `crate::index`.
 //!
 //! `MemtableActive` is sampled from the engine while `FlushDrained` is owned at
 //! the authoritative drain boundary. Those authorities cannot be sampled
@@ -500,8 +503,25 @@ fn measurement(category: Category) -> Measurement {
         | Category::CacheSortShadow
         | Category::CacheIdPositions
         | Category::CacheRowSequences
-        | Category::CacheDecodedStored => Measurement::Estimated,
-        _ => Measurement::Unavailable,
+        | Category::CacheDecodedStored
+        | Category::CacheFtsReader
+        | Category::CacheVectorColumn
+        | Category::MergeDecoded
+        | Category::MergeSurvivor
+        | Category::MergeParsed => Measurement::Estimated,
+        // Exact owned buffer lengths observed at the buffer boundary.
+        Category::MergeJsonBuffer | Category::MergeEncoded => Measurement::SerializedSize,
+    }
+}
+
+/// Sampled checkpoint for a merge-owned buffer whose size changes per
+/// document (`survivors`, `merged_json_buf`, `fts_input`). One atomic
+/// transition per checkpoint instead of one per document; the sampled peak
+/// can trail the true peak by up to one checkpoint interval of growth, which
+/// the `Estimated` measurement kind already admits.
+pub(crate) fn observe_checkpoint(category: Category, bytes: usize) {
+    if let Some(ledger) = active_ledger() {
+        ledger.observe(category, bytes);
     }
 }
 

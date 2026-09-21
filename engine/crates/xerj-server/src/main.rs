@@ -2520,7 +2520,30 @@ async fn async_main() -> Result<()> {
     //      parent circuit breaker and the disk flood-stage write block. This
     //      is the structural guard against the 112 GiB OOM class — writes get
     //      a 429 circuit_breaking_exception before the kernel OOM-kills us.
+    //      Since #948 the sampler also requests a memory-pressure DRAIN
+    //      (flush + cache release) when the breaker engages; the purge hook
+    //      installed just below is what lets that drain actually lower RSS
+    //      under jemalloc, which otherwise keeps freed pages resident.
     if storage_available {
+        // The purge-hook closure calls jemalloc mallctls, and jemalloc is not
+        // built on MSVC (the tikv crates are target-gated out in Cargo.toml),
+        // so the hook installs on every other target only — the engine's
+        // default no-op purge covers MSVC. The resource sampler below still
+        // runs everywhere: allocator_snapshot() has its own msvc fallback.
+        #[cfg(not(target_env = "msvc"))]
+        xerj_engine::engine::set_allocator_purge_hook(std::sync::Arc::new(|| {
+            // Refresh the cached stats first (the epoch mallctl is what makes
+            // the stats reads in the ingest-memory ledger coherent), then
+            // purge every arena's dirty pages back to the OS. 4096 is
+            // MALLCTL_ARENAS_ALL. Both are best-effort: a failing mallctl
+            // must never propagate out of the drain path.
+            let _ = tikv_jemalloc_ctl::epoch::advance();
+            // SAFETY: `arena.<i>.purge` with i = MALLCTL_ARENAS_ALL (4096)
+            // is a plain "purge every arena" action mallctl; the value is an
+            // unused unsigned scalar. The name is NUL-terminated and names a
+            // real jemalloc ctl node, so the write cannot read out of bounds.
+            let _ = unsafe { tikv_jemalloc_ctl::raw::write(b"arena.4096.purge\0", 0u64) };
+        }));
         state.engine.spawn_resource_sampler();
     }
 

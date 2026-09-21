@@ -1,0 +1,61 @@
+########## VARIANT A AFTER clean re-run ##########
+variant=A docs=20000 body_kb=10 idle_rss_kb=131936 idle_hwm_kb=131936
+{"docs_requested": 20000, "docs_sent": 20000, "node_count": 20000, "body_kb": 10, "bulk_mb": 8.0, "retry_rounds": 147, "wall_s": 1472.1, "docs_per_s": 13.6}
+post-flush rss_kb=875708
+settled rss_kb=499944 hwm_kb=1928908
+cache/view stats:
+6447
+index bytes on disk: 294456 kB
+after-delete rss_kb=211812 (was 500148 before delete)
+ledger last snapshot:
+{"schema": "xerj.ingest_memory.v1", "seq": 1527, "ts_unix_ns": 1789961058428583400, "event": "trace_snapshot", "scope": {"index_hash": null, "request": null, "flush": null, "merge": null, "shard": null}, "logical": [{"category": "http_body", "current": 0, "peak": 8398962, "measurement": "serialized_size"}, {"category": "http_rewrite_buffer", "current": 0, "peak": 0, "measurement": "exact_capacity"}, {"category": "raw_source", "current": 0, "peak": 0, "measurement": "serialized_size"}, {"category": "parsed_source", "current": 0, "peak": 0, "measurement": "estimated"}, {"category": "parsed_vector", "current": 0, "peak": 0, "measurement": "exact_capacity"}, {"category": "prepared_document", "current": 0, "peak": 0, "measurement": "estimated"}, {"category": "prepared_vector", "current": 0, "peak": 0, "measurement": "exact_capacity"}, {"category": "memtable_active", "current": 0, "peak": 478961091, "measurement": "estimated"}, {"category": "flush_drained", "current": 0, "peak": 216101357, "measurement": "estimated"}, {"category": "merge_decoded", "current": 0, "peak": 16248091, "measurement": "estimated"}, {"category": "merge_survivor", "current": 0, "peak": 163292797, "measurement": "estimated"}, {"category": "merge_json_buffer", "current": 0, "peak": 162223281, "measurement": "serialized_size"}, {"category": "merge_parsed", "current": 0, "peak": 186934251, "measurement": "estimated"}, {"category": "merge_encoded", "current": 0, "peak": 39973405, "measurement": "serialized_size"}
+WORKDIR=/tmp/948-atrest.vMKPdM
+########## VARIANT C BASE (100k x 100B) ##########
+variant=C docs=100000 body_kb=0 idle_rss_kb=130788 idle_hwm_kb=130788
+{"docs_requested": 100000, "docs_sent": 100000, "node_count": 100000, "body_kb": 0, "bulk_mb": 8.0, "retry_rounds": 8, "wall_s": 92.0, "docs_per_s": 1086.5}
+post-flush rss_kb=1612780
+settled rss_kb=904136 hwm_kb=2020212
+cache/view stats:
+6455
+index bytes on disk: 63568 kB
+after-delete rss_kb=215120 (was 904444 before delete)
+ledger last snapshot:
+{"schema": "xerj.ingest_memory.v1", "seq": 150, "ts_unix_ns": 1789961209342658723, "event": "trace_snapshot", "scope": {"index_hash": null, "request": null, "flush": null, "merge": null, "shard": null}, "logical": [{"category": "http_body", "current": 0, "peak": 8418673, "measurement": "serialized_size"}, {"category": "http_rewrite_buffer", "current": 0, "peak": 0, "measurement": "exact_capacity"}, {"category": "raw_source", "current": 0, "peak": 0, "measurement": "serialized_size"}, {"category": "parsed_source", "current": 0, "peak": 0, "measurement": "estimated"}, {"category": "parsed_vector", "current": 0, "peak": 0, "measurement": "exact_capacity"}, {"category": "prepared_document", "current": 0, "peak": 0, "measurement": "estimated"}, {"category": "prepared_vector", "current": 0, "peak": 0, "measurement": "exact_capacity"}, {"category": "memtable_active", "current": 865, "peak": 160096907, "measurement": "estimated"}, {"category": "flush_drained", "current": 0, "peak": 71920064, "measurement": "estimated"}, {"category": "merge_decoded", "current": 0, "peak": 0, "measurement": "unavailable"}, {"category": "merge_survivor", "current": 0, "peak": 0, "measurement": "unavailable"}, {"category": "merge_json_buffer", "current": 0, "peak": 0, "measurement": "unavailable"}, {"category": "merge_parsed", "current": 0, "peak": 0, "measurement": "unavailable"}, {"category": "merge_encoded", "current": 0, "peak": 0, "measurement": "unavailable"}, {"category": "cache_stored_slices", "c
+WORKDIR=/tmp/948-atrest.8HDjdQ
+########## VARIANT C AFTER ##########
+variant=C docs=100000 body_kb=0 idle_rss_kb=129460 idle_hwm_kb=129460
+{"docs_requested": 100000, "docs_sent": 100000, "node_count": 100000, "body_kb": 0, "bulk_mb": 8.0, "retry_rounds": 2, "wall_s": 47.1, "docs_per_s": 2124.2}
+post-flush rss_kb=1385352
+settled rss_kb=287496 hwm_kb=1607592
+cache/view stats:
+6459
+index bytes on disk: 63576 kB
+after-delete rss_kb=176968 (was 287744 before delete)
+ledger last snapshot:
+{"schema": "xerj.ingest_memory.v1", "seq": 105, "ts_unix_ns": 1789961314285513277, "event": "trace_snapshot", "scope": {"index_hash": null, "request": null, "flush": null, "merge": null, "shard": null}, "logical": [{"category": "http_body", "current": 0, "peak": 8418673, "measurement": "serialized_size"}, {"category": "http_rewrite_buffer", "current": 0, "peak": 0, "measurement": "exact_capacity"}, {"category": "raw_source", "current": 0, "peak": 0, "measurement": "serialized_size"}, {"category": "parsed_source", "current": 0, "peak": 0, "measurement": "estimated"}, {"category": "parsed_vector", "current": 0, "peak": 0, "measurement": "exact_capacity"}, {"category": "prepared_document", "current": 0, "peak": 0, "measurement": "estimated"}, {"category": "prepared_vector", "current": 0, "peak": 0, "measurement": "exact_capacity"}, {"category": "memtable_active", "current": 865, "peak": 162499652, "measurement": "estimated"}, {"category": "flush_drained", "current": 0, "peak": 82164391, "measurement": "estimated"}, {"category": "merge_decoded", "current": 0, "peak": 10325213, "measurement": "estimated"}, {"category": "merge_survivor", "current": 0, "peak": 63570782, "measurement": "estimated"}, {"category": "merge_json_buffer", "current": 0, "peak": 56381893, "measurement": "serialized_size"}, {"category": "merge_parsed", "current": 0, "peak": 233834144, "measurement": "estimated"}, {"category": "merge_encoded", "current": 0, "peak": 8009843, "measurement": "serialized_size"}, {
+WORKDIR=/tmp/948-atrest.lH663L
+########## ATREST TAIL DONE ##########
+########## VARIANT A BASE (xerj-948-base) ##########
+variant=A docs=20000 body_kb=10 idle_rss_kb=135528 idle_hwm_kb=135528
+{"docs_requested": 20000, "docs_sent": 20000, "node_count": 20000, "body_kb": 10, "bulk_mb": 8.0, "retry_rounds": 0, "wall_s": 17.4, "docs_per_s": 1147.7}
+post-flush rss_kb=1393996
+settled rss_kb=996188 hwm_kb=1990784
+cache/view stats:
+6447
+index bytes on disk: 294476 kB
+after-delete rss_kb=232300 (was 996388 before delete)
+ledger last snapshot:
+{"schema": "xerj.ingest_memory.v1", "seq": 75, "ts_unix_ns": 1789952795164577083, "event": "trace_snapshot", "scope": {"index_hash": null, "request": null, "flush": null, "merge": null, "shard": null}, "logical": [{"category": "http_body", "current": 0, "peak": 8398962, "measurement": "serialized_size"}, {"category": "http_rewrite_buffer", "current": 0, "peak": 0, "measurement": "exact_capacity"}, {"category": "raw_source", "current": 0, "peak": 0, "measurement": "serialized_size"}, {"category": "parsed_source", "current": 0, "peak": 0, "measurement": "estimated"}, {"category": "parsed_vector", "current": 0, "peak": 0, "measurement": "exact_capacity"}, {"category": "prepared_document", "current": 0, "peak": 0, "measurement": "estimated"}, {"category": "prepared_vector", "current": 0, "peak": 0, "measurement": "exact_capacity"}, {"category": "memtable_active", "current": 865, "peak": 477629276, "measurement": "estimated"}, {"category": "flush_drained", "current": 0, "peak": 205390028, "measurement": "estimated"}, {"category": "merge_decoded", "current": 0, "peak": 0, "measurement": "unavailable"}, {"category": "merge_survivor", "current": 0, "peak": 0, "measurement": "unavailable"}, {"category": "merge_json_buffer", "current": 0, "peak": 0, "measurement": "unavailable"}, {"category": "merge_parsed", "current": 0, "peak": 0, "measurement": "unavailable"}, {"category": "merge_encoded", "current": 0, "peak": 0, "measurement": "unavailable"}, {"category": "cache_stored_slices", "c
+WORKDIR=/tmp/948-atrest.Hljq0P
+########## VARIANT A AFTER (xerj-948-after) ##########
+variant=A docs=20000 body_kb=10 idle_rss_kb=131400 idle_hwm_kb=131400
+{"docs_requested": 20000, "docs_sent": 20000, "node_count": 20000, "body_kb": 10, "bulk_mb": 8.0, "retry_rounds": 0, "wall_s": 18.6, "docs_per_s": 1077.0}
+post-flush rss_kb=880792
+settled rss_kb=492972 hwm_kb=1988256
+cache/view stats:
+6447
+index bytes on disk: 294860 kB
+after-delete rss_kb=203808 (was 493424 before delete)
+ledger last snapshot:
+{"schema": "xerj.ingest_memory.v1", "seq": 77, "ts_unix_ns": 1789952871701833462, "event": "trace_snapshot", "scope": {"index_hash": null, "request": null, "flush": null, "merge": null, "shard": null}, "logical": [{"category": "http_body", "current": 0, "peak": 8398962, "measurement": "serialized_size"}, {"category": "http_rewrite_buffer", "current": 0, "peak": 0, "measurement": "exact_capacity"}, {"category": "raw_source", "current": 0, "peak": 0, "measurement": "serialized_size"}, {"category": "parsed_source", "current": 0, "peak": 0, "measurement": "estimated"}, {"category": "parsed_vector", "current": 0, "peak": 0, "measurement": "exact_capacity"}, {"category": "prepared_document", "current": 0, "peak": 0, "measurement": "estimated"}, {"category": "prepared_vector", "current": 0, "peak": 0, "measurement": "exact_capacity"}, {"category": "memtable_active", "current": 865, "peak": 477629276, "measurement": "estimated"}, {"category": "flush_drained", "current": 0, "peak": 216974534, "measurement": "estimated"}, {"category": "merge_decoded", "current": 0, "peak": 13576868, "measurement": "estimated"}, {"category": "merge_survivor", "current": 0, "peak": 142017230, "measurement": "estimated"}, {"category": "merge_json_buffer", "current": 0, "peak": 141086859, "measurement": "serialized_size"}, {"category": "merge_parsed", "current": 0, "peak": 162577428, "measurement": "estimated"}, {"category": "merge_encoded", "current": 0, "peak": 34775188, "measurement": "serialized_size"}
+WORKDIR=/tmp/948-atrest.SSIO8g

@@ -265,9 +265,9 @@
 
   <h3>3. Watch each modality fail on its own</h3>
   <p><strong>Pure BM25</strong> — <code class="inline">{"match": {"title": "reset password"}}</code>:</p>
-<pre class="code">d1  score=0.5754  Reset your password
-d3  score=0.2877  Password complexity and rotation policy
-d5  score=0.2877  Change your account password</pre>
+<pre class="code">d1  score=2.2742  Reset your password
+d5  score=0.5784  Change your account password
+d3  score=0.5300  Password complexity and rotation policy</pre>
   <p>It <strong>misses d2</strong> entirely — "Regain entry to a locked-out account" has no shared keywords, so it can never be a BM25 hit.</p>
   <p><strong>Pure kNN</strong> — <code class="inline">{"knn": {"field": "vec", "query_vector": [...], "k": 3}}</code>, showing the 3 nearest:</p>
 <pre class="code">d1  score=0.9994  Reset your password
@@ -298,21 +298,22 @@ d5  score=0.9942  Change your account password</pre>
     "max_score": 0.03279,
     "hits": [
       { "_id": "d1", "_score": 0.03279, "_source": { "title": "Reset your password" } },
-      { "_id": "d5", "_score": 0.03175, "_source": { "title": "Change your account password" } },
-      { "_id": "d3", "_score": 0.01613, "_source": { "title": "Password complexity and rotation policy" } },
-      { "_id": "d2", "_score": 0.01613, "_source": { "title": "Regain entry to a locked-out account" } }
+      { "_id": "d5", "_score": 0.032, "_source": { "title": "Change your account password" } },
+      { "_id": "d2", "_score": 0.01613, "_source": { "title": "Regain entry to a locked-out account" } },
+      { "_id": "d3", "_score": 0.01587, "_source": { "title": "Password complexity and rotation policy" } }
     ]
   }
 }</pre>
-  <p><strong>d2</strong> (only kNN found it) and <strong>d3</strong> (only BM25 found it) are now <em>both</em> on the page, and <strong>d1</strong> — the doc that matched on <em>both</em> keyword and vector — is still ranked #1. Watch <strong>d5</strong>: neither BM25 nor kNN ranks it better than #3, yet because <em>both</em> signals agree on it, fusion promotes it to <strong>#2</strong> — ahead of d3 and d2, each of which is strong in only one modality. That's the whole point: fusion rewards agreement between the two signals while still admitting the strong single-signal hits that either method alone would have dropped.</p>
+  <p><strong>d2</strong> (only kNN found it) and <strong>d3</strong> (only BM25 found it) are now <em>both</em> on the page, and <strong>d1</strong> — the doc that matched on <em>both</em> keyword and vector — is still ranked #1. Watch <strong>d5</strong>: BM25 ranks it #2 and kNN ranks it #3 — first in neither — yet because <em>both</em> signals agree on it, fusion keeps it at <strong>#2</strong>, ahead of d2 and d3, each of which only one modality found. That's the whole point: fusion rewards agreement between the two signals while still admitting the strong single-signal hits that either method alone would have dropped.</p>
   <p>Only <strong>four</strong> docs come back, not five: d4 ("How to bake sourdough bread") is in <em>neither</em> sub-query's result set — it shares no keywords and its topic vector falls outside the kNN <code class="inline">k:3</code> cutoff — so RRF never sees it. Fusion ranks the <em>union</em> of the sub-query hits, nothing more.</p>
 
   <h2>How the fusion works</h2>
-  <p><code class="inline">"fusion": "rrf"</code> uses Reciprocal Rank Fusion: each sub-query contributes <code class="inline">weight / (k + rank)</code> for a doc (default <code class="inline">k = 60</code>, <code class="inline">rank</code> is 1-based), summed across sub-queries. It ranks by <em>position</em>, not raw score, so BM25's <code class="inline">~0.5</code> scores and kNN's <code class="inline">~0.99</code> cosines never have to be normalized onto a common scale — a persistent headache when you fuse two systems yourself. The scores above fall straight out of this formula:</p>
+  <p><code class="inline">"fusion": "rrf"</code> uses Reciprocal Rank Fusion: each sub-query contributes <code class="inline">weight / (k + rank)</code> for a doc (default <code class="inline">k = 60</code>, <code class="inline">rank</code> is 1-based), summed across sub-queries. It ranks by <em>position</em>, not raw score, so BM25's <code class="inline">0.5</code>–<code class="inline">2.3</code> scores and kNN's <code class="inline">~0.99</code> cosines never have to be normalized onto a common scale — a persistent headache when you fuse two systems yourself. The scores above fall straight out of this formula:</p>
   <ul>
     <li><strong>d1</strong> is rank 1 in <em>both</em> lists → <code class="inline">1/(60+1) + 1/(60+1) = 0.03279</code>.</li>
-    <li><strong>d5</strong> is rank 3 in <em>both</em> lists → <code class="inline">1/63 + 1/63 = 0.03175</code>, still beating either single-list hit because two contributions stack.</li>
-    <li><strong>d3</strong> and <strong>d2</strong> each appear in <em>one</em> list at rank 2 → <code class="inline">1/(60+2) = 0.01613</code> apiece — an exact tie.</li>
+    <li><strong>d5</strong> is rank 2 in the BM25 list and rank 3 in the kNN list → <code class="inline">1/62 + 1/63 = 0.03200</code>, still beating either single-list hit because two contributions stack.</li>
+    <li><strong>d2</strong> is rank 2 in the kNN list only → <code class="inline">1/(60+2) = 0.01613</code>.</li>
+    <li><strong>d3</strong> is rank 3 in the BM25 list only → <code class="inline">1/(60+3) = 0.01587</code>.</li>
   </ul>
   <p>Other <code class="inline">fusion</code> options:</p>
   <ul>
@@ -338,19 +339,19 @@ PASS  kNN alone MISSES d3 (password policy: topic vector too far)
 PASS  Hybrid surfaces BOTH d2 and d3 in a single query
 PASS  d1 (keyword + vector match) still ranks #1 under fusion
 
-BM25 ids  : ['d1', 'd3', 'd5']
+BM25 ids  : ['d1', 'd5', 'd3']
 kNN  ids  : ['d1', 'd2', 'd5']
 Hybrid ids: ['d1', 'd5', 'd2', 'd3']
 
 OK</pre>
-  <p>The four assertions and the scores are deterministic; the BM25 and kNN id lists are stable, and the hybrid list always starts <code class="inline">['d1', 'd5', …]</code>. The <strong>only</strong> run-to-run wobble is the last two ids — <strong>d3 and d2 tie at exactly <code class="inline">0.01613</code></strong>, so they swap freely between positions #3 and #4 (across a dozen runs we saw both <code class="inline">d2, d3</code> and <code class="inline">d3, d2</code>). The recipe's point — that d2 and d3 both appear and d1 stays #1 — holds every time.</p>
+  <p>The four assertions, the scores and all three id lists are deterministic: the same request returns the same page on every run and after a restart. That holds for tied scores too — see the note on ties below.</p>
   <p>See the full runnable example — <a href="https://github.com/xerj-org/xerj/blob/main/docs/examples/hybrid-search/hybrid_search.py">docs/examples/hybrid-search/hybrid_search.py</a> on GitHub.</p>
 
   <h2>Notes &amp; limits</h2>
   <ul>
     <li><strong><code class="inline">knn</code> in a query scores every doc that has the field</strong>, ranked by cosine; <code class="inline">size</code> (or <code class="inline">from</code>+<code class="inline">size</code>) is the cutoff the user sees. So <code class="inline">k:3</code> plus <code class="inline">size:3</code> means "show the 3 nearest." For a hard candidate cap independent of <code class="inline">size</code>, keep <code class="inline">k</code> small — it's carried on the sub-query.</li>
     <li><strong>Score scales differ by fusion.</strong> RRF returns small fused scores (<code class="inline">0.016–0.033</code> here) — compare docs <em>within</em> a response, not against BM25/cosine absolutes.</li>
-    <li><strong>Tie ordering is not guaranteed</strong> for docs with identical fused scores. d3 and d2 both score exactly <code class="inline">0.01613</code> here (each is a single rank-2 hit in one sub-query), and they genuinely swap between positions #3 and #4 from one run to the next — we observed both orders across a dozen runs. Set membership — the point of this recipe — is stable; the order <em>among exact ties</em> is not.</li>
+    <li><strong>Tied fused scores are ordered by arrival.</strong> Under RRF ties are common: a document found only by one leg at rank <em>r</em> and a document found only by the other leg at rank <em>r</em> score exactly the same (<code class="inline">1/(k+r)</code> each), and so do two documents at swapped ranks (1,2) and (2,1). XERJ orders a tie the way it orders every score-ranked page: fused <code class="inline">_score</code> descending, then the order the documents were indexed (<code class="inline">_seq_no</code>, the ES <code class="inline">_doc</code> order), then <code class="inline">_id</code>. The page is the same on every run and after a restart, whether the documents are still in memory or already flushed, so <code class="inline">from</code>/<code class="inline">size</code> paging does not skip or repeat a document at a page boundary, and listing the legs in another order does not reorder an equal-weight request. Before <a href="https://github.com/xerj-org/xerj/issues/940">#940</a> a tie followed hash-map iteration order, which changed from one process to the next.</li>
     <li><strong>Vector quality is your embeddings' job.</strong> This recipe supplies vectors directly for a deterministic demo. For real semantic recall, generate <code class="inline">dense_vector</code> values with a production embedding model, or use a <code class="inline">semantic_text</code> field with an external <code class="inline">inference_id</code>.</li>
   </ul>
 
@@ -405,6 +406,7 @@ OK</pre>
   <div class="fm-col">
     <span class="fm-h">RESOURCES</span>
     <a href="/resources/">SALES KIT</a>
+    <a href="/blog/">BLOG</a>
     <a href="/brand">BRAND</a>
     <a href="/brandbook/">BRAND BOOK</a>
     <a href="/llms.txt">LLMS.TXT</a>

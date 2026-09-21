@@ -66,6 +66,15 @@ pub struct SizeTieredMergePolicy {
     /// Maximum size a segment can reach before it is excluded from merges
     /// (already "large enough").
     pub max_merged_segment_bytes: u64,
+    /// Upper bound on the SUM of input segment bytes in one merge batch.
+    /// Issue #948: the merge executor materialises decoded + re-encoded
+    /// copies of every input doc in memory (measured 5-9x the input bytes
+    /// on mailbox-shaped docs), so an unbounded count-chunked batch of
+    /// large segments is an unbounded heap spike.  A batch may exceed the
+    /// cap only when even the tier's `min_merge_count` smallest segments
+    /// already exceed it (otherwise no merge in that tier could ever run).
+    /// 0 disables the bound (previous behaviour).
+    pub max_batch_input_bytes: u64,
 }
 
 impl Default for SizeTieredMergePolicy {
@@ -75,6 +84,7 @@ impl Default for SizeTieredMergePolicy {
             max_merge_count: 10,
             tier_floor_bytes: 5 * 1024 * 1024, // 5 MiB
             max_merged_segment_bytes: 5 * 1024 * 1024 * 1024, // 5 GiB
+            max_batch_input_bytes: 512 * 1024 * 1024, // 512 MiB
         }
     }
 }
@@ -121,15 +131,38 @@ impl MergePolicy for SizeTieredMergePolicy {
             // batches sequentially and the spawn_blocking hand-off keeps
             // the runtime responsive, so there's no reason to
             // artificially hold batches back.
-            let ids: Vec<SegmentId> = segs.into_iter().map(|s| s.id.clone()).collect();
+            //
+            // #948 — batches are additionally cut on cumulative INPUT
+            // bytes (`max_batch_input_bytes`): the executor holds decoded
+            // + re-encoded copies of every input doc, so batch heap cost
+            // scales with bytes, not segment count.  A batch only
+            // overruns the cap when `min_merge_count` smallest segments
+            // of the tier already exceed it by themselves.
+            let id_sizes: Vec<(SegmentId, u64)> = segs
+                .into_iter()
+                .map(|s| (s.id.clone(), s.size_bytes))
+                .collect();
             let mut start = 0usize;
-            while start < ids.len() {
-                let end = (start + self.max_merge_count).min(ids.len());
-                let batch: Vec<SegmentId> = ids[start..end].to_vec();
+            while start < id_sizes.len() {
+                let mut batch: Vec<SegmentId> = Vec::new();
+                let mut batch_bytes = 0u64;
+                let mut i = start;
+                while i < id_sizes.len() && batch.len() < self.max_merge_count {
+                    let (id, size) = &id_sizes[i];
+                    if self.max_batch_input_bytes > 0
+                        && batch.len() >= self.min_merge_count
+                        && batch_bytes + size > self.max_batch_input_bytes
+                    {
+                        break;
+                    }
+                    batch_bytes = batch_bytes.saturating_add(*size);
+                    batch.push(id.clone());
+                    i += 1;
+                }
                 if batch.len() >= self.min_merge_count {
                     merges.push(batch);
                 }
-                start = end;
+                start = i;
             }
         }
         merges
@@ -576,5 +609,93 @@ mod tests {
             executor.execute_merge(&ids),
             Err(StorageError::MergeAborted(_))
         ));
+    }
+
+    // ── #948: merge batch input-byte bound ──────────────────────────────────
+
+    fn sized_segment(id: &str, size_bytes: u64) -> SegmentMeta {
+        SegmentMeta {
+            id: id.to_string(),
+            doc_count: 1,
+            size_bytes,
+            min_seq_no: 0,
+            max_seq_no: 1,
+            created_at_ms: 0,
+            has_tombstones: false,
+            seg_path: String::new(),
+            sidx_path: String::new(),
+        }
+    }
+
+    const MI: u64 = 1024 * 1024;
+
+    #[test]
+    fn size_tiered_batches_respect_input_byte_cap() {
+        // #948 — the merge executor materialises decoded + re-encoded copies
+        // of every input document (measured 5-9x input bytes on mailbox
+        // docs), so batch heap cost scales with INPUT BYTES, not segment
+        // count.  A count-chunked batch of large segments is an unbounded
+        // heap spike.  The default policy caps a batch at 512 MiB.
+        let policy = SizeTieredMergePolicy::default();
+        let cap = policy.max_batch_input_bytes;
+        assert!(cap > 0, "default policy must bound batch input bytes");
+
+        // Ten 100 MiB segments in the same size tier: 1000 MiB of input —
+        // one count-chunked batch pre-#948 (max_merge_count = 10).  The cap
+        // must split them into <= 512 MiB batches.
+        let segments: Vec<SegmentMeta> = (0..10)
+            .map(|i| sized_segment(&format!("seg-{i}"), 100 * MI))
+            .collect();
+        let size_of =
+            |id: &str| -> u64 { segments.iter().find(|s| s.id == id).unwrap().size_bytes };
+
+        let batches = policy.select_merges(&segments);
+        assert!(
+            batches.len() >= 2,
+            "1000 MiB of input must not land in one batch: {:?}",
+            batches
+        );
+        for batch in &batches {
+            let input_bytes: u64 = batch.iter().map(|id| size_of(id)).sum();
+            assert!(
+                input_bytes <= cap || batch.len() <= policy.min_merge_count,
+                "batch of {} segments carries {} MiB > {} MiB cap",
+                batch.len(),
+                input_bytes / MI,
+                cap / MI
+            );
+        }
+        // The bound must not stop the tier converging: every segment that
+        // made it into a batch is merged exactly once.
+        let merged: std::collections::HashSet<&str> = batches
+            .iter()
+            .flat_map(|b| b.iter().map(|id| id.as_str()))
+            .collect();
+        assert_eq!(merged.len(), 10, "all ten segments must still merge");
+    }
+
+    #[test]
+    fn size_tiered_batch_cap_floor_is_min_merge_count() {
+        // When even the tier's `min_merge_count` smallest segments exceed
+        // the cap by themselves, the floor wins: a batch of exactly
+        // `min_merge_count` is allowed to overrun, otherwise the tier
+        // could never merge at all.
+        let policy = SizeTieredMergePolicy {
+            max_batch_input_bytes: 10 * MI,
+            ..Default::default()
+        };
+        let segments: Vec<SegmentMeta> = (0..8)
+            .map(|i| sized_segment(&format!("seg-{i}"), 4 * MI))
+            .collect();
+
+        let batches = policy.select_merges(&segments);
+        assert!(!batches.is_empty());
+        for batch in &batches {
+            assert!(
+                batch.len() == policy.min_merge_count,
+                "cap smaller than min_merge_count inputs must yield exact-floor batches, got {:?}",
+                batch
+            );
+        }
     }
 }

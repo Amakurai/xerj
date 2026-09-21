@@ -23,8 +23,9 @@
 // the ledger.
 //
 // LIVE DATA ONLY. data/backends/xerj.js routes this dashboard to
-// data/second-brain-api.js, which reads /_graph/{brain}/overview and
-// /_graph/{brain}/ego and NEVER falls back to mock — an empty or
+// data/second-brain-api.js, which reads the console's own session-authorized
+// graph endpoints (`/_xerj-console/api/v1/graph/{brain}/overview` and
+// `…/{brain}/ego`, issue #936) and NEVER falls back to mock — an empty or
 // unreachable brain renders an honest state that says how to fill it
 // (`xerj brain ~/your-folder`), not invented beliefs.
 // ============================================================

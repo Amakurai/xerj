@@ -37,6 +37,7 @@ import json
 import pathlib
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import urllib.parse
@@ -221,6 +222,22 @@ class Lint:
     @staticmethod
     def _meta(page: audit_mod.Page, key: str) -> str | None:
         return page.metas.get(key)
+
+    @staticmethod
+    def _png_size(path: pathlib.Path) -> tuple[int, int] | None:
+        """Width/height from the IHDR chunk, or None when not a PNG.
+
+        Used by the og:image card check — every og card this site ships is a
+        1200x630 PNG rendered by scripts/seo/mk_og_card.py, and a card of the
+        wrong size fails open-graph validation silently."""
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(24)
+        except OSError:
+            return None
+        if len(head) < 24 or head[:8] != b"\x89PNG\r\n\x1a\n":
+            return None
+        return struct.unpack(">II", head[16:24])
 
     # ── sitemap ↔ filesystem (rules 1-14) ───────────────────────────────────
     def check_sitemap(self) -> None:
@@ -611,6 +628,20 @@ class Lint:
                     if not (self.root / asset).is_file():
                         self.gate("og.image_missing", rel,
                                   f"og:image {og_img} has no file on disk (rule 31)")
+                    elif not asset.lower().endswith(".png"):
+                        self.warn("og.image_not_png", rel,
+                                  f"og:image {og_img} is not a PNG — size "
+                                  f"not checked (rule 31)")
+                    else:
+                        size = self._png_size(self.root / asset)
+                        if size is None:
+                            self.gate("og.image_not_png", rel,
+                                      f"og:image {og_img} does not parse as a "
+                                      f"PNG (rule 31)")
+                        elif size != (1200, 630):
+                            self.gate("og.image_size", rel,
+                                      f"og:image {og_img} is {size[0]}x{size[1]}, "
+                                      f"not the 1200x630 card size (rule 31)")
             card = self._meta(page, "twitter:card")
             if card not in ("summary", "summary_large_image"):
                 self.gate("twitter.card", rel,

@@ -74,9 +74,9 @@ The user's intent in both modalities: text `"reset password"`, vector
 **Pure BM25** — `{"match": {"title": "reset password"}}`:
 
 ```
-d1  score=0.5754  Reset your password
-d3  score=0.2877  Password complexity and rotation policy
-d5  score=0.2877  Change your account password
+d1  score=2.2742  Reset your password
+d5  score=0.5784  Change your account password
+d3  score=0.5300  Password complexity and rotation policy
 ```
 
 It **misses d2** entirely — "Regain entry to a locked-out account" has no
@@ -124,9 +124,9 @@ Real response (trimmed to `title`, printed verbatim by the script):
     "max_score": 0.03279,
     "hits": [
       { "_id": "d1", "_score": 0.03279, "_source": { "title": "Reset your password" } },
-      { "_id": "d5", "_score": 0.03175, "_source": { "title": "Change your account password" } },
-      { "_id": "d3", "_score": 0.01613, "_source": { "title": "Password complexity and rotation policy" } },
-      { "_id": "d2", "_score": 0.01613, "_source": { "title": "Regain entry to a locked-out account" } }
+      { "_id": "d5", "_score": 0.032, "_source": { "title": "Change your account password" } },
+      { "_id": "d2", "_score": 0.01613, "_source": { "title": "Regain entry to a locked-out account" } },
+      { "_id": "d3", "_score": 0.01587, "_source": { "title": "Password complexity and rotation policy" } }
     ]
   }
 }
@@ -134,10 +134,10 @@ Real response (trimmed to `title`, printed verbatim by the script):
 
 **d2** (only kNN found it) and **d3** (only BM25 found it) are now *both*
 on the page, and **d1** — the doc that matched on *both* keyword and
-vector — is still ranked #1. Watch **d5**: neither BM25 nor kNN ranks it
-better than #3, yet because *both* signals agree on it, fusion promotes
-it to **#2** — ahead of d3 and d2, each of which is strong in only one
-modality. That's the whole point: fusion rewards agreement between the
+vector — is still ranked #1. Watch **d5**: BM25 ranks it #2 and kNN
+ranks it #3 — first in neither — yet because *both* signals agree on it,
+fusion keeps it at **#2**, ahead of d2 and d3, each of which only one
+modality found. That's the whole point: fusion rewards agreement between the
 two signals while still admitting the strong single-signal hits that
 either method alone would have dropped.
 
@@ -151,15 +151,16 @@ sees it. Fusion ranks the *union* of the sub-query hits, nothing more.
 `"fusion": "rrf"` uses Reciprocal Rank Fusion: each sub-query contributes
 `weight / (k + rank)` for a doc (default `k = 60`, `rank` is 1-based),
 summed across sub-queries. It ranks by *position*, not raw score, so
-BM25's `~0.5` scores and kNN's `~0.99` cosines never have to be
+BM25's `0.5`–`2.3` scores and kNN's `~0.99` cosines never have to be
 normalized onto a common scale — a persistent headache when you fuse two
 systems yourself. The scores above fall straight out of this formula:
 
 - **d1** is rank 1 in *both* lists → `1/(60+1) + 1/(60+1) = 0.03279`.
-- **d5** is rank 3 in *both* lists → `1/63 + 1/63 = 0.03175`, still beating
-  either single-list hit because two contributions stack.
-- **d3** and **d2** each appear in *one* list at rank 2 → `1/(60+2) =
-  0.01613` apiece — an exact tie.
+- **d5** is rank 2 in the BM25 list and rank 3 in the kNN list →
+  `1/62 + 1/63 = 0.03200`, still beating either single-list hit because
+  two contributions stack.
+- **d2** is rank 2 in the kNN list only → `1/(60+2) = 0.01613`.
+- **d3** is rank 3 in the BM25 list only → `1/(60+3) = 0.01587`.
 
 Other `fusion` options:
 
@@ -201,19 +202,17 @@ PASS  kNN alone MISSES d3 (password policy: topic vector too far)
 PASS  Hybrid surfaces BOTH d2 and d3 in a single query
 PASS  d1 (keyword + vector match) still ranks #1 under fusion
 
-BM25 ids  : ['d1', 'd3', 'd5']
+BM25 ids  : ['d1', 'd5', 'd3']
 kNN  ids  : ['d1', 'd2', 'd5']
 Hybrid ids: ['d1', 'd5', 'd2', 'd3']
 
 OK
 ```
 
-The four assertions and the scores are deterministic; the BM25 and kNN
-id lists are stable, and the hybrid list always starts `['d1', 'd5', …]`.
-The **only** run-to-run wobble is the last two ids — **d3 and d2 tie at
-exactly `0.01613`**, so they swap freely between positions #3 and #4
-(across a dozen runs we saw both `d2, d3` and `d3, d2`). The recipe's
-point — that d2 and d3 both appear and d1 stays #1 — holds every time.
+The four assertions, the scores and all three id lists are
+deterministic: the same request returns the same page on every run and
+after a restart. That holds for tied scores too — see the note on ties
+below.
 
 ## Notes & limits
 
@@ -224,12 +223,19 @@ point — that d2 and d3 both appear and d1 stays #1 — holds every time.
 - **Score scales differ by fusion.** RRF returns small fused scores
   (`0.016–0.033` here) — compare docs *within* a response, not against
   BM25/cosine absolutes.
-- **Tie ordering is not guaranteed** for docs with identical fused scores.
-  d3 and d2 both score exactly `0.01613` here (each is a single rank-2 hit
-  in one sub-query), and they genuinely swap between positions #3 and #4
-  from one run to the next — we observed both orders across a dozen runs.
-  Set membership — the point of this recipe — is stable; the order *among
-  exact ties* is not.
+- **Tied fused scores are ordered by arrival.** Under RRF ties are
+  common: a document found only by one leg at rank *r* and a document
+  found only by the other leg at rank *r* score exactly the same
+  (`1/(k+r)` each), and so do two documents at swapped ranks (1,2) and
+  (2,1). XERJ orders a tie the way it orders every score-ranked page:
+  fused `_score` descending, then the order the documents were indexed
+  (`_seq_no`, the ES `_doc` order), then `_id`. The page is the same on
+  every run and after a restart, whether the documents are still in
+  memory or already flushed, so `from`/`size` paging does not skip or
+  repeat a document at a page boundary, and listing the legs in another
+  order does not reorder an equal-weight request. Before
+  [#940](https://github.com/xerj-org/xerj/issues/940) a tie followed
+  hash-map iteration order, which changed from one process to the next.
 - **Vector quality is your embeddings' job.** This recipe supplies
   vectors directly for a deterministic demo. For real semantic recall,
   generate `dense_vector` values with a production embedding model, or

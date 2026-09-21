@@ -96,9 +96,13 @@ export async function startFakeEngine() {
     operator: false,
     /** status overrides: { search, mapping, ego, proxySearch, all } → HTTP status */
     fail: {},
-    /** An `--insecure` node: the brain list, each brain's meta document and
-     *  `ego` answer WITHOUT a key, so the operator's graph path can be driven.
-     *  `brains` is the `_cat` order; only `inbox` holds edges for the fixtures. */
+    /** The engine's graph posture toward THIS console session, exercised
+     *  through the console's graph read path (`/_xerj-console/api/v1/graph/…`,
+     *  issue #936): `openGraph` true = the session may read the graph (the
+     *  operator tier on an `--insecure` node); false = every graph read is
+     *  refused (401) — the auth-enabled posture that used to 401 the old
+     *  keyless `_cat` probe. `brains` is the listing order; only `inbox`
+     *  holds edges for the fixtures. */
     openGraph: false,
     brains: ['inbox'],
     /** claim this many attachment records exist (0 = the truth) */
@@ -169,21 +173,23 @@ export async function startFakeEngine() {
         send(200, searchResponse(body, state));
         return;
       }
-      send(404, { error: { code: 'not_found', message: p } });
-      return;
-    }
-
-    // ---- the graph without a key (an `--insecure` node), when a test asks --
-    if (state.openGraph && !auth) {
-      if (path === '/_cat/indices/.xerj-memory-*') {
-        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-        res.end(state.brains.map((b) => `green open .xerj-memory-${b}-edges u1 1 0 1 0 1kb 1kb 1kb`).join('\n'));
+      // ---- the console's graph read path (a session, never a key) --------
+      // Brain discovery + the reader panel's ego walk, as
+      // xerj-console-api/src/graph.rs serves them. `state.openGraph` is the
+      // engine's posture: readable, or a flat refusal to this session.
+      if (p === '/graph/brains') {
+        if (!state.openGraph) { send(401, { error: { code: 'unauthorized', message: 'the engine refused this console session' } }); return; }
+        send(200, { data: { brains: state.brains.map((b) => ({ name: b, nodes_index: 'ax-inbox' })), total: state.brains.length } });
         return;
       }
-      const bm = path.match(/^\/\.xerj-memory-([^/]+)-edges\/_doc\/__xerj-brain-meta$/);
-      if (bm) { send(state.brains.includes(bm[1]) ? 200 : 404, { _index: `.xerj-memory-${bm[1]}-edges`, _id: '__xerj-brain-meta', found: true, _source: { nodes_index: 'ax-inbox' } }); return; }
-      const gm = path.match(/^\/_graph\/([^/]+)\/ego$/);
-      if (gm) { send(200, gm[1] === 'inbox' ? hostileEgo : { node: url.searchParams.get('node'), edges: [], nodes: {}, not_shown: {} }); return; }
+      const gm = p.match(/^\/graph\/([^/]+)\/ego$/);
+      if (gm) {
+        if (!state.openGraph) { send(401, { error: { code: 'unauthorized', message: 'the engine refused this console session' } }); return; }
+        send(200, gm[1] === 'inbox' ? hostileEgo : { node: url.searchParams.get('node'), edges: [], nodes: {}, not_shown: {} });
+        return;
+      }
+      send(404, { error: { code: 'not_found', message: p } });
+      return;
     }
 
     // ---- data plane (API key) --------------------------------------------

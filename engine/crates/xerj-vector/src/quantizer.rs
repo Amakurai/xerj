@@ -183,11 +183,11 @@ impl Quantizer for NoneQuantizer {
 /// Each dimension gets its own `min` and `scale` computed from the training
 /// set, so the quantization is adaptive to the actual data distribution.
 ///
-/// Encoding size: 1 byte per dimension vs. 4 bytes for f32 — 4x. That is a
-/// property of this codec, not of the engine: the kNN serving path does not
-/// hold SQ8 codes resident, it quantizes each candidate's f32 vector per query
-/// (see [`Sq8Params`], and issue #392 for the ingest-time code array that would
-/// turn this ratio into a resident saving).
+/// Encoding size: 1 byte per dimension vs. 4 bytes for f32 — 4x. On the kNN
+/// serving path that ratio is realized by [`crate::sq8_codes::Sq8CodeStore`]
+/// (issue #392): codes are written at ingest into a flat, slot-addressed u8
+/// array with a codebook fitted from the ingested vectors, and queries score
+/// against those codes instead of re-quantizing each candidate's f32 vector.
 #[derive(Debug, Default, Clone)]
 pub struct Scalar8Quantizer;
 
@@ -320,25 +320,38 @@ impl Quantizer for Scalar8Quantizer {
 ///
 /// This is the serving-path counterpart to [`Scalar8Quantizer`]: instead of
 /// packing a whole batch into one blob, it exposes a fitted codec cheap enough
-/// to build per query. The brute-force kNN scan fits one of these over exactly
-/// the candidate vectors it is about to score ([`Sq8Params::fit_borrowed`]),
-/// quantizes each candidate's current vector through it, dequantizes straight
-/// back, and drops it — so scores come from **1 byte/dim** codes while **no
-/// SQ8 state outlives the query** (issue #371).
+/// to build per query.
 ///
-/// That is deliberate. Both a per-document `doc_id -> Vec<u8>` code map and a
-/// per-field cached codebook were tried, and both were write-once in practice:
-/// the map never recomputed a document's codes after an update, and the
-/// codebook, fitted from the first ~1000 vectors a field was ever scanned
-/// with, silently *clamped* every later vector into that range — so a document
-/// overwritten with its own negation decoded straight back to its old value
-/// and kept ranking first at cosine 1.000000. Fitting over the set being
-/// encoded also makes clamping impossible here rather than merely unlikely.
+/// Since issue #392 the PRIMARY serving path no longer builds one of these at
+/// all: [`crate::sq8_codes::Sq8CodeStore`] holds the codes and the codebook at
+/// ingest time (one flat u8 array, slot-addressed, widened and re-encoded when
+/// a vector lands outside the fitted range), and kNN queries score by decoding
+/// those codes. A document's score is therefore a function of the index state
+/// alone, not of the candidate set the query happens to scan — the property
+/// Lucene has and the per-query fit lacked.
 ///
-/// The cost is that `scalar8` does not reduce resident memory: the scan reads
-/// the full-precision vector from `_source` either way. Making codes live with
-/// the data, addressed by ordinal and written at ingest as Lucene does, is
-/// tracked in issue #392.
+/// `fit_borrowed` remains as the FALLBACK codec for the windows where the
+/// store cannot serve — the open-time walk has not converged yet, a
+/// publication is racing source visibility, or coverage is broken by a
+/// wrong-dimension write. There the brute-force scan fits one of these over
+/// exactly the candidate vectors it is about to score, quantizes each
+/// candidate's current vector through it, dequantizes straight back, and drops
+/// it. That keeps the #371 guarantee — **no SQ8 state outlives the query**, so
+/// an updated document can never be scored on a stale code — at the cost that
+/// scores in that fallback window depend on the candidate set (each by at most
+/// SQ8's own 1/255 quantization step).
+///
+/// History (#371): both a per-document `doc_id -> Vec<u8>` code map and a
+/// per-field cached codebook were tried before this type existed, and both
+/// were write-once in practice: the map never recomputed a document's codes
+/// after an update, and the codebook, fitted from the first ~1000 vectors a
+/// field was ever scanned with, silently *clamped* every later vector into
+/// that range — so a document overwritten with its own negation decoded
+/// straight back to its old value and kept ranking first at cosine 1.000000.
+/// The ingest-time store does not repeat that defect class structurally: an
+/// out-of-range value extends the range and every live code is re-encoded
+/// through a decode/encode round trip (each stored value moves by at most the
+/// new quantization step), so clamping cannot occur.
 ///
 /// `mins[d]`/`scales[d]` are the per-dimension minimum and range (`max-min`)
 /// observed in the fitting sample. `encode` maps `v[d]` linearly to a u8 in
@@ -787,9 +800,10 @@ mod tests {
     }
 
     /// (b) MEMORY: SQ8 codes are ~4× smaller than the f32 vectors they encode.
-    /// This is a property of the codec, measured here on the codec. The engine
-    /// does not currently realize it as a resident saving on the kNN path — see
-    /// the note on [`Sq8Params`].
+    /// This is a property of the codec, measured here on the codec; since #392
+    /// the engine realizes it on the kNN path too — the serving scan scores
+    /// against the ingest-time code array ([`crate::sq8_codes::Sq8CodeStore`]),
+    /// not the f32 `_source` vectors.
     #[test]
     fn sq8_store_is_quarter_of_f32() {
         let n = 2000usize;
