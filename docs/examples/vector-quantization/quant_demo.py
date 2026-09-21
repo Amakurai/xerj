@@ -7,11 +7,13 @@ int8_hnsw`) makes the kNN *serving* path score against 1-byte-per-dimension
 codes instead of 4-byte floats, with almost no recall loss. `_source` still
 returns the original vectors.
 
-NOTE: this changes PRECISION, not memory. XERJ reads the full-precision
-vector from `_source` and quantizes it per query, so `scalar8` does not
-shrink the resident vector working set today — see issue #392. The footprint
-number printed below is the size of the int8 ENCODING, not a saving XERJ
-currently realises.
+Since issue #392 the codes are written at INGEST time into a flat,
+slot-addressed u8 array and the kNN scan scores against them, so the
+serving working set IS the 1-byte-per-dim codes rather than the f32
+`_source` vectors. The run below measures the resident array straight off
+the server (`GET /{index}/_stats` → `primaries.sq8.fields.v.codes_bytes`).
+`_source` keeps the f32 originals, so this is the scoring working set that
+shrinks 4x — not total process memory.
 
 This recipe embeds the 40 real KB articles (demo/data/ai_kb.ndjson) into
 128-dim vectors with a small deterministic feature-hasher (same idea as
@@ -21,9 +23,9 @@ shows that:
 
   1. kNN returns the same top results from both,
   2. recall@10 of the quantized index vs the exact index stays >= 0.90,
-  3. what the int8 encoding costs vs float32 — MEASURED by actually
-     encoding every vector both ways and comparing the real byte totals
-     (not a hardcoded ratio). See the NOTE above on what this is not.
+  3. the resident SQ8 code array the server actually holds — measured
+     from `_stats` (1 byte/dim/live doc), alongside the encoding-size
+     comparison measured by encoding every vector both ways client-side.
 
 Usage:
     xerj --insecure --data-dir ./data &        # start XERJ
@@ -178,11 +180,17 @@ def main():
         total += len(exact)
     recall = hits / total if total else 0.0
 
-    # ── 5. Measure the real byte size of each ENCODING. ──────────────────
+    # ── 5. Measure the RESIDENT codes the server holds (#392). ──────────
+    # The ingest-time, slot-addressed SQ8 array is server state — read it
+    # back from _stats rather than stipulating its size.
+    stats = call("GET", f"/{SQ8_INDEX}/_stats")
+    field_stats = stats["indices"][SQ8_INDEX]["primaries"]["sq8"]["fields"]["v"]
+    codes_bytes = field_stats["codes_bytes"]
+    live = field_stats["live"]
+
+    # ── 6. Measure the real byte size of each ENCODING (client side). ────
     # Encode every corpus vector both ways and compare the actual byte totals
-    # — a genuine measurement, not a stipulated 4x. It is a measurement of the
-    # encodings, though, NOT of XERJ's resident footprint: the serving path
-    # reads the f32 vector from `_source` and quantizes per query (issue #392).
+    # — a genuine measurement, not a stipulated 4x.
     f32_total = sum(len(encode_f32(d["v"])) for d in docs)
     i8_total = sum(len(encode_i8(d["v"])) for d in docs)
     ratio = f32_total / i8_total if i8_total else 0.0
@@ -191,14 +199,25 @@ def main():
 
     print(f"recall@10 (scalar8 vs float32 ground truth): {recall:.3f}")
     print(
+        f"resident SQ8 codes (from _stats, {live} live docs): "
+        f"{codes_bytes} B ({codes_bytes // max(live, 1)} B/vec) — "
+        f"serving={field_stats['serving']}"
+    )
+    print(
         f"encoding size over {len(docs)} vecs: "
         f"float32 = {f32_total} B ({f32_per} B/vec)  →  "
         f"scalar8 = {i8_total} B ({i8_per} B/vec)  ({ratio:.2f}x smaller)"
     )
     if recall < 0.90:
         raise SystemExit(f"FAIL: recall {recall:.3f} < 0.90")
-    print("\nOK — recall preserved through 1-byte-per-dim codes. `_source` still holds")
-    print("the originals. scalar8 changes precision, not resident memory (issue #392).")
+    if not field_stats["serving"] or not field_stats["ready"]:
+        raise SystemExit("FAIL: SQ8 code store not serving after ingest (#392)")
+    if codes_bytes != len(docs) * DIM:
+        raise SystemExit(
+            f"FAIL: codes_bytes {codes_bytes} != {len(docs)} docs x {DIM} dim"
+        )
+    print("\nOK — recall preserved through 1-byte-per-dim codes, served from the")
+    print("ingest-time slot-addressed array (#392). `_source` still holds the originals.")
 
 
 if __name__ == "__main__":

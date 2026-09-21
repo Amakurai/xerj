@@ -34,7 +34,7 @@ use xerj_storage::segment::SectionType;
 use xerj_storage::wal::{SyncMode, WalEntry};
 use xerj_vector::distance::DistanceMetric;
 use xerj_vector::hnsw::{HnswIndex, HnswParams};
-use xerj_vector::Sq8Params;
+use xerj_vector::{Sq8CodeStore, Sq8Params};
 
 use crate::aggs::run_aggs_with_all;
 use crate::segment_cache_budget::{
@@ -7893,6 +7893,10 @@ pub struct Index {
     /// `abort_background_tasks` so an unfinished rebuild can't hold the
     /// runtime (or the index Arc) alive across shutdown.
     hnsw_rebuild_task: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Per-field ingest-time SQ8 code stores (#392): field name → handle.
+    /// Empty unless the mapping declares `quantization: "scalar8"` — every
+    /// other index pays one empty-map read per write.
+    sq8_stores: Arc<parking_lot::RwLock<HashMap<String, Arc<Sq8StoreHandle>>>>,
     // ── Per-index concurrency control ─────────────────────────────────────────
     /// Semaphore that limits the number of queries executing concurrently
     /// against this index.  The default is 64 permits, matching the global
@@ -8562,6 +8566,9 @@ impl Index {
         let segment_hydration_budget = index_segment_hydration_budget(config);
         let passage_chunk_fields_init = passage_chunk_fields_from_schema(&managed.schema);
         let date_field_scales_snapshot = date_field_scales(&managed.schema);
+        // #392: kept back from the struct literal so the SQ8 handle setup at
+        // the end of create can read the mapping without re-locking.
+        let managed_schema_for_sq8 = managed.schema.clone();
         let index = Arc::new(Self {
             name,
             schema: Arc::new(RwLock::new(managed)),
@@ -8654,6 +8661,7 @@ impl Index {
             hnsw_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hnsw_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hnsw_rebuild_task: Arc::new(parking_lot::Mutex::new(None)),
+            sq8_stores: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             metric_query_count: Arc::new(AtomicU64::new(0)),
             metric_query_total_ms: Arc::new(AtomicU64::new(0)),
             metric_index_count: Arc::new(AtomicU64::new(0)),
@@ -8723,6 +8731,12 @@ impl Index {
                     idx.on_segments_changed();
                 }
             })));
+        // #392: SQ8 code stores for scalar8 fields. A fresh index carries
+        // no documents, so the walk converges (and publishes `ready`)
+        // immediately; ingest maintains the store from the first write.
+        for field in index.ensure_sq8_stores_from_schema(&managed_schema_for_sq8) {
+            index.spawn_sq8_walk(&field);
+        }
         Ok(index)
     }
 
@@ -8888,6 +8902,10 @@ impl Index {
         let (flush_doc_threshold, flush_byte_threshold) =
             Self::resolve_flush_thresholds(config.storage.flush_size_mb);
         let flush_idle_secs = config.storage.flush_idle_secs;
+
+        // #392: kept back from the struct literal (which moves `schema`) so
+        // the SQ8 handle setup at the end of open can read the mapping.
+        let schema_for_sq8 = schema.schema.clone();
 
         // Try to reload a previously-persisted HNSW snapshot. If both
         // graph.bin and ids.json exist, validate, and the pinned field is
@@ -9060,6 +9078,7 @@ impl Index {
             hnsw_stale: Arc::new(std::sync::atomic::AtomicBool::new(hnsw_stale_init)),
             hnsw_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hnsw_rebuild_task: Arc::new(parking_lot::Mutex::new(None)),
+            sq8_stores: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             metric_query_count: Arc::new(AtomicU64::new(0)),
             metric_query_total_ms: Arc::new(AtomicU64::new(0)),
             metric_index_count: Arc::new(AtomicU64::new(0)),
@@ -9136,6 +9155,12 @@ impl Index {
         // full graph-maintenance cost while the ANN path never served).
         // Heal it in the background from the authoritative doc set.
         index.spawn_hnsw_rebuild_if_stale();
+        // #392: create SQ8 code-store handles for any scalar8 field and
+        // make them serving-ready from the authoritative doc set (WAL
+        // replay never re-runs vector indexing).
+        for field in index.ensure_sq8_stores_from_schema(&schema_for_sq8) {
+            index.spawn_sq8_walk(&field);
+        }
         Ok(index)
     }
 
@@ -12894,6 +12919,16 @@ impl Index {
         if let Some(handle) = self.hnsw_rebuild_task.lock().take() {
             handle.abort();
         }
+        // #392: same treatment for in-flight SQ8 code-store walks. An
+        // interrupted walk leaves `ready` false (exact scan serves) and the
+        // next open retries.
+        let walk_handles: Vec<Arc<Sq8StoreHandle>> =
+            self.sq8_stores.read().values().cloned().collect();
+        for handle in walk_handles {
+            if let Some(handle) = handle.walk_task.lock().take() {
+                handle.abort();
+            }
+        }
     }
 
     /// Update a document with upsert support.
@@ -13145,6 +13180,9 @@ impl Index {
     /// node before inserting the fresh vector — otherwise the graph would
     /// keep serving the pre-update vector forever.
     async fn index_vectors(&self, doc_id: &str, source: &Value) {
+        // #392: SQ8 code stores are maintained for EVERY scalar8 field on
+        // every write, independent of the single field the HNSW graph pins.
+        self.sq8_ingest(doc_id, source).await;
         let obj = match source.as_object() {
             Some(o) => o,
             None => return,
@@ -13282,6 +13320,323 @@ impl Index {
         id_map.insert(doc_id.to_string(), node_id);
         id_rev.insert(node_id, doc_id.to_string());
         true
+    }
+
+    // ── SQ8 ingest-time code stores (#392) ──────────────────────────────
+    //
+    // One `Sq8CodeStore` per `quantization: "scalar8"` dense_vector field:
+    // one u8 per dimension per document, written by the ingest hook the
+    // moment a write publishes, addressed by dense slot (`slot * dim..`) —
+    // the same slot discipline the HNSW slab uses for its f32 vectors. The
+    // codebook is fitted from the vectors as they are ingested (widening +
+    // re-encode on out-of-range values, never clamping), so a document's
+    // quantized score is a function of index state alone — not of the
+    // candidate set a query scans. That is the Lucene property #392 asks
+    // for; qdrant's `EncodedVectorsU8` does the same at build time.
+    //
+    // Fail-safe direction everywhere: a store that is missing, not yet
+    // converged, or whose coverage gate is broken (a wrong-dimension write)
+    // leaves the kNN paths on the exact `_source` scan — nothing is ever
+    // served from incomplete codes.
+
+    /// The SQ8 code store handle for one field, if the mapping declared
+    /// `scalar8` and the handle exists.
+    fn sq8_store_for(&self, field: &str) -> Option<Arc<Sq8StoreHandle>> {
+        self.sq8_stores.read().get(field).cloned()
+    }
+
+    /// Create code-store handles for every `scalar8` field the schema
+    /// declares and none exists for yet. Returns the NEW fields — the caller
+    /// spawns the authoritative doc walk for those (an existing index may
+    /// carry documents that predate the handle; a fresh index converges on
+    /// an empty walk).
+    async fn ensure_sq8_stores(&self) -> Vec<String> {
+        let schema = self.schema.read().await;
+        self.ensure_sq8_stores_from_schema(&schema.schema)
+    }
+
+    /// Sync variant for call sites that already hold the schema.
+    fn ensure_sq8_stores_from_schema(&self, schema: &Schema) -> Vec<String> {
+        let scalar8_fields = collect_scalar8_fields(schema);
+        if scalar8_fields.is_empty() {
+            return Vec::new();
+        }
+        let mut created = Vec::new();
+        let mut guard = self.sq8_stores.write();
+        for field in scalar8_fields {
+            if guard.contains_key(&field) {
+                continue;
+            }
+            let similarity = lookup_vector_similarity(schema, &field);
+            let dim = declared_field(schema, &field)
+                .and_then(|fc| fc.options.dimensions)
+                .unwrap_or(0);
+            let handle = Arc::new(Sq8StoreHandle {
+                store: parking_lot::RwLock::new(Sq8CodeStore::new(dim)),
+                normalize: !matches!(
+                    similarity.as_str(),
+                    "l2_norm" | "dot_product" | "max_inner_product"
+                ),
+                ready: std::sync::atomic::AtomicBool::new(false),
+                walking: std::sync::atomic::AtomicBool::new(false),
+                walk_task: parking_lot::Mutex::new(None),
+            });
+            guard.insert(field.clone(), Arc::clone(&handle));
+            created.push(field);
+        }
+        drop(guard);
+        created
+    }
+
+    /// Spawn the authoritative doc walk that makes a (new) code store
+    /// serving-ready. Single-flight per handle. The walk re-derives codes
+    /// for every live document — WAL replay never re-runs vector indexing,
+    /// so this is also the restart path — and then publishes `ready` when
+    /// coverage is intact.
+    fn spawn_sq8_walk(self: &Arc<Self>, field: &str) {
+        let Some(handle) = self.sq8_store_for(field) else {
+            return;
+        };
+        if handle
+            .walking
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let field = field.to_string();
+        let index_name = self.name.as_str().to_string();
+        let walk_handle = Arc::clone(&handle);
+        let join = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let mut converged = false;
+            if let Some(idx) = weak.upgrade() {
+                converged = idx.sq8_rebuild_one_field(&walk_handle, &field).await;
+            }
+            walk_handle
+                .walking
+                .store(false, std::sync::atomic::Ordering::Release);
+            if converged {
+                info!(
+                    index = %index_name,
+                    field = %field,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "SQ8 code store rebuilt — codes serving path enabled"
+                );
+            } else {
+                warn!(
+                    index = %index_name,
+                    field = %field,
+                    "SQ8 code store rebuild did not converge — staying on exact scan"
+                );
+            }
+        });
+        let mut slot = handle.walk_task.lock();
+        if let Some(prev) = slot.replace(join) {
+            prev.abort();
+        }
+    }
+
+    /// Walk every live document once and make `handle`'s store describe
+    /// exactly the live corpus: upsert each doc that carries `field`, then
+    /// reconcile the remaining slots against the authoritative doc state.
+    /// Returns `false` (store left not-ready, exact scan keeps serving) if
+    /// any segment was unreadable or a suspect doc could not be fetched.
+    async fn sq8_rebuild_one_field(
+        self: &Arc<Self>,
+        handle: &Arc<Sq8StoreHandle>,
+        field: &str,
+    ) -> bool {
+        // Live-doc walk, same discipline as `rebuild_hnsw_from_docs`:
+        // memtable first, then every flushed segment, dedup by doc id,
+        // skipping tombstoned and seq-superseded copies.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mem_docs = self.memtable.all_docs_with_sources();
+        for (doc_id, src) in &mem_docs {
+            seen.insert(doc_id.clone());
+            if let Some(mut vector) = extract_numeric_vector(src, field) {
+                if handle.normalize {
+                    l2_normalize_vec(&mut vector);
+                }
+                handle.store.write().upsert(doc_id, &vector);
+            }
+        }
+        drop(mem_docs);
+
+        let snap = self.store.snapshot();
+        for meta in snap.segments.iter() {
+            let Some(docs_arc) = self.stored_values_for_async(&meta.id).await else {
+                warn!(
+                    index = self.name.as_str(),
+                    segment = meta.id.as_str(),
+                    field,
+                    "SQ8 rebuild: segment not readable — not ready"
+                );
+                return false;
+            };
+            for doc in docs_arc.iter() {
+                let Some(id) = doc.get("_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if let Some(ver) = self.store.version_map.get(id) {
+                    if ver.deleted {
+                        continue;
+                    }
+                    if let Some(doc_seq) = doc.get("_seq_no").and_then(Value::as_u64) {
+                        if doc_seq < ver.seq_no {
+                            continue;
+                        }
+                    }
+                }
+                if !seen.insert(id.to_string()) {
+                    continue;
+                }
+                let src_owned;
+                let src: &Value = match doc.get("_source") {
+                    Some(s) => s,
+                    None => {
+                        let mut d = doc.clone();
+                        if let Some(obj) = d.as_object_mut() {
+                            obj.remove("_id");
+                        }
+                        src_owned = d;
+                        &src_owned
+                    }
+                };
+                if let Some(mut vector) = extract_numeric_vector(src, field) {
+                    if handle.normalize {
+                        l2_normalize_vec(&mut vector);
+                    }
+                    handle.store.write().upsert(id, &vector);
+                }
+            }
+        }
+
+        // Reconcile slots the walk did not confirm. A slot is dropped when
+        // its doc is gone (deleted, or no longer in the authoritative view)
+        // or no longer carries the field; a slot whose doc raced the walk
+        // (updated after its segment was passed) is refreshed from the live
+        // source rather than trusted or dropped blind.
+        let suspects: Vec<String> = {
+            let store = handle.store.read();
+            store
+                .iter_live()
+                .map(|(id, _)| id.to_string())
+                .filter(|id| !seen.contains(id))
+                .collect()
+        };
+        for id in suspects {
+            let gone = self
+                .store
+                .version_map
+                .get(&id)
+                .map(|e| e.deleted)
+                .unwrap_or(true);
+            if gone {
+                handle.store.write().remove(&id);
+                continue;
+            }
+            match self.get_document_uncounted(&id).await {
+                Ok(Some(src)) => match extract_numeric_vector(&src, field) {
+                    Some(mut vector) => {
+                        if handle.normalize {
+                            l2_normalize_vec(&mut vector);
+                        }
+                        handle.store.write().upsert(&id, &vector);
+                    }
+                    None => {
+                        // Live doc no longer carries the field.
+                        handle.store.write().remove(&id);
+                    }
+                },
+                Ok(None) => {
+                    // Not in the authoritative view any more.
+                    handle.store.write().remove(&id);
+                }
+                Err(e) => {
+                    warn!(
+                        index = self.name.as_str(),
+                        field,
+                        doc_id = %id,
+                        error = %e,
+                        "SQ8 rebuild: suspect doc not fetchable — not ready"
+                    );
+                    return false;
+                }
+            }
+        }
+
+        let coverage = handle.store.read().coverage_ok();
+        handle.ready.store(coverage, Ordering::Release);
+        coverage
+    }
+
+    /// Await all in-flight SQ8 code-store walks (deterministic test hook,
+    /// mirroring [`Self::await_hnsw_rebuild`]).
+    pub async fn await_sq8_rebuilds(&self) {
+        let handles: Vec<Arc<Sq8StoreHandle>> = self.sq8_stores.read().values().cloned().collect();
+        for handle in handles {
+            let join = handle.walk_task.lock().take();
+            if let Some(join) = join {
+                let _ = join.await;
+            }
+        }
+    }
+
+    /// Maintain every scalar8 field's code store for one document write.
+    /// Runs inside the write's publication interval (the same bracket the
+    /// HNSW inserts use), so a codes-served query either sees the slot or
+    /// falls back — never a half-published vector. A doc that stops
+    /// carrying the field loses its slot in the same step.
+    async fn sq8_ingest(&self, doc_id: &str, source: &Value) {
+        let handles: Vec<(String, Arc<Sq8StoreHandle>)> = {
+            let guard = self.sq8_stores.read();
+            guard
+                .iter()
+                .map(|(f, h)| (f.clone(), Arc::clone(h)))
+                .collect()
+        };
+        if handles.is_empty() {
+            return;
+        }
+        for (field, handle) in handles {
+            let Some(mut vector) = extract_numeric_vector(source, &field) else {
+                handle.store.write().remove(doc_id);
+                continue;
+            };
+            if handle.normalize {
+                l2_normalize_vec(&mut vector);
+            }
+            handle.store.write().upsert(doc_id, &vector);
+        }
+    }
+
+    /// Per-field SQ8 code-store health (#392), surfaced by `GET
+    /// /{index}/_stats` next to the HNSW section.
+    pub fn sq8_stats(&self) -> Value {
+        let guard = self.sq8_stores.read();
+        let mut fields = serde_json::Map::new();
+        for (field, handle) in guard.iter() {
+            let store = handle.store.read();
+            fields.insert(
+                field.clone(),
+                serde_json::json!({
+                    "dim": store.dim(),
+                    "live": store.live_len(),
+                    "expected": store.expected(),
+                    "covered": store.coverage_ok(),
+                    "ready": handle.ready.load(Ordering::Acquire),
+                    "serving": handle.serving_fresh(),
+                    "refits": store.refits(),
+                    "codes_bytes": store.codes_bytes(),
+                    // The retained originals exist so codebook re-fits
+                    // re-encode from the true vectors (see `sq8_codes`);
+                    // reported so the memory story stays honest.
+                    "originals_bytes": store.originals_bytes(),
+                }),
+            );
+        }
+        Value::Object(fields)
     }
 
     /// Perform KNN search over the HNSW index.
@@ -14031,6 +14386,167 @@ impl Index {
         .await
     }
 
+    /// #392 serving fast path: score an UNFILTERED scalar8 kNN entirely
+    /// from the ingest-time code store — no `_source` candidates are
+    /// collected, no f32 vectors are read, nothing is quantized per query.
+    ///
+    /// The whole scoring loop runs under ONE read guard of the store, with
+    /// no await inside it, so it observes the codes and the codebook of a
+    /// single consistent generation (a concurrent ingest waits on the write
+    /// guard; a codebook re-fit cannot interleave). Only the top `k`
+    /// survivors are hydrated from stored docs afterwards — any hydration
+    /// anomaly (doc deleted mid-scan, unreadable segment, a chunked-passage
+    /// doc) abandons the path and the caller falls back to the exact scan,
+    /// mirroring `run_knn_hnsw`'s never-a-partial-page discipline.
+    ///
+    /// Returns `None` whenever the path cannot serve: store missing, walk
+    /// not converged, coverage broken (a wrong-dimension write), dim
+    /// mismatch, deadline, or a publication racing source visibility. The
+    /// fail-safe direction is always the exact `_source` scan.
+    #[allow(clippy::too_many_arguments)] // mirrors run_knn_brute_force_with_deadline
+    async fn run_knn_sq8_codes_scan(
+        &self,
+        request: &SearchRequest,
+        deadline: std::time::Instant,
+        field: &str,
+        query_vec: &[f32],
+        k: usize,
+        similarity: &str,
+        boost: Option<f32>,
+        min_similarity: Option<f32>,
+        started: std::time::Instant,
+    ) -> Option<SearchResult> {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        // Chunked-passage docs score by best passage in the exact path; the
+        // codes hold the pooled vector, so hand those back to it.
+        if self.passage_chunks_require_exact(field) {
+            return None;
+        }
+        let handle = self.sq8_store_for(field)?;
+        if !handle.serving_fresh() {
+            return None;
+        }
+        // The codes quantize vectors normalized per the MAPPING's similarity
+        // (`handle.normalize`). The exact scan normalizes per the QUERY's
+        // similarity (`!matches!(similarity, "l2_norm" | "dot_product" |
+        // "max_inner_product")`); a query that overrides `similarity` to the
+        // other family quantizes differently-SCALED vectors there (raw
+        // magnitudes vs unit), so the codes cannot reproduce its arithmetic
+        // — hand it to the exact path, whose per-query codec follows the
+        // query's own rule.
+        let query_normalizes =
+            !matches!(similarity, "l2_norm" | "dot_product" | "max_inner_product");
+        if query_normalizes != handle.normalize {
+            return None;
+        }
+        // Same publication discipline as `run_knn_hnsw`: never serve codes
+        // from a window that overlapped a vector publication.
+        let publication_generation = self.hnsw_publication_generation.load(Ordering::Acquire);
+        if self.hnsw_publications_in_flight.load(Ordering::Acquire) != 0 {
+            return None;
+        }
+
+        // ── Score every live slot from the codes ─────────────────────
+        let mut ranked: Vec<(f32, String)> = Vec::new();
+        {
+            let store = handle.store.read();
+            // Re-check the gates under the guard: the freshness check above
+            // raced a concurrent walk/ingest if this now fails.
+            if !store.coverage_ok() || store.dim() != query_vec.len() {
+                return None;
+            }
+            let codebook = store.codebook();
+            let mut decoded = vec![0.0f32; store.dim()];
+            ranked.reserve(store.live_len() as usize);
+            for (id, codes) in store.iter_live() {
+                // Cheap deadline poll — no await can run under this guard.
+                // On expiry hand the request to the exact path (which owns
+                // the timed_out semantics), never serve a partial scan.
+                if ranked.len() & 8191 == 8191 && std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                codebook.decode_into(codes, &mut decoded);
+                let score = compute_vector_similarity(similarity, query_vec, &decoded);
+                ranked.push((score, id.to_string()));
+            }
+        }
+        debug!(
+            index = self.name.as_str(),
+            field,
+            scored = ranked.len(),
+            "SQ8 kNN served from ingest-time codes (#392)"
+        );
+
+        // ── Same cutoff → boost → rank pipeline as the exact path ─────
+        if let Some(raw) = min_similarity {
+            let cut = raw_similarity_to_score(similarity, raw);
+            ranked.retain(|(score, _)| *score >= cut);
+        }
+        if let Some(b) = boost {
+            if (b - 1.0).abs() > f32::EPSILON {
+                for (score, _) in ranked.iter_mut() {
+                    *score *= b;
+                }
+            }
+        }
+        // Deterministic order for equal scores (the slot walk's HashMap
+        // order is not), then cap the pool at k — only these are hydrated.
+        ranked.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        ranked.truncate(k.max(1));
+
+        // ── Hydrate the top-k from stored docs ────────────────────────
+        let chunk_field = format!("{field}_chunks");
+        let mut scored: Vec<(String, f32, Value, Option<u32>)> = Vec::with_capacity(ranked.len());
+        for (score, doc_id) in ranked {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let src =
+                match tokio::time::timeout(remaining, self.get_document_uncounted(&doc_id)).await {
+                    Ok(Ok(Some(source))) => source,
+                    _ => return None,
+                };
+            // A chunked doc must be scored by its best passage, not the
+            // pooled codes — same bail as `run_knn_hnsw`.
+            if get_field_value(&src, &chunk_field).is_some() {
+                return None;
+            }
+            scored.push((doc_id, score, src, None));
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        if self.passage_chunks_require_exact(field) {
+            return None;
+        }
+        if self.hnsw_publications_in_flight.load(Ordering::Acquire) != 0
+            || self.hnsw_publication_generation.load(Ordering::Acquire) != publication_generation
+        {
+            return None;
+        }
+
+        let generated_companion_fields = {
+            let schema = self.schema.read().await;
+            generated_embedding_companion_fields(&schema.schema)
+        };
+        Some(knn_result_from_scored(
+            self,
+            request,
+            field,
+            scored,
+            k,
+            started,
+            &generated_companion_fields,
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn run_knn_brute_force_with_deadline(
         &self,
@@ -14065,15 +14581,44 @@ impl Index {
 
         // ── Determine whether this field opts into SQ8 (scalar8) ──────
         // Default fields keep the exact f32 brute-force scan below,
-        // byte-identical to before. A `scalar8` field takes the branch above
-        // instead: it reads the same live f32 vector out of `_source`, but
-        // rounds it through 1-byte-per-dimension SQ8 codes before scoring, so
-        // the score carries `scalar8`'s precision loss. Nothing is cached —
-        // neither the codes nor the codebook outlive the query (#371).
+        // byte-identical to before. A `scalar8` field may take the codes
+        // fast path instead (#392). Determined up front so the fast path
+        // can skip the candidate collection altogether; a FILTERED
+        // `scalar8` query always runs this scan on the per-query codec in
+        // the `use_sq8` branch below (bit-identical to the reference
+        // oracle, which fits over the post-filter set).
         let use_sq8 = {
             let schema = self.schema.read().await;
             lookup_vector_quantization(&schema.schema, field).as_deref() == Some("scalar8")
         };
+
+        // ── #392 fast path: unfiltered scalar8 kNN from ingest-time codes ──
+        // Scores every live slot straight out of the code store — no
+        // `_source` candidates collected, no per-query quantization — and
+        // hydrates only the top k. Any gate miss (store not converged,
+        // coverage broken, publication racing, a similarity family whose
+        // normalization differs from the mapping's) falls through to the
+        // exact scan below; filtered queries take the per-query codec in
+        // the use_sq8 branch further down.
+        if use_sq8 && filter.is_none() {
+            if let Some(result) = self
+                .run_knn_sq8_codes_scan(
+                    request,
+                    deadline,
+                    field,
+                    query_vec,
+                    k,
+                    similarity,
+                    boost,
+                    min_similarity,
+                    started,
+                )
+                .await
+            {
+                return Ok(result);
+            }
+        }
+
         // `scalar8` reads only the pooled vector; the default scan prefers the
         // per-passage companion. The two shapes are cached under different keys.
         let column_mode = if use_sq8 {
@@ -14235,6 +14780,8 @@ impl Index {
         }
         let collect_elapsed = started.elapsed();
 
+        // `use_sq8` was determined before candidate collection (the codes
+        // fast path above may already have returned).
         // The filter runs BEFORE scoring and without the vectors (#939): see
         // `KnnFilterPlan`. It used to clone the whole source a second time,
         // per candidate, to insert `_id` beside ~1,900 numbers it never read.
@@ -14294,67 +14841,56 @@ impl Index {
                 cand.push((position, doc_vec));
             }
 
+            // ── Per-query fit over the post-filter candidates ───────────
+            //
             // Fit this field's SQ8 codebook over the candidate vectors this
             // query is about to score, and drop it when the query ends. No
             // codec state survives a query (#371).
             //
-            // The codebook used to be fitted from the first ≤1000 vectors the
-            // field was ever scanned with and then kept for the life of the
-            // process, which is the same write-once defect as the per-document
-            // code map one level up: a vector written afterwards outside the
-            // fitted per-dimension range is CLAMPED into it, and when that
-            // range is narrow the clamped decode is indistinguishable from the
-            // vector the document used to hold. A corpus whose dimension 0
-            // never left +1.0 fitted `[1,1]` there, so overwriting a document
-            // with its exact negation decoded straight back to +1.0 and it
-            // stayed top at cosine 1.000000 — verbatim the reported symptom,
-            // with the per-document map already gone.
+            // The codebook used to be fitted from the first ≤1000 vectors
+            // the field was ever scanned with and then kept for the life of
+            // the process, which is the same write-once defect as the
+            // per-document code map one level up: a vector written
+            // afterwards outside the fitted per-dimension range is CLAMPED
+            // into it, and when that range is narrow the clamped decode is
+            // indistinguishable from the vector the document used to hold —
+            // a corpus whose dimension 0 never left +1.0 fitted `[1,1]`
+            // there, so overwriting a document with its exact negation
+            // decoded straight back to +1.0 and it stayed top at cosine
+            // 1.000000. Fitting over exactly the set being encoded makes
+            // clamping structurally impossible here: every value passed to
+            // `encode_into` is inside `[min,max]` by construction.
             //
-            // Fitting over exactly the set being encoded also makes clamping
-            // structurally impossible here rather than merely unlikely: every
-            // value passed to `encode_into` is inside `[min,max]` by
-            // construction. An empty candidate set fits degenerate params, but
-            // the scoring loop below is then empty too, so nothing observes
-            // them — the old code had to guard against publishing that codec
-            // because it outlived the query that produced it.
-            //
-            // ACCEPTED CONSEQUENCE: the codebook now depends on the candidate
-            // set, and that changes the RETURNED ORDER, not merely the score.
-            // Each individual score moves by at most SQ8's own quantization
-            // step (1/255 of the fitted range per dimension), which is inside
-            // the approximation error `scalar8` already advertises — but
-            // near-tied documents swap, so a caller sees a different ranking.
-            // Measured at the HTTP boundary on a 60-document 4-dim cosine
-            // field: adding a `filter` that removes only unrelated documents
-            // returned the same 30 survivors with max |Δ_score| 1.976e-05 but
-            // a different order at 19 of 30 positions. The trigger is the
-            // candidate set, not the `filter` keyword — indexing one more
-            // unrelated document moved the same corpus by max 7.100e-06 and
-            // reordered its top 10 — and on an unfiltered corpus over 1000
-            // documents every score also differs from rc.17, which fitted from
-            // the first <=1000 candidates and cached that (1500 documents: all
-            // of the top 40 changed, max 4.880e-05, one adjacent-rank swap).
-            // Documented in docs/recipes/vector-quantization.md and #392.
-            //
-            // This is NOT the dependency Lucene has. Lucene fits per segment at
-            // INDEX time, so a Lucene score is a function of the index state
-            // alone; here it is a function of the query's candidate set too.
-            // #392 is what would close that gap.
+            // A FILTERED `scalar8` query deliberately stays on this codec
+            // rather than the ingest-time codes (#392's unfiltered fast
+            // path): the reference this scan is pinned against —
+            // `exact_scan_hydration_tests`' clone-everything oracle, #979 —
+            // fits over the POST-FILTER candidate set, and a filtered
+            // subset's per-dimension bounds are generally NARROWER than the
+            // whole-corpus fit the store holds (measured on that fixture:
+            // three of five filters move at least four of eight bounds), so
+            // corpus-fitted codes cannot reproduce its scores. Quantizing
+            // exactly the set being scored is also the pre-#392 behaviour,
+            // which keeps the filtered path bit-identical to the oracle.
+            // The consequence, documented in #392: a filtered score can
+            // move by up to SQ8's quantization step relative to the
+            // unfiltered codes path when the filter changes the fitted
+            // range — the exactness of the scan is the stronger contract.
             let params = Sq8Params::fit_borrowed(cand.iter().map(|(_, v)| v.as_slice()), dim);
             debug!(
                 field,
                 dim,
                 candidates = cand.len(),
                 normalize,
-                "SQ8 codec fitted for this query"
+                "SQ8 codec fitted for this query (filtered or non-serving codes store)"
             );
 
-            // Score by quantizing each candidate's CURRENT vector and decoding
-            // it straight back — 1 byte/dim, so `scalar8` keeps its recall
-            // profile, and the score describes the vector the document holds
-            // right now rather than one a previous query cached. Both buffers
-            // are reused across the scan, so this allocates nothing per
-            // document. `v.len() == dim` was established when `cand` was built.
+            // Score by quantizing each candidate's CURRENT vector and
+            // decoding it straight back — 1 byte/dim, so `scalar8`
+            // keeps its recall profile, and the score describes the
+            // vector the document holds right now. Both buffers are
+            // reused across the scan. `v.len() == dim` was
+            // established when `cand` was built.
             let mut codes = vec![0u8; dim];
             let mut decoded = vec![0.0f32; dim];
             for (position, (candidate, v)) in cand.into_iter().enumerate() {
@@ -14886,21 +15422,20 @@ impl Index {
         // against stored vectors. Filters and aggregations remain exact scans
         // so approximation cannot change filter/analytics membership.
         let result = if filter.is_none() && request.aggs.is_none() {
-            match self
-                .run_knn_hnsw(
-                    request,
-                    deadline,
-                    &knn_field,
-                    &query_vec,
-                    k,
-                    None,
-                    &similarity,
-                )
-                .await
+            match Box::pin(self.run_knn_hnsw(
+                request,
+                deadline,
+                &knn_field,
+                &query_vec,
+                k,
+                None,
+                &similarity,
+            ))
+            .await
             {
                 Some(result) => Ok(result),
                 None => {
-                    self.run_knn_brute_force_with_deadline(
+                    Box::pin(self.run_knn_brute_force_with_deadline(
                         request,
                         deadline,
                         &knn_field,
@@ -14910,12 +15445,12 @@ impl Index {
                         &similarity,
                         None,
                         None,
-                    )
+                    ))
                     .await
                 }
             }
         } else {
-            self.run_knn_brute_force_with_deadline(
+            Box::pin(self.run_knn_brute_force_with_deadline(
                 request,
                 deadline,
                 &knn_field,
@@ -14925,7 +15460,7 @@ impl Index {
                 &similarity,
                 None,
                 None,
-            )
+            ))
             .await
         };
         if trace_phases {
@@ -15635,7 +16170,7 @@ impl Index {
                 && min_similarity.is_none()
                 && request.aggs.is_none();
             let hnsw = if plain {
-                self.run_knn_hnsw(
+                Box::pin(self.run_knn_hnsw(
                     &sub_request,
                     deadline,
                     field,
@@ -15643,7 +16178,7 @@ impl Index {
                     *k,
                     *num_candidates,
                     &similarity,
-                )
+                ))
                 .await
             } else {
                 None
@@ -15651,7 +16186,7 @@ impl Index {
             let leg = match hnsw {
                 Some(result) => result,
                 None => {
-                    self.run_knn_brute_force_with_deadline(
+                    Box::pin(self.run_knn_brute_force_with_deadline(
                         &sub_request,
                         deadline,
                         field,
@@ -15661,7 +16196,7 @@ impl Index {
                         &similarity,
                         *boost,
                         *min_similarity,
-                    )
+                    ))
                     .await?
                 }
             };
@@ -16884,6 +17419,15 @@ impl Index {
                 })
                 .ok();
         }
+        // #392: drop the deleted doc's SQ8 code slots so the per-field
+        // coverage gates stay exact (mirrors the vector_doc_count decrement
+        // above).
+        {
+            let guard = self.sq8_stores.read();
+            for handle in guard.values() {
+                handle.store.write().remove(id);
+            }
+        }
         #[cfg(test)]
         self.publication_test_point(id, PublicationTestPoint::AfterHnsw);
 
@@ -17740,7 +18284,7 @@ impl Index {
                 && min_similarity.is_none()
                 && request.aggs.is_none();
             let hnsw = if plain {
-                self.run_knn_hnsw(
+                Box::pin(self.run_knn_hnsw(
                     request,
                     search_deadline,
                     &field,
@@ -17748,7 +18292,7 @@ impl Index {
                     k,
                     num_candidates,
                     &similarity,
-                )
+                ))
                 .await
             } else {
                 None
@@ -17756,7 +18300,7 @@ impl Index {
             let result = match hnsw {
                 Some(result) => result,
                 None => {
-                    self.run_knn_brute_force_with_deadline(
+                    Box::pin(self.run_knn_brute_force_with_deadline(
                         request,
                         search_deadline,
                         &field,
@@ -17766,7 +18310,7 @@ impl Index {
                         &similarity,
                         boost,
                         min_similarity,
-                    )
+                    ))
                     .await?
                 }
             };
@@ -17786,9 +18330,8 @@ impl Index {
         // — matching ES 8.13 multi-kNN semantics (live-verified 2026-07-12).
         if let Some(clauses) = peel_multi_knn_query(query) {
             let fields: Vec<String> = clauses.iter().map(|c| c.field.clone()).collect();
-            let result = self
-                .run_multi_knn_brute_force(request, search_deadline, clauses)
-                .await?;
+            let result =
+                Box::pin(self.run_multi_knn_brute_force(request, search_deadline, clauses)).await?;
             // #542: each knn clause validates its own field. On an empty,
             // non-timed-out union, reject the first clause naming an
             // unanswerable field — the same execution-truth check the single-knn
@@ -23099,7 +23642,7 @@ impl Index {
     }
 
     /// Add a field to the schema.
-    pub async fn add_field(&self, field: FieldConfig) -> Result<()> {
+    pub async fn add_field(self: &Arc<Self>, field: FieldConfig) -> Result<()> {
         self.add_fields(vec![field]).await
     }
 
@@ -23109,7 +23652,7 @@ impl Index {
     /// companion together. Validate and persist the complete candidate schema
     /// before publishing it so a later-field failure cannot leave half of that
     /// contract visible.
-    pub async fn add_fields(&self, fields: Vec<FieldConfig>) -> Result<()> {
+    pub async fn add_fields(self: &Arc<Self>, fields: Vec<FieldConfig>) -> Result<()> {
         if fields.is_empty() {
             return Ok(());
         }
@@ -23173,6 +23716,13 @@ impl Index {
             *self.embedder.write().await = embedder;
         }
         *schema = candidate;
+        drop(schema);
+        // #392: a mapping update can introduce a `scalar8` field — create
+        // its code store now and walk the live docs (the index may already
+        // carry documents predating the handle).
+        for field in self.ensure_sq8_stores().await {
+            self.spawn_sq8_walk(&field);
+        }
         Ok(())
     }
 
@@ -36421,6 +36971,64 @@ pub(crate) fn collect_dense_vector_fields(schema: &Schema) -> Vec<String> {
                 format!("{prefix}.{}", fc.name)
             };
             if matches!(fc.field_type, FieldType::Vector) {
+                out.push(path);
+            } else if !fc.fields.is_empty() {
+                walk(&fc.fields, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&schema.fields, "", &mut out);
+    out
+}
+
+/// One `scalar8` field's ingest-time SQ8 code store plus its readiness gate
+/// (#392). The engine holds one handle per quantized field in
+/// [`Index::sq8_stores`].
+struct Sq8StoreHandle {
+    /// The slot-addressed code array + codebook. Written by the ingest hook
+    /// (`sq8_ingest`), the delete hook, and the authoritative doc walk;
+    /// read by the kNN serving paths under a read guard.
+    store: parking_lot::RwLock<Sq8CodeStore>,
+    /// L2-normalize vectors before encoding — cosine-family similarity,
+    /// exactly the rule the per-query serving path applies
+    /// (`!matches!(similarity, "l2_norm" | "dot_product" | "max_inner_product")`).
+    /// Captured from the mapping when the handle is created; changing a
+    /// live field's similarity requires a reindex (as in ES).
+    normalize: bool,
+    /// Set once an authoritative walk over the live document set has
+    /// converged (empty indexes converge trivially). The serving paths may
+    /// only score from the codes when this holds AND the store's coverage
+    /// gate passes; otherwise they fall back to the exact scan.
+    ready: std::sync::atomic::AtomicBool,
+    /// Single-flight guard for the authoritative walk.
+    walking: std::sync::atomic::AtomicBool,
+    /// JoinHandle of the in-flight walk, aborted by `abort_background_tasks`.
+    walk_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Sq8StoreHandle {
+    /// The serving gate: the walk has converged and every doc id that ever
+    /// carried (or attempted) this field holds a live slot.
+    fn serving_fresh(&self) -> bool {
+        self.ready.load(Ordering::Acquire) && self.store.read().coverage_ok()
+    }
+}
+
+/// All dense_vector fields whose mapping opts into SQ8 (`quantization:
+/// "scalar8"`, set from `index_options.type: int8_hnsw|int8_flat` by the
+/// compat layer). Same recursive walk as [`collect_dense_vector_fields`].
+fn collect_scalar8_fields(schema: &Schema) -> Vec<String> {
+    fn walk(fields: &[FieldConfig], prefix: &str, out: &mut Vec<String>) {
+        for fc in fields {
+            let path = if prefix.is_empty() {
+                fc.name.clone()
+            } else {
+                format!("{prefix}.{}", fc.name)
+            };
+            if matches!(fc.field_type, FieldType::Vector)
+                && fc.options.quantization.as_deref() == Some("scalar8")
+            {
                 out.push(path);
             } else if !fc.fields.is_empty() {
                 walk(&fc.fields, &path, out);

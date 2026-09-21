@@ -20462,6 +20462,16 @@ pub async fn index_stats(
         Ok(idx) => idx.hnsw_stats().await,
         Err(_) => json!({ "present": false }),
     };
+    // XERJ extension (issue #392): the ingest-time SQ8 code stores. `fields`
+    // is empty for indices with no `scalar8` mapping; per field it reports
+    // the dimension, live slot count, coverage denominator, the
+    // ready/serving gates, codebook refits, and the resident `codes_bytes`
+    // — the flat u8 array the slot addressing is for, observable instead
+    // of notional.
+    let sq8_stats = match state.engine.get_index(&index) {
+        Ok(idx) => json!({ "fields": idx.sq8_stats() }),
+        Err(_) => json!({ "fields": {} }),
+    };
     // Merge status + real segment count so benchmarks can verify the
     // index is merge-quiescent (merges.current == 0) before measuring.
     let (seg_count, merges_current) = state
@@ -20491,6 +20501,7 @@ pub async fn index_stats(
         "store": { "size_in_bytes": store_size_bytes },
         "dense_vector": dense_vector_stats,
         "hnsw": hnsw_stats,
+        "sq8": sq8_stats,
         "mappings": { "schema_persist_failures": schema_persist_failures },
         "indexing": {
             // Real cumulative indexing counters (RC4 W4 item 1): plumbed from

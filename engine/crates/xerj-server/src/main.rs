@@ -2497,6 +2497,12 @@ async fn async_main() -> Result<()> {
     //      installed just below is what lets that drain actually lower RSS
     //      under jemalloc, which otherwise keeps freed pages resident.
     if storage_available {
+        // The purge-hook closure calls jemalloc mallctls, and jemalloc is not
+        // built on MSVC (the tikv crates are target-gated out in Cargo.toml),
+        // so the hook installs on every other target only — the engine's
+        // default no-op purge covers MSVC. The resource sampler below still
+        // runs everywhere: allocator_snapshot() has its own msvc fallback.
+        #[cfg(not(target_env = "msvc"))]
         xerj_engine::engine::set_allocator_purge_hook(std::sync::Arc::new(|| {
             // Refresh the cached stats first (the epoch mallctl is what makes
             // the stats reads in the ingest-memory ledger coherent), then
