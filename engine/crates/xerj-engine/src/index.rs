@@ -11193,6 +11193,42 @@ impl Index {
         Ok(total)
     }
 
+    /// Upper bound on the total INPUT bytes of one merge batch.  Issue #948.
+    ///
+    /// The merge executor materialises decoded and re-encoded copies of
+    /// every input document (measured 5-9x input bytes on mailbox-shaped
+    /// docs: `merge_parsed` alone held 191 MB current on a 20k-doc index),
+    /// so batch heap cost scales with bytes, not segment count.  Peers
+    /// bound the same thing by memory, not count: Quickwit caps the bytes
+    /// buffered by pending merge writers
+    /// (`quickwit-parquet-engine/src/storage/streaming_writer.rs:378`
+    /// `pending_writers_memory_size`) and streams segment files
+    /// (`quickwit-parquet-engine/src/merge/streaming.rs:148`); tantivy's
+    /// `LogMergePolicy` filters candidates by size before batching
+    /// (`max_docs_before_merge`, `src/indexer/log_merge_policy.rs:22,94`).
+    ///
+    /// Derived: `clamp(process cap / 64, 32 MiB, 512 MiB)` — at #948's
+    /// 16 GiB auto-cap that is a 256 MiB batch, i.e. a worst-case merge
+    /// working set of ~1.5-2.4 GiB at the measured multipliers.
+    /// `XERJ_MERGE_BATCH_MAX_INPUT_MB` overrides (0 disables the bound).
+    /// A non-numeric cap (`auto`, `off`) falls back to the 512 MiB
+    /// default.
+    fn merge_batch_cap_bytes() -> u64 {
+        const MB: u64 = 1024 * 1024;
+        if let Ok(raw) = std::env::var("XERJ_MERGE_BATCH_MAX_INPUT_MB") {
+            if let Ok(mb) = raw.trim().parse::<u64>() {
+                return mb * MB;
+            }
+        }
+        match std::env::var("XERJ_MAX_PROCESS_MEMORY_MB")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+        {
+            Some(limit_mb) if limit_mb > 0 => (limit_mb / 64).clamp(32, 512) * MB,
+            _ => 512 * MB,
+        }
+    }
+
     /// One merge pass.  Caller MUST hold `merge_in_progress` (and clear it
     /// after — see `MergeFlagClear`).
     ///
@@ -11237,6 +11273,7 @@ impl Index {
             max_merge_count: mc.max_merge_count as usize,
             tier_floor_bytes: mc.tier_floor_mb * 1024 * 1024,
             max_merged_segment_bytes: mc.max_segment_mb * 1024 * 1024,
+            max_batch_input_bytes: Self::merge_batch_cap_bytes(),
         };
 
         let segments_snapshot_init = {
@@ -11246,15 +11283,37 @@ impl Index {
         let batches: Vec<Vec<SegmentId>> = match force_max_segments {
             // Forcemerge: chunk every segment (smallest first) into
             // max_merge_count-sized batches, ignoring tier/size caps.
+            // #948 — the byte cap still applies: an explicit forcemerge
+            // on a mailbox index used to build one count-sized batch of
+            // ~100 MB segments and hold ~16 GiB of decoded docs at once.
+            // Multiple capped batches still converge to `target`
+            // segments (the caller loops passes).
             Some(target) if segments_snapshot_init.len() > target => {
+                let cap = Self::merge_batch_cap_bytes();
                 let mut segs: Vec<&xerj_storage::segment::SegmentMeta> =
                     segments_snapshot_init.iter().collect();
                 segs.sort_by_key(|s| s.size_bytes);
+                let sizes: Vec<u64> = segs.iter().map(|s| s.size_bytes).collect();
                 let ids: Vec<SegmentId> = segs.into_iter().map(|s| s.id.clone()).collect();
-                ids.chunks((mc.max_merge_count as usize).max(2))
-                    .filter(|c| c.len() >= 2)
-                    .map(|c| c.to_vec())
-                    .collect()
+                let chunk_len = (mc.max_merge_count as usize).max(2);
+                let mut chunks: Vec<Vec<SegmentId>> = Vec::new();
+                let mut batch: Vec<SegmentId> = Vec::new();
+                let mut batch_bytes = 0u64;
+                for (id, size) in ids.into_iter().zip(sizes) {
+                    if !batch.is_empty()
+                        && (batch.len() >= chunk_len || (cap > 0 && batch_bytes + size > cap))
+                    {
+                        chunks.push(std::mem::take(&mut batch));
+                        batch_bytes = 0;
+                    }
+                    batch_bytes = batch_bytes.saturating_add(size);
+                    batch.push(id);
+                }
+                if !batch.is_empty() {
+                    chunks.push(batch);
+                }
+                chunks.retain(|c| c.len() >= 2);
+                chunks
             }
             Some(_) => Vec::new(),
             None => policy.select_merges(&segments_snapshot_init),
@@ -11496,6 +11555,24 @@ impl Index {
                         };
                     let merge_postings = merge_readers.is_some();
 
+                    // Ingest-memory attribution (#948): the replay path holds
+                    // every input's decompressed postings + norms for the whole
+                    // batch, and the same bytes bound the writer's in-memory
+                    // rebuild (a merged posting list is the inputs' lists
+                    // remapped, not re-derived). `retained_bytes` charges only
+                    // what the reader OWNS (an mmap'd `.post` contributes 0),
+                    // matching what this batch adds to the heap.
+                    let merge_reader_retained = merge_readers.as_ref().map(|readers| {
+                        let bytes: u64 = readers
+                            .iter()
+                            .map(|reader| reader.retained_bytes())
+                            .sum();
+                        crate::ingest_memory::Retained::new(
+                            crate::ingest_memory::Category::MergeDecoded,
+                            bytes as usize,
+                        )
+                    });
+
                     // Per-phase attribution of one merge batch, gated on
                     // XERJ_PROF, matching the flush path's `XERJ_PROF
                     // flush-sidecar` line. The #876 A/B is read off `fts_us`.
@@ -11560,6 +11637,10 @@ impl Index {
                     // doc ids, and the global `_seq_no` sort below scrambles the
                     // per-input order, so the pair has to ride along.
                     let mut survivors: Vec<(u64, String, String, u32, u32)> = Vec::new();
+                    // #948 attribution: running estimate of the survivor
+                    // set's retained bytes (raw JSON + id + tuple), observed
+                    // once per input segment as a sampled checkpoint.
+                    let mut survivor_bytes: usize = 0;
                     // One entry per document in each input segment, in that
                     // segment's own ordinal order: the merged ordinal it becomes,
                     // or `None` if it does not survive.
@@ -11688,6 +11769,15 @@ impl Index {
                                     return None;
                                 }
                             };
+                        // Ingest-memory attribution (#948): one guard per
+                        // input for its decompressed stored section, held
+                        // until this iteration ends (the RawValue parse and
+                        // the survivor scan both read it; the buffer drops
+                        // with the iteration scope).
+                        let _stored_guard = crate::ingest_memory::Retained::new(
+                            crate::ingest_memory::Category::MergeDecoded,
+                            stored_bytes.len(),
+                        );
                         // `Box<RawValue>` uses a serde-private newtype tag that
                         // simd_json's serde adapter does not recognise — the
                         // deserialiser fails with "invalid type: newtype struct,
@@ -11755,8 +11845,21 @@ impl Index {
                                 source_index as u32,
                                 source_ordinal as u32,
                             ));
+                            survivor_bytes = survivor_bytes.saturating_add(
+                                raw_str.len()
+                                    + id_seq.id.len()
+                                    + std::mem::size_of::<(u64, String, String, u32, u32)>(),
+                            );
                         }
                         // raw_docs + stored_bytes drop here — segment RAM reclaimed.
+                        // One sampled checkpoint per input segment: the
+                        // survivor set grows monotonically inside the input
+                        // loop, so the trailing edge of the peak is at most
+                        // one input's worth of growth (#948 attribution).
+                        crate::ingest_memory::observe_checkpoint(
+                            crate::ingest_memory::Category::MergeSurvivor,
+                            survivor_bytes,
+                        );
                     }
 
                     // Global insertion-order (_seq_no) sort — see the B1 note
@@ -11767,6 +11870,8 @@ impl Index {
                     // Single sorted stream → all four outputs.  `into_iter`
                     // frees each raw String right after its bytes are copied
                     // into `merged_json_buf`, keeping peak memory ~1× stored.
+                    let mut drain_checkpoint = 0u64;
+                    let mut fts_input_bytes: usize = 0;
                     for (seq_no, id_str, raw_str, source_index, source_ordinal) in survivors {
                         if !first_doc {
                             merged_json_buf.push(b',');
@@ -11813,13 +11918,50 @@ impl Index {
                         } else {
                             extract_fts_fields_excluding(&source, &excluded_fts_fields_for_task)
                         };
+                        // #948 attribution: the Value tree the FTS/DV passes
+                        // hold until the end of the batch. The walk is
+                        // per-document but only when tracing is enabled.
+                        if crate::ingest_memory::enabled() {
+                            fts_input_bytes = fts_input_bytes
+                                .saturating_add(crate::ingest_memory::estimated_json_heap(
+                                    doc_value.get("_source").unwrap_or(&Value::Null),
+                                ));
+                        }
                         fts_input.push((id_str, fields, source));
+                        // Sampled checkpoints every 8192 drained docs: the
+                        // survivor set shrinks as `merged_json_buf` and
+                        // `fts_input` grow, so the crossover IS the batch's
+                        // stored-side peak.
+                        drain_checkpoint += 1;
+                        if drain_checkpoint.is_multiple_of(8192) {
+                            crate::ingest_memory::observe_checkpoint(
+                                crate::ingest_memory::Category::MergeJsonBuffer,
+                                merged_json_buf.len(),
+                            );
+                            crate::ingest_memory::observe_checkpoint(
+                                crate::ingest_memory::Category::MergeParsed,
+                                fts_input_bytes,
+                            );
+                        }
                     }
+                    // Drained: the survivors vec is empty now.
+                    crate::ingest_memory::observe_checkpoint(
+                        crate::ingest_memory::Category::MergeSurvivor,
+                        0,
+                    );
 
                     if live_doc_count == 0 {
                         return None;
                     }
                     merged_json_buf.push(b']');
+                    crate::ingest_memory::observe_checkpoint(
+                        crate::ingest_memory::Category::MergeJsonBuffer,
+                        merged_json_buf.len(),
+                    );
+                    crate::ingest_memory::observe_checkpoint(
+                        crate::ingest_memory::Category::MergeParsed,
+                        fts_input_bytes,
+                    );
 
                     // Write merged stored section using the columnar v2 codec.
                     let mut writer = match SegmentWriter::new(&segments_dir_for_task, 1, 0, 0) {
@@ -11835,8 +11977,19 @@ impl Index {
                         &merged_json_buf,
                         merge_zstd_level,
                     );
+                    // #948 attribution: the compressed output buffer is an
+                    // exact owned length; it coexists with the drained buffer
+                    // for one encode call.
+                    let _encoded_guard = crate::ingest_memory::Retained::new(
+                        crate::ingest_memory::Category::MergeEncoded,
+                        encoded.len(),
+                    );
                     let stored_us = stored_timer.elapsed().as_micros();
                     drop(merged_json_buf);
+                    crate::ingest_memory::observe_checkpoint(
+                        crate::ingest_memory::Category::MergeJsonBuffer,
+                        0,
+                    );
                     if let Err(e) = writer.add_section(SectionType::Stored, &encoded) {
                         tracing::error!("merge ABORTED: failed to add section: {e}");
                         failed_for_task.fetch_add(1, Ordering::Relaxed);
@@ -11989,6 +12142,7 @@ impl Index {
                     // Release the inputs' decompressed postings before the
                     // doc-values build, which is now the batch's memory peak.
                     drop(merge_readers);
+                    drop(merge_reader_retained);
 
                     // Update version_map so doc → segment_id points to the
                     // merged segment, using each doc's REAL seq_no from
@@ -12041,6 +12195,13 @@ impl Index {
                     }
 
                     let dv_us = dv_timer.elapsed().as_micros();
+                    // `fts_input` (raw ids + the per-doc `_source` Value
+                    // trees) survives its last reader here — the batch's
+                    // parsed-side attribution ends with it.
+                    crate::ingest_memory::observe_checkpoint(
+                        crate::ingest_memory::Category::MergeParsed,
+                        0,
+                    );
                     if prof {
                         eprintln!(
                             "XERJ_PROF merge-batch inputs={} docs={live_doc_count} \
@@ -22146,6 +22307,14 @@ impl Index {
         self.memtable.size_bytes()
     }
 
+    /// #948 — entries currently resident in the STORAGE memtable
+    /// (`IndexStore::memtable_shards`).  Diagnostic twin of
+    /// [`Self::memtable_bytes`]: the FTS memtable drains on every flush,
+    /// the storage one used to never drain at all.
+    pub fn resident_memtable_entries(&self) -> usize {
+        self.store.resident_memtable_entries()
+    }
+
     pub fn flush_threshold(&self) -> usize {
         self.flush_byte_threshold
     }
@@ -29056,14 +29225,20 @@ async fn do_flush_shard(
 
             let storage_entries: Vec<xerj_storage::index_store::MemEntry> = raw
                 .into_iter()
-                .map(
-                    |(seq_no, doc_id, arc, raw_bytes)| xerj_storage::index_store::MemEntry {
+                .map(|(seq_no, doc_id, arc, raw_bytes)| {
+                    let charge = if !raw_bytes.is_empty() {
+                        raw_bytes.len() as u64
+                    } else {
+                        xerj_storage::index_store::estimate_value_bytes(&arc)
+                    };
+                    xerj_storage::index_store::MemEntry {
                         seq_no,
                         doc_id,
                         source: Some(arc),
                         source_bytes: raw_bytes,
-                    },
-                )
+                        charge,
+                    }
+                })
                 .collect();
             let storage_drained = xerj_storage::index_store::DrainedMemtable {
                 entries: storage_entries,
@@ -43922,6 +44097,16 @@ fn warm_segment_at_publish(
         )
     });
     if *NO_WARM {
+        return;
+    }
+    // Issue #948 — publish warming retains ~10-15× the flushed segment's
+    // raw bytes. Doing that while the parent memory breaker is ENGAGED buys
+    // query latency with exactly the memory the process just ran out of,
+    // and the warmer fills the segment-hydration budget with artifacts at
+    // the worst moment (the breaker only rejects; it cannot reclaim what
+    // warming keeps re-adding). Skip when engaged — the next read
+    // re-hydrates on demand, and warming resumes once memory frees up.
+    if crate::governor::global().is_some_and(|g| g.memory_breaker_engaged()) {
         return;
     }
     // 1. Stored slices.

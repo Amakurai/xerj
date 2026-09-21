@@ -182,6 +182,33 @@ struct MemEntry {
     size_bytes: usize,
 }
 
+/// Charge for one raw-bytes (turbo `_bulk`) memtable entry — issue #948.
+///
+/// The entry retains the full NDJSON payload plus the doc-id string twice
+/// (`doc_id_index` key + `MemEntry.doc_id`) and the entry/index nodes; the
+/// parsed `Value` and postings are deferred to the flush thread, so the
+/// payload length IS the honest hot-path footprint. The historical flat
+/// 800-byte estimate stays as the floor so compressed log docs (~115 B)
+/// keep their exact M5.6/M5.17 charge and flush cadence — only docs larger
+/// than the floor charge more, which is precisely the case where the flat
+/// number let a ~10 KB mailbox doc count as 800 bytes while the
+/// process-wide memtable budget believed it had 12× more headroom than it
+/// did.
+const RAW_BYTES_CHARGE_FLOOR: usize = 800;
+/// `MemEntry` + Arc header + `doc_id_index` node allowance for one raw-bytes
+/// entry. Sized from the struct fields (2×u64, 2×String, Arc<Value>,
+/// Arc<[u8]>, OnceLock, usize ≈ 100 B) plus a hash-map node (~48 B).
+const RAW_BYTES_ENTRY_OVERHEAD: usize = 160;
+
+fn raw_bytes_charge(doc_id: &str, source_bytes: &[u8]) -> usize {
+    RAW_BYTES_CHARGE_FLOOR.max(
+        source_bytes
+            .len()
+            .saturating_add(doc_id.len())
+            .saturating_add(RAW_BYTES_ENTRY_OVERHEAD),
+    )
+}
+
 /// Reconstruct the (field_name → flattened text) map that pre-M4.9
 /// `MemEntry` used to cache eagerly at ingest time.  Called only by
 /// the legacy `drain_with_sources` / `drain` / `get_source` paths, which
@@ -2591,14 +2618,23 @@ impl FtsMemtable {
         doc_id: String,
         source_bytes: Arc<[u8]>,
     ) {
-        // M5.6 flat-800-byte estimate retained — changing it to a
-        // per-doc `source_bytes.len()` in M5.17 regressed ingest
-        // throughput (varies 400-640 k vs 870 k baseline) because
-        // the math interacts non-obviously with the shard flush
-        // scheduler.  Revert.  The 800-byte number over-estimates
-        // compressed log docs by ~7× but keeps the flush cadence
-        // predictable.
-        let estimated = 800usize;
+        // Issue #948 — the charge must be an estimate of what this entry
+        // actually retains. On this path that is the raw NDJSON payload
+        // (`source_bytes`), the doc-id string (duplicated into
+        // `doc_id_index` and `MemEntry`), and the entry/index nodes — the
+        // parsed `Value` and postings are built later, on the flush thread.
+        //
+        // History, so nobody re-breaks M5.17: a bare `source_bytes.len()`
+        // charge there regressed log-ingest throughput (400-640 k vs 870 k
+        // docs/s) by disturbing the shard flush scheduler's cadence for
+        // SMALL docs. The flat 800 bytes stays as the FLOOR — compressed
+        // log docs (~115 B) keep their exact historical charge and cadence —
+        // but a mailbox-shaped doc (~10 KB of raw JSON retained verbatim)
+        // now charges its real footprint. At 800 B/doc the process-wide
+        // memtable budget (governor item 1) was admitting ~12× more live
+        // bytes than it was told about, which is exactly how the #948
+        // mailbox ingest overshot the memory cap while "under budget".
+        let estimated = raw_bytes_charge(&doc_id, &source_bytes);
         self.total_bytes += estimated;
         self.aggregate_bytes.fetch_add(estimated, Ordering::Relaxed);
 
@@ -2624,7 +2660,7 @@ impl FtsMemtable {
     /// Currently we still clone since stable Rust HashMap requires an
     /// owned key; the gain is skipping the prior `remove()` miss lookup.
     pub fn insert_raw_bytes_fresh(&mut self, seq_no: u64, doc_id: String, source_bytes: Arc<[u8]>) {
-        let estimated = 800usize;
+        let estimated = raw_bytes_charge(&doc_id, &source_bytes);
         self.total_bytes += estimated;
         self.aggregate_bytes.fetch_add(estimated, Ordering::Relaxed);
 
@@ -5870,5 +5906,49 @@ mod aggregate_bytes_tests {
         let _ = mem.drain_with_sources();
         check("drain_with_sources");
         assert_eq!(mem.size_bytes(), 0, "fully drained memtable must read 0");
+    }
+
+    /// Issue #948: the raw-bytes entry charge must track what the entry
+    /// actually retains. A mailbox-shaped doc (~10 KB of NDJSON held
+    /// verbatim until flush) must charge at least its payload length — the
+    /// pre-fix flat 800 bytes let the process-wide memtable budget admit
+    /// ~12× more live bytes than it was told about. Small (log-shaped) docs
+    /// must keep the historical 800-byte floor so the M5.17 flush-cadence
+    /// behaviour is byte-for-byte unchanged for them.
+    ///
+    /// Uses only the public insert/size_bytes surface (no helper symbols
+    /// introduced by the fix) so the mailbox assertion is a mechanical
+    /// FAIL-BEFORE on pre-fix source: it charged 800 there.
+    #[test]
+    fn raw_bytes_charge_tracks_payload_with_an_800_byte_floor() {
+        use std::sync::Arc as StdArc;
+
+        let registry = StdArc::new(AnalyzerRegistry::default());
+        let mem = ShardedFtsMemtable::with_registry_and_shards(registry, 2);
+
+        // Small (log-shaped) doc: keeps the historical flat charge exactly.
+        mem.insert_raw_bytes_with_seq(
+            1,
+            "id-1".to_string(),
+            StdArc::from(&b"{\"body\":\"log line\"}"[..]),
+        );
+        assert_eq!(
+            mem.size_bytes(),
+            800,
+            "small docs must keep the M5.6/M5.17 flat charge and flush cadence"
+        );
+
+        // Mailbox-shaped doc: must charge at least its own payload length.
+        let payload = vec![b'x'; 9_830];
+        mem.insert_raw_bytes_with_seq(
+            2,
+            "message-42".to_string(),
+            StdArc::from(payload.clone().into_boxed_slice()),
+        );
+        assert!(
+            mem.size_bytes() >= 800 + payload.len(),
+            "memtable size_bytes must not under-count a mailbox-sized doc by ~12x (pre-fix: 800/doc)"
+        );
+        assert_eq!(mem.size_bytes(), recount(&mem));
     }
 }

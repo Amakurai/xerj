@@ -160,6 +160,50 @@ pub struct MemEntry {
     /// writer uses these directly instead of re-serializing the Value —
     /// saving ~500ns/doc on the flush hot path.
     pub source_bytes: std::sync::Arc<[u8]>,
+    /// Heap bytes this entry charges to `memtable_bytes` (raw bytes length,
+    /// or a structural estimate of the parsed `source`).  Carried ON the
+    /// entry so `prune_published_memtable` can recompute the counter
+    /// exactly, without re-serialising anything.
+    pub charge: u64,
+}
+
+/// Fixed charge for a tombstone `MemEntry` (String doc_id + SeqNo + Arcs).
+const TOMBSTONE_CHARGE: u64 = 64;
+
+/// Structural heap estimate for a parsed source document.
+///
+/// `source.to_string().len()` (the pre-#948 accounting) serialises the whole
+/// document on every write just to measure it — a full JSON render per doc on
+/// the explicit-id bulk path.  Walking the tree costs no formatting and no
+/// allocation and stays within ~10 % of the serialised length on
+/// mailbox-shaped documents (many medium string fields).
+pub fn estimate_value_bytes(v: &serde_json::Value) -> u64 {
+    match v {
+        serde_json::Value::Null => 8,
+        serde_json::Value::Bool(_) => 1,
+        serde_json::Value::Number(n) => n.to_string().len() as u64 + 8,
+        serde_json::Value::String(s) => s.len() as u64 + 16, // header + heap buf
+        serde_json::Value::Array(a) => 8 + a.iter().map(estimate_value_bytes).sum::<u64>(),
+        serde_json::Value::Object(m) => {
+            // IndexMap bucket: key String + value + bucket overhead.
+            32 + m
+                .iter()
+                .map(|(k, v)| (k.len() as u64 + 16) + estimate_value_bytes(v))
+                .sum::<u64>()
+        }
+    }
+}
+
+impl MemEntry {
+    /// Charge for a live entry: raw bytes when present (the turbo-raw bulk
+    /// path), else the structural estimate of the parsed source.
+    fn charge_for(source: &serde_json::Value, source_bytes: &std::sync::Arc<[u8]>) -> u64 {
+        if !source_bytes.is_empty() {
+            source_bytes.len() as u64
+        } else {
+            estimate_value_bytes(source)
+        }
+    }
 }
 
 /// Opaque handle holding a drained memtable.
@@ -1675,7 +1719,8 @@ impl IndexStore {
             wal.append(&entry)?
         };
 
-        let source_len = source.to_string().len();
+        let source_bytes = std::sync::Arc::from(&[][..]);
+        let charge = MemEntry::charge_for(&source, &source_bytes);
         self.version_map
             .set(&doc_id, seq_no, IN_MEMORY_SEGMENT_ID, false);
 
@@ -1685,10 +1730,10 @@ impl IndexStore {
             seq_no,
             doc_id,
             source: Some(std::sync::Arc::new(source)),
-            source_bytes: std::sync::Arc::from(&[][..]),
+            source_bytes,
+            charge,
         });
-        self.memtable_bytes
-            .fetch_add(source_len as u64, Ordering::Relaxed);
+        self.memtable_bytes.fetch_add(charge, Ordering::Relaxed);
 
         debug!(seq_no, "document indexed");
         Ok(seq_no)
@@ -1731,18 +1776,19 @@ impl IndexStore {
             let seq_no = seq_nos[i];
             self.version_map
                 .set(doc_id, seq_no, IN_MEMORY_SEGMENT_ID, false);
-            let source_len = source.to_string().len();
+            let source_bytes = std::sync::Arc::from(&[][..]);
+            let charge = MemEntry::charge_for(source, &source_bytes);
             let shard = self.shard_for(doc_id);
             let mut mem = self.memtable_shards[shard].lock().unwrap();
             mem.push(MemEntry {
                 seq_no,
                 doc_id: doc_id.clone(),
                 source: Some(std::sync::Arc::new(source.clone())),
-                source_bytes: std::sync::Arc::from(&[][..]),
+                source_bytes,
+                charge,
             });
             drop(mem);
-            self.memtable_bytes
-                .fetch_add(source_len as u64, Ordering::Relaxed);
+            self.memtable_bytes.fetch_add(charge, Ordering::Relaxed);
         }
 
         Ok(seq_nos)
@@ -1801,7 +1847,10 @@ impl IndexStore {
             doc_id: doc_id.to_owned(),
             source: None,
             source_bytes: std::sync::Arc::from(&[][..]),
+            charge: TOMBSTONE_CHARGE,
         });
+        self.memtable_bytes
+            .fetch_add(TOMBSTONE_CHARGE, Ordering::Relaxed);
 
         Ok(Some(seq_no))
     }
@@ -1863,14 +1912,7 @@ impl IndexStore {
             }) {
                 continue;
             }
-            restored_bytes = restored_bytes.saturating_add(if !entry.source_bytes.is_empty() {
-                entry.source_bytes.len() as u64
-            } else {
-                entry
-                    .source
-                    .as_ref()
-                    .map_or(0, |source| source.to_string().len() as u64)
-            });
+            restored_bytes = restored_bytes.saturating_add(entry.charge);
             mem.push(entry.clone());
         }
         self.memtable_bytes
@@ -1924,6 +1966,13 @@ impl IndexStore {
     {
         let entries = &drained.entries;
         if entries.is_empty() {
+            let pruned = self.prune_published_memtable();
+            if pruned > 0 {
+                debug!(
+                    pruned,
+                    "pruned published storage memtable entries (empty flush)"
+                );
+            }
             return Ok(FlushFinalizeOutcome::Empty);
         }
 
@@ -2369,6 +2418,10 @@ impl IndexStore {
                     segment_id,
                     doc_count, min_seq, max_seq, "segment published with deferred maintenance"
                 );
+                let pruned = self.prune_published_memtable();
+                if pruned > 0 {
+                    debug!(pruned, "pruned published storage memtable entries");
+                }
                 return Ok(FlushFinalizeOutcome::Published {
                     meta,
                     maintenance_deferred: true,
@@ -2397,6 +2450,12 @@ impl IndexStore {
         }
 
         info!(segment_id, doc_count, min_seq, max_seq, "segment flushed");
+        // #948 — the segment is durable and the version map repointed:
+        // drop the storage-memtable `Arc<Value>` copies these docs held.
+        let pruned = self.prune_published_memtable();
+        if pruned > 0 {
+            debug!(pruned, "pruned published storage memtable entries");
+        }
         Ok(FlushFinalizeOutcome::Published {
             meta,
             maintenance_deferred: false,
@@ -2409,6 +2468,82 @@ impl IndexStore {
             self.flush()
         } else {
             Ok(None)
+        }
+    }
+
+    /// Drop memtable entries whose durable copy no longer needs the in-memory
+    /// one, returning the number of entries removed.  Issue #948.
+    ///
+    /// An entry is retained only while the version map still resolves its
+    /// `doc_id` to THIS entry — i.e. `segment_id == __memtable__` at exactly
+    /// this `seq_no`.  Once a flush repoints the doc at a real segment (or a
+    /// newer write/delete supersedes this seq_no), the entry's
+    /// `Arc<serde_json::Value>` — the full parsed document tree — is dead
+    /// weight, but nothing used to remove it: the engine flush path drains
+    /// the FTS memtable and builds its `DrainedMemtable` from THAT, so
+    /// `memtable_shards` was never drained and one `Arc<Value>` per
+    /// explicit-id write was retained for the life of the process (freed
+    /// only by a DELETE of the doc).  Measured: ~2.4-3.1x source bytes of
+    /// un-attributed at-rest RSS on mailbox-shaped bulk loads.
+    ///
+    /// Called at the end of every successful
+    /// [`finalize_flush_with_publisher`], which covers the engine flush
+    /// path, the legacy `flush_with_publisher`, and crash-recovery replay
+    /// flushes.  Convergence, not exactness: entries flushed by a CONCURRENT
+    /// finalize that has not yet repointed the version map simply survive
+    /// until the next prune.
+    pub fn prune_published_memtable(&self) -> usize {
+        let mut removed = 0usize;
+        let mut removed_charge = 0u64;
+        for shard in &self.memtable_shards {
+            let mut mem = shard.lock().unwrap();
+            let before = mem.len();
+            mem.retain(|entry| {
+                let live = self.version_map.get(&entry.doc_id).is_some_and(|current| {
+                    current.seq_no == entry.seq_no
+                        && current.segment_id.as_ref() == IN_MEMORY_SEGMENT_ID
+                });
+                if !live {
+                    removed_charge = removed_charge.saturating_add(entry.charge);
+                }
+                live
+            });
+            removed += before - mem.len();
+        }
+        if removed > 0 {
+            self.memtable_bytes_sub_clamped(removed_charge);
+        }
+        removed
+    }
+
+    /// Test/diagnostic accessor: number of entries currently resident in the
+    /// storage memtable shards.
+    pub fn resident_memtable_entries(&self) -> usize {
+        self.memtable_shards
+            .iter()
+            .map(|shard| shard.lock().unwrap().len())
+            .sum()
+    }
+
+    /// `memtable_bytes.fetch_sub` that clamps at zero instead of wrapping.
+    ///
+    /// Entries pushed by WAL replay before #948 never incremented the
+    /// counter, so a prune can in principle subtract more than was added;
+    /// the counter only feeds `maybe_flush`, where a wrapped (huge) value
+    /// would flap the threshold forever.
+    fn memtable_bytes_sub_clamped(&self, delta: u64) {
+        let mut current = self.memtable_bytes.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(delta);
+            match self.memtable_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
         }
     }
 
@@ -3660,14 +3795,19 @@ impl IndexStore {
                     if !already_persisted {
                         self.version_map
                             .set(&doc_id, seq_no, IN_MEMORY_SEGMENT_ID, false);
+                        let source_bytes = std::sync::Arc::from(&[][..]);
+                        let charge = MemEntry::charge_for(&source, &source_bytes);
                         let shard = self.shard_for(&doc_id);
                         let mut mem = self.memtable_shards[shard].lock().unwrap();
                         mem.push(MemEntry {
                             seq_no,
                             doc_id,
                             source: Some(std::sync::Arc::new(source)),
-                            source_bytes: std::sync::Arc::from(&[][..]),
+                            source_bytes,
+                            charge,
                         });
+                        drop(mem);
+                        self.memtable_bytes.fetch_add(charge, Ordering::Relaxed);
                     }
                 }
                 WalEntry::Delete { doc_id } => {
@@ -3730,7 +3870,11 @@ impl IndexStore {
                         doc_id,
                         source: None,
                         source_bytes: std::sync::Arc::from(&[][..]),
+                        charge: TOMBSTONE_CHARGE,
                     });
+                    drop(mem);
+                    self.memtable_bytes
+                        .fetch_add(TOMBSTONE_CHARGE, Ordering::Relaxed);
                 }
                 WalEntry::UpdateMapping { .. } => {}
             }
@@ -6618,5 +6762,93 @@ mod tests {
             .apply_merge_with_repoints(&input_ids, output, transaction)
             .unwrap_err();
         assert!(matches!(error, MergePublicationError::Indeterminate { .. }));
+    }
+
+    // ── #948: storage memtable prune on flush completion ────────────────────
+
+    fn store_with_memtable(path: &std::path::Path) -> Arc<IndexStore> {
+        IndexStore::open(
+            path,
+            IndexStoreConfig {
+                sync_mode: SyncMode::Batched,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// The engine flush path reproduces the #948 leak at its smallest:
+    /// `store.index()` pushes a `MemEntry` into `memtable_shards`, the
+    /// engine finalises a flush built from an EXTERNAL `DrainedMemtable`
+    /// (its own FTS memtable drain) which repoints the version map at the
+    /// new segment — and pre-#948 nothing ever removed the storage-side
+    /// entry, retaining one `Arc<Value>` per explicit-id write for the
+    /// life of the process.
+    ///
+    /// FAIL-BEFORE: with the `prune_published_memtable()` call in
+    /// `finalize_flush_with_publisher` reverted (test and accessors kept),
+    /// `resident == 0` fails — the entry survives the publish.
+    #[test]
+    fn flush_finalize_prunes_published_storage_memtable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_memtable(dir.path());
+        let source = serde_json::json!({"v": 1});
+        let seq_no = store.index("doc-1", source.clone()).unwrap();
+        assert_eq!(store.resident_memtable_entries(), 1);
+
+        // Exactly what `Index::do_flush_shard` does: hand finalize a
+        // DrainedMemtable built from the engine-side (FTS) drain — the
+        // storage shards are NOT drained and still hold the entry above.
+        let drained = DrainedMemtable {
+            entries: vec![MemEntry {
+                seq_no,
+                doc_id: "doc-1".to_string(),
+                source: Some(std::sync::Arc::new(source)),
+                source_bytes: std::sync::Arc::from(&[][..]),
+                charge: 64,
+            }],
+        };
+        match store
+            .finalize_flush_with_publisher(&drained, |_| Ok(()))
+            .unwrap()
+        {
+            FlushFinalizeOutcome::Published { .. } => {}
+            other => panic!("expected Published, got {other:?}"),
+        }
+
+        assert_eq!(
+            store.resident_memtable_entries(),
+            0,
+            "#948: once the version map repoints at the published segment, \
+             the storage memtable entry must be pruned"
+        );
+    }
+
+    /// The prune is conservative where it must be and exact where it can:
+    /// a still-live write and a memtable-resident tombstone survive, while
+    /// an entry superseded by a newer write of the same doc (still in the
+    /// memtable, nothing published) is stale and dropped.
+    #[test]
+    fn prune_keeps_unpublished_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_memtable(dir.path());
+        store.index("live", serde_json::json!({"v": 1})).unwrap();
+        store
+            .index("overwritten", serde_json::json!({"v": 1}))
+            .unwrap();
+        store.delete("overwritten").unwrap();
+        assert_eq!(
+            store.resident_memtable_entries(),
+            3,
+            "two writes + one tombstone"
+        );
+
+        let removed = store.prune_published_memtable();
+        assert_eq!(
+            removed, 1,
+            "only the entry superseded by the newer tombstone is prunable"
+        );
+        let resident = store.resident_memtable_entries();
+        assert_eq!(resident, 2, "the live write and the tombstone stay");
     }
 }
