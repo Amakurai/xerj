@@ -1,0 +1,199 @@
+{
+ "profile": "mixed",
+ "target_size": "1G",
+ "label": "capped16g-base",
+ "extra_autoindex_flags": "",
+ "resumed_after_a_failed_run": false,
+ "autoindex_exit_code": 1,
+ "autoindex_last_line": "error: autoindex stopped with bulk/backend failures: bulk backend failed for 38 item(s): {\"type\":\"engine_exception\",\"reason\":\"[parent] real memory circuit breaker tripped: rss=15569MB >= watermark=15564MB (94% of limit=16384MB); writes rejected to prevent an out-of-memory kill\",\"status\":429}. Source file was not journaled complete; fix the server condition (or wait for it to clear) and rerun autoindex \u2014 the run resumes from the journal. Failed source files were not journaled complete; fix the reported server or embedding configuration and rerun the same command to resume safely",
+ "source": {
+  "mbox_bytes": 1073777879,
+  "tree_bytes": 1073794434,
+  "entries": 40799,
+  "attachments": {
+   "binary": 5698,
+   "pdf": 4261,
+   "text": 4300
+  },
+  "mbox_sha256": "4098bf60c0cba54e6dc21737c5ddb0883da45854eec928e3e39ff1434aec0323"
+ },
+ "wall_seconds": 817.1,
+ "node_docs_indexed": 85722,
+ "docs_per_second": 104.9,
+ "source_mb_per_second": 1.31,
+ "peak_rss_unit": "MiB (VmHWM kB / 1024) - the key says mb for compatibility with earlier result files",
+ "peak_rss_mb": {
+  "autoindex_process": 242.7,
+  "largest_single_process_in_autoindex_tree": 241.2,
+  "server": 25356.9,
+  "server_at_autoindex_exit": 25356.9,
+  "server_idle_before_run": 132.7
+ },
+ "server_memory_cap": "auto tier (see the node log)",
+ "server_breaker_engagements": 31,
+ "disk_bytes": {
+  "index_at_autoindex_exit": 608292835,
+  "index_settled": 605235632,
+  "index_settled_over_mbox": 0.564,
+  "state_dir_peak_during_run": 262950092
+ },
+ "loadavg_before": "1.54 1.67 2.02",
+ "loadavg_after": [
+  "2.34",
+  "2.10",
+  "2.02"
+ ],
+ "verify": {
+  "node_docs": 85722,
+  "mbox_docs": 85692,
+  "attachment_docs": 31731,
+  "needles": {
+   "body": {
+    "planted": 418,
+    "found_exactly_once": 329,
+    "found_in_overlapping_sections": 1,
+    "missing": 88,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 418
+   },
+   "latin1-8bit-body": {
+    "planted": 1160,
+    "found_exactly_once": 916,
+    "found_in_overlapping_sections": 0,
+    "missing": 244,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 1160
+   },
+   "cp1252-undeclared-body": {
+    "planted": 417,
+    "found_exactly_once": 335,
+    "found_in_overlapping_sections": 0,
+    "missing": 82,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 417
+   },
+   "after-unquoted-prose-from": {
+    "planted": 41,
+    "found_exactly_once": 32,
+    "found_in_overlapping_sections": 0,
+    "missing": 9,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 41
+   },
+   "pdf-attachment": {
+    "planted": 265,
+    "found_exactly_once": 216,
+    "found_in_overlapping_sections": 0,
+    "missing": 49,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 265
+   },
+   "text-attachment": {
+    "planted": 216,
+    "found_exactly_once": 178,
+    "found_in_overlapping_sections": 0,
+    "missing": 38,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 216
+   },
+   "keep-note": {
+    "planted": 12,
+    "found_exactly_once": 12,
+    "found_in_overlapping_sections": 0,
+    "missing": 0,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 12
+   },
+   "drive-markdown": {
+    "planted": 1,
+    "found_exactly_once": 1,
+    "found_in_overlapping_sections": 0,
+    "missing": 0,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 1
+   }
+  },
+  "needle_examples_of_failure": [
+   {
+    "missing": {
+     "message_id": "prosefrom-32000@example.org",
+     "token": "xqtonelubedo",
+     "where": "after-unquoted-prose-from"
+    },
+    "response_error": null
+   },
+   {
+    "missing": {
+     "message_id": "6e32c5de.032006@corp.example",
+     "token": "xqputorusobi",
+     "where": "cp1252-undeclared-body"
+    },
+    "response_error": null
+   },
+   {
+    "missing": {
+     "message_id": "0cf69ade.032010@corp.example",
+     "token": "xqcatamadege",
+     "where": "body"
+    },
+    "response_error": null
+   },
+   {
+    "missing": {
+     "message_id": "6e2df434.032011@example.org",
+     "token": "xqbozamucuru",
+     "where": "cp1252-undeclared-body"
+    },
+    "response_error": null
+   },
+   {
+    "missing": {
+     "message_id": "6d21845a.032018@example.org",
+     "token": "xqrorepakifa",
+     "where": "latin1-8bit-body"
+    },
+    "response_error": null
+   }
+  ],
+  "edges": {
+   "replies_to": {
+    "live": 0,
+    "stored_including_invalidated": 0,
+    "truth_resolvable_replies": 21544
+   },
+   "attachment_of": {
+    "live": 0,
+    "stored_including_invalidated": 0,
+    "attachment_docs": 31731
+   }
+  },
+  "sender_filter": {
+   "sampled": 40,
+   "term_matches_display_form": 40,
+   "mismatch": []
+  },
+  "subject_search": {
+   "sampled": 40,
+   "subject_found_in_body": 40,
+   "mismatch": []
+  },
+  "empty_no_subject_docs": 0,
+  "query_latency_seconds": {
+   "requests": 2700,
+   "total": 66.5,
+   "median": 0.0065,
+   "p95": 0.0075,
+   "max": 33.001,
+   "over_1s": 2,
+   "over_10s": 2
+  }
+ }
+}

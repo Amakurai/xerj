@@ -142,6 +142,16 @@ impl ResourceGovernor {
         Ok(())
     }
 
+    /// Whether the parent RSS memory breaker is currently engaged (issue
+    /// #948). Admission (429) is only half of the contract: the resource
+    /// sampler uses this same flag to request a memory-pressure DRAIN of
+    /// rebuildable state (flush + cache release), because a breaker that
+    /// only rejects never lets a workload whose caches hold gigabytes of
+    /// re-hydratable data make progress.
+    pub fn memory_breaker_engaged(&self) -> bool {
+        self.memory_tripped.load(Ordering::Relaxed)
+    }
+
     /// Disk flood-stage admission. Returns an ES-shaped
     /// `read_only_allow_delete` cluster block (HTTP 429) when the data-dir
     /// filesystem is over the flood-stage watermark. `index` names the
@@ -1586,6 +1596,31 @@ mod tests {
         // Recovery once usage drops back under the budget.
         g.refresh(10 * 1024 * 1024, 0, 0);
         assert!(g.check_ingest_admission().is_ok());
+    }
+
+    /// #948: the sampler's drain wiring keys on this accessor, so it must
+    /// track the RSS watermark latch exactly — engaging when the breaker
+    /// engages, releasing when it releases. A stale engaged reading drains
+    /// forever; a stale released one never drains at all.
+    #[test]
+    fn memory_breaker_engaged_tracks_the_rss_watermark() {
+        let mut cfg = Config::default();
+        cfg.limits.max_total_memtable_mb = 0; // isolate the RSS path
+        cfg.limits.memory_watermark_percent = 95;
+        let g = build(&cfg);
+        let watermark = g.memory_watermark_bytes;
+        assert!(watermark > 0, "this test needs a live RSS watermark");
+        assert!(!g.memory_breaker_engaged(), "fresh governor is disengaged");
+        g.refresh(0, watermark, 0);
+        assert!(
+            g.memory_breaker_engaged(),
+            "RSS at the watermark engages the breaker"
+        );
+        g.refresh(0, watermark / 2, 0);
+        assert!(
+            !g.memory_breaker_engaged(),
+            "RSS back under the watermark releases it"
+        );
     }
 
     #[test]

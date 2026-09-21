@@ -1,0 +1,158 @@
+{
+ "profile": "mixed",
+ "target_size": "1G",
+ "label": "capped16g-fix",
+ "extra_autoindex_flags": "",
+ "resumed_after_a_failed_run": false,
+ "autoindex_exit_code": 3,
+ "autoindex_last_line": "xerj-done ok=true exit=3 reason=completed-with-junk wall=407.6s files=16 records=107698 datasets=1 junk_files=2 code_files=0 code_files_indexed=0 code_files_junked=0",
+ "source": {
+  "mbox_bytes": 1073777879,
+  "tree_bytes": 1073794434,
+  "entries": 40799,
+  "attachments": {
+   "binary": 5698,
+   "pdf": 4261,
+   "text": 4300
+  },
+  "mbox_sha256": "4098bf60c0cba54e6dc21737c5ddb0883da45854eec928e3e39ff1434aec0323"
+ },
+ "wall_seconds": 407.7,
+ "node_docs_indexed": 107698,
+ "docs_per_second": 264.1,
+ "source_mb_per_second": 2.63,
+ "peak_rss_unit": "MiB (VmHWM kB / 1024) - the key says mb for compatibility with earlier result files",
+ "peak_rss_mb": {
+  "autoindex_process": 318.3,
+  "largest_single_process_in_autoindex_tree": 318.3,
+  "server": 21405.3,
+  "server_at_autoindex_exit": 21405.3,
+  "server_idle_before_run": 131.0
+ },
+ "server_memory_cap": "auto tier (see the node log)",
+ "server_breaker_engagements": 24,
+ "disk_bytes": {
+  "index_at_autoindex_exit": 776955683,
+  "index_settled": 776726956,
+  "index_settled_over_mbox": 0.723,
+  "state_dir_peak_during_run": 262950092
+ },
+ "loadavg_before": "4.87 2.63 2.19",
+ "loadavg_after": [
+  "5.50",
+  "5.42",
+  "6.60"
+ ],
+ "verify": {
+  "node_docs": 107698,
+  "mbox_docs": 107668,
+  "attachment_docs": 39619,
+  "needles": {
+   "body": {
+    "planted": 418,
+    "found_exactly_once": 417,
+    "found_in_overlapping_sections": 1,
+    "missing": 0,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 418
+   },
+   "latin1-8bit-body": {
+    "planted": 1160,
+    "found_exactly_once": 1160,
+    "found_in_overlapping_sections": 0,
+    "missing": 0,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 1160
+   },
+   "cp1252-undeclared-body": {
+    "planted": 417,
+    "found_exactly_once": 417,
+    "found_in_overlapping_sections": 0,
+    "missing": 0,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 417
+   },
+   "after-unquoted-prose-from": {
+    "planted": 41,
+    "found_exactly_once": 41,
+    "found_in_overlapping_sections": 0,
+    "missing": 0,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 41
+   },
+   "pdf-attachment": {
+    "planted": 265,
+    "found_exactly_once": 265,
+    "found_in_overlapping_sections": 0,
+    "missing": 0,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 265
+   },
+   "text-attachment": {
+    "planted": 216,
+    "found_exactly_once": 216,
+    "found_in_overlapping_sections": 0,
+    "missing": 0,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 216
+   },
+   "keep-note": {
+    "planted": 12,
+    "found_exactly_once": 12,
+    "found_in_overlapping_sections": 0,
+    "missing": 0,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 12
+   },
+   "drive-markdown": {
+    "planted": 1,
+    "found_exactly_once": 1,
+    "found_in_overlapping_sections": 0,
+    "missing": 0,
+    "duplicated": 0,
+    "wrong_message": 0,
+    "checked": 1
+   }
+  },
+  "needle_examples_of_failure": [],
+  "edges": {
+   "replies_to": {
+    "live": 21544,
+    "stored_including_invalidated": 21544,
+    "truth_resolvable_replies": 21544
+   },
+   "attachment_of": {
+    "live": 39619,
+    "stored_including_invalidated": 39619,
+    "attachment_docs": 39619
+   }
+  },
+  "sender_filter": {
+   "sampled": 0,
+   "term_matches_display_form": 0,
+   "mismatch": []
+  },
+  "subject_search": {
+   "sampled": 40,
+   "subject_found_in_body": 40,
+   "mismatch": []
+  },
+  "empty_no_subject_docs": 0,
+  "query_latency_seconds": {
+   "requests": 2619,
+   "total": 3055.9,
+   "median": 0.0092,
+   "p95": 5.5393,
+   "max": 71.549,
+   "over_1s": 509,
+   "over_10s": 18
+  }
+ }
+}
