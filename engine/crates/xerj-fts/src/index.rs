@@ -80,6 +80,46 @@ fn segment_uses_encoded_filename_layout(segment_dir: &Path, segment_id: &str) ->
     }
 }
 
+/// Per-segment record of the analyzer each field's postings were built with
+/// (#937). Written by [`FtsIndexWriter::finish`] as JSON
+/// `{"fields":{"<field>":"<analyzer>"}}`, but ONLY when some field was
+/// indexed with an analyzer other than `standard` — an index that declares
+/// no analyzers produces byte- and directory-identical flushes to a
+/// pre-#937 build.
+///
+/// The consumer is the engine's merge gate (`fts_merge_readers`): a merge
+/// may replay input postings verbatim only when they were produced by the
+/// same analyzer the merge output would use. Segments written by pre-#937
+/// builds have no marker; their text postings are `standard` by
+/// construction, which is exactly what absence reports.
+const FTS_ANALYZER_MARKER_SUFFIX: &str = "ftsan";
+
+fn segment_analyzer_marker_path(segment_dir: &Path, segment_id: &str) -> PathBuf {
+    segment_dir.join(format!("{segment_id}.{FTS_ANALYZER_MARKER_SUFFIX}"))
+}
+
+/// The per-field analyzers a segment's FTS side-cars were written with.
+///
+/// `None` (file absent or unreadable) means "no field deviates from
+/// `standard`" — the pre-#937 state. An unreadable marker on a segment
+/// that WAS written with a declared analyzer can only come from
+/// post-publication corruption; reporting `None` keeps the merge gate
+/// conservative in the direction of re-analysis whenever the expected
+/// analyzer is not `standard`, and is exactly yesterday's behaviour when
+/// it is.
+pub fn segment_recorded_analyzers(
+    segment_dir: &Path,
+    segment_id: &str,
+) -> Option<HashMap<String, String>> {
+    #[derive(serde::Deserialize)]
+    struct Marker {
+        fields: HashMap<String, String>,
+    }
+    let bytes = fs::read(segment_analyzer_marker_path(segment_dir, segment_id)).ok()?;
+    let parsed: Marker = serde_json::from_slice(&bytes).ok()?;
+    Some(parsed.fields)
+}
+
 fn is_windows_reserved_device_name(field: &str) -> bool {
     let stem = field.split('.').next().unwrap_or(field);
     if ["CON", "PRN", "AUX", "NUL"]
@@ -739,6 +779,29 @@ impl FtsIndexWriter {
         }
     }
 
+    /// The configuration an UNCONFIGURED field is indexed with.
+    ///
+    /// Pre-#937 this was always [`FieldIndexConfig::default`]
+    /// (`standard`). It now resolves the registry's `default` analyzer
+    /// when the index settings declared one, so a dynamically-mapped
+    /// field that never entered `build_fts_field_configs` is analysed
+    /// the same way at flush as the memtable analysed it at insert
+    /// (`get_analyzer("default").or_else(standard)`). With no declared
+    /// `default` the resolution is `standard` and behaviour is
+    /// unchanged.
+    fn unconfigured_field_config(registry: &AnalyzerRegistry) -> FieldIndexConfig {
+        let analyzer = if registry.get_analyzer("default").is_some() {
+            "default"
+        } else {
+            "standard"
+        };
+        FieldIndexConfig {
+            analyzer: analyzer.to_owned(),
+            store_positions: true,
+            store_term_vectors: false,
+        }
+    }
+
     /// Re-encode this segment's `.meta` / `.post` at `level` instead of the
     /// flush default [`ZSTD_DURABLE_LEVEL`].
     ///
@@ -850,7 +913,7 @@ impl FtsIndexWriter {
                 self.fields.insert(
                     field_name.clone(),
                     FieldData {
-                        config: FieldIndexConfig::default(),
+                        config: Self::unconfigured_field_config(&registry),
                         postings: PostingsWriter::new(),
                         stats: FieldStats::default(),
                         norms: Vec::new(),
@@ -922,7 +985,7 @@ impl FtsIndexWriter {
                 self.fields.insert(
                     name.clone(),
                     FieldData {
-                        config: FieldIndexConfig::default(),
+                        config: Self::unconfigured_field_config(&self.registry),
                         postings: PostingsWriter::new(),
                         stats: FieldStats::default(),
                         norms: Vec::new(),
@@ -947,7 +1010,10 @@ impl FtsIndexWriter {
         let built: Vec<(String, FieldData)> = per_field_vec
             .into_par_iter()
             .map(|(field_name, entries)| {
-                let cfg = field_configs.get(&field_name).cloned().unwrap_or_default();
+                let cfg = field_configs
+                    .get(&field_name)
+                    .cloned()
+                    .unwrap_or_else(|| Self::unconfigured_field_config(&registry));
                 let analyzer = registry
                     .get_analyzer(&cfg.analyzer)
                     .or_else(|| registry.get_analyzer("standard"))
@@ -1104,6 +1170,31 @@ impl FtsIndexWriter {
                 (name, stats, fd)
             })
             .collect();
+
+        // #937 — record which analyzer each field's postings were built
+        // with, but only when some field deviates from `standard`. The
+        // engine's merge gate reads this to refuse replaying postings
+        // into a term space they were not produced by (a pre-#937
+        // `standard` segment inside an index that now honours a declared
+        // `default`). An index that declares nothing writes no marker, so
+        // its flushes stay byte- and directory-identical to a pre-#937
+        // build.
+        let recorded: HashMap<&str, &str> = fields
+            .iter()
+            .map(|(name, _stats, fd)| (name.as_str(), fd.config.analyzer.as_str()))
+            .filter(|(_name, analyzer)| *analyzer != "standard")
+            .collect();
+        if !recorded.is_empty() {
+            #[derive(serde::Serialize)]
+            struct Marker<'a> {
+                fields: HashMap<&'a str, &'a str>,
+            }
+            let bytes = serde_json::to_vec(&Marker { fields: recorded })
+                .with_context(|| "encoding FTS analyzer marker")?;
+            let path = segment_analyzer_marker_path(&segment_dir, &segment_id);
+            xerj_common::fsio::write_file_durable(&path, &bytes)
+                .with_context(|| format!("writing FTS analyzer marker {:?}", path))?;
+        }
 
         // Parallel field writes.  `write_field_static` is a pure function
         // of its inputs and touches only files named after the field, so
@@ -2274,6 +2365,120 @@ mod tests {
 
     fn make_registry() -> Arc<AnalyzerRegistry> {
         Arc::new(AnalyzerRegistry::default())
+    }
+
+    /// A registry built the way the engine builds one for
+    /// `settings.analysis.analyzer.default = {"type": "english"}` — the
+    /// built-in `english` pipeline registered under the name `default`.
+    fn english_default_registry() -> Arc<AnalyzerRegistry> {
+        let mut registry = AnalyzerRegistry::default();
+        registry.apply_settings(&serde_json::json!({
+            "analysis": {"analyzer": {"default": {"type": "english"}}}
+        }));
+        assert!(
+            registry.get_analyzer("default").is_some(),
+            "fixture: the declared default must resolve"
+        );
+        Arc::new(registry)
+    }
+
+    /// #937: a writer whose registry declares a `default` analyzer records
+    /// it per field; a writer with no declaration writes no marker at all
+    /// (byte- and directory-identical flushes for indexes that declare
+    /// nothing).
+    #[test]
+    fn analyzer_marker_written_only_for_non_standard_analysis() {
+        let plain = TempDir::new().unwrap();
+        let mut writer = FtsIndexWriter::new(plain.path(), "seg0", make_registry());
+        writer.configure_field(
+            "body",
+            FieldIndexConfig {
+                analyzer: "standard".to_owned(),
+                store_positions: true,
+                store_term_vectors: false,
+            },
+        );
+        let document = [("body".to_owned(), FieldValues::from("fast car"))]
+            .into_iter()
+            .collect();
+        writer.add_document(0, &document);
+        writer.finish().unwrap();
+        assert!(
+            segment_recorded_analyzers(plain.path(), "seg0").is_none(),
+            "an all-standard segment must not grow a marker file"
+        );
+        assert!(
+            !plain.path().join("seg0.ftsan").exists(),
+            "the directory must stay identical to a pre-#937 flush"
+        );
+
+        let declared = TempDir::new().unwrap();
+        let registry = english_default_registry();
+        let mut writer = FtsIndexWriter::new(declared.path(), "seg0", Arc::clone(&registry));
+        writer.configure_field(
+            "body",
+            FieldIndexConfig {
+                analyzer: "default".to_owned(),
+                store_positions: true,
+                store_term_vectors: false,
+            },
+        );
+        writer.configure_field(
+            "tag",
+            FieldIndexConfig {
+                analyzer: "keyword".to_owned(),
+                store_positions: false,
+                store_term_vectors: false,
+            },
+        );
+        let document = [
+            ("body".to_owned(), FieldValues::from("the bagels")),
+            ("tag".to_owned(), FieldValues::from("GET")),
+        ]
+        .into_iter()
+        .collect();
+        writer.add_document(0, &document);
+        writer.finish().unwrap();
+        let recorded = segment_recorded_analyzers(declared.path(), "seg0")
+            .expect("a segment with non-standard fields records its analyzers");
+        assert_eq!(recorded.get("body").map(String::as_str), Some("default"));
+        assert_eq!(recorded.get("tag").map(String::as_str), Some("keyword"));
+    }
+
+    /// #937: an UNCONFIGURED field is analysed with the registry's declared
+    /// `default` (matching the memtable's insert path), and with `standard`
+    /// when nothing is declared.
+    #[test]
+    fn unconfigured_field_follows_the_declared_default() {
+        let dir = TempDir::new().unwrap();
+
+        // Declared english default: `bagels` stems to `bagel`, `the` drops.
+        let registry = english_default_registry();
+        let mut writer = FtsIndexWriter::new(dir.path(), "seg0", registry);
+        let document = [("t".to_owned(), FieldValues::from("the bagels"))]
+            .into_iter()
+            .collect();
+        writer.add_document(0, &document);
+        writer.finish().unwrap();
+        let reader = FtsIndexReader::open(dir.path(), "seg0", &["t"]).unwrap();
+        assert!(reader.term_exists("t", "bagel"), "stemmed token present");
+        assert!(!reader.term_exists("t", "bagels"), "unstemmed token absent");
+        assert!(!reader.term_exists("t", "the"), "stop-word dropped");
+        let recorded = segment_recorded_analyzers(dir.path(), "seg0").unwrap();
+        assert_eq!(recorded.get("t").map(String::as_str), Some("default"));
+
+        // No declaration: `standard` keeps `bagels` whole and `the` present.
+        let dir2 = TempDir::new().unwrap();
+        let mut writer = FtsIndexWriter::new(dir2.path(), "seg0", make_registry());
+        let document = [("t".to_owned(), FieldValues::from("the bagels"))]
+            .into_iter()
+            .collect();
+        writer.add_document(0, &document);
+        writer.finish().unwrap();
+        let reader = FtsIndexReader::open(dir2.path(), "seg0", &["t"]).unwrap();
+        assert!(reader.term_exists("t", "bagels"));
+        assert!(reader.term_exists("t", "the"));
+        assert!(segment_recorded_analyzers(dir2.path(), "seg0").is_none());
     }
 
     #[test]

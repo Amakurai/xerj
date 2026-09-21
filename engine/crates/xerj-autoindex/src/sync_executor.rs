@@ -13,7 +13,7 @@ use crate::sync::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -46,6 +46,18 @@ pub struct SnapshotFile {
     pub relative_blob: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared: Option<PreparedArtifact>,
+    /// #971: identity of every input `prepare_artifact` consumes for THIS file
+    /// (chunker identity, document-id identity, the file's assignment, its
+    /// alias paths, the datasets it routes to). A later generation whose file
+    /// carries the same content digest AND the same identity reuses the sealed
+    /// blob and prepared artifact via hardlink instead of re-copying,
+    /// re-verifying and re-extracting, which is what makes a one-file change
+    /// cost O(changed) rather than O(corpus). Skip-serialized so a manifest
+    /// sealed before this field existed keeps hashing to the digest the journal
+    /// recorded — the same rule `records_by_dataset` follows above. `None` on
+    /// this file therefore also means "a pre-#971 snapshot: never reuse".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_identity: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,6 +177,17 @@ impl Drop for StagingCleanup {
     }
 }
 
+/// One operation this replay attempt still owes, with the name and byte
+/// weight the progress surface reports for it. Precomputed once by
+/// [`replay_pending_operations`] so the serial loop and the parallel
+/// scheduler (#933) describe every operation identically — and so a worker
+/// thread never needs the group maps the fields were derived from.
+pub struct ReplayItem<'o> {
+    pub operation: &'o SyncOperation,
+    pub rel: String,
+    pub bytes: u64,
+}
+
 /// Remote mutations must be convergent: calling `apply` twice for one
 /// operation after an accepted-but-unrecorded response must produce exactly
 /// the same live state. `validate` is the final generation-wide barrier.
@@ -218,6 +241,170 @@ pub trait SyncOperationBackend {
 
     /// The operation started by [`Self::operation_begins`] has been applied.
     fn operation_applied(&mut self) {}
+
+    /// Apply `items` — the operations this attempt still owes, in operation
+    /// order — journaling each one through `journal`.
+    ///
+    /// The default is the historical serial loop: `Started`, apply,
+    /// `Committed`, one operation at a time. [`EsSyncBackend`] overrides it
+    /// (#933) with a windowed scheduler when the run asked for more than one
+    /// worker: one plan gives every group at most one operation
+    /// (`plan_operations` emits at most one per group id), and an operation's
+    /// writes are keyed by its group's content id, so two operations' writes
+    /// never touch the same documents. The per-operation durable order is
+    /// exactly the serial contract, overlapped — `Started` is journaled
+    /// before the operation is dispatched, `Committed` after its apply
+    /// returned, so a crash mid-window repeats precisely the operations
+    /// whose accepted apply was not recorded, and `apply` stays convergent
+    /// for exactly that retry.
+    fn replay_operations(
+        &mut self,
+        items: &[ReplayItem<'_>],
+        base: &CommittedManifest,
+        desired: &GenerationManifest,
+        snapshot: &SourceSnapshot,
+        journal: &mut Journal,
+    ) -> Result<()> {
+        replay_serial(self, items, base, desired, snapshot, journal)
+    }
+}
+
+/// The historical serial replay: one operation at a time, journaling
+/// `Started` before its apply and `Committed` after it.
+fn replay_serial<B: SyncOperationBackend + ?Sized>(
+    backend: &mut B,
+    items: &[ReplayItem<'_>],
+    base: &CommittedManifest,
+    desired: &GenerationManifest,
+    snapshot: &SourceSnapshot,
+    journal: &mut Journal,
+) -> Result<()> {
+    for item in items {
+        let operation = item.operation;
+        let state = journal
+            .pending_sync
+            .as_ref()
+            .and_then(|sync| sync.operation_states.get(&operation.operation_id))
+            .cloned();
+        if state == Some(SyncOperationState::Committed) {
+            continue;
+        }
+        if state.is_none() {
+            journal.sync_operation_state(&operation.operation_id, SyncOperationState::Started)?;
+        }
+        backend.operation_begins(&item.rel, item.bytes);
+        backend.apply(operation, base, desired, snapshot)?;
+        replay_fail_after_apply()?;
+        journal.sync_operation_state(&operation.operation_id, SyncOperationState::Committed)?;
+        backend.operation_applied();
+    }
+    Ok(())
+}
+
+/// The journal-side callbacks of [`replay_windowed`], one object so the
+/// caller's mutable state — the journal — is borrowed once, not once per
+/// closure.
+pub(crate) trait ReplayHooks<T> {
+    /// Called on the scheduling thread before the item is dispatched.
+    fn begin(&mut self, item: &T) -> Result<()>;
+    /// Called on the scheduling thread, in dispatch order, as each item's
+    /// apply finishes. Returning an error stops all further dispatch.
+    fn applied(&mut self, item: &T, outcome: Result<()>) -> Result<()>;
+}
+
+/// #933: apply `items` through a window at most `width` items wide.
+///
+/// This is the whole concurrency policy of the parallel replay, kept free of
+/// ES, journal and progress detail so it can be unit-tested without a
+/// server. [`ReplayHooks::begin`] runs on the calling thread before an item
+/// is dispatched — where the serial loop journals `Started`; `apply` runs on
+/// worker threads and may overlap with other items' `apply`;
+/// [`ReplayHooks::applied`] runs on the calling thread, in dispatch order,
+/// as each item finishes — where the serial loop journals `Committed`.
+/// Completions are joined head-first, so `applied` sees items in exactly the
+/// order they were begun, which is what keeps the journal a serial reader
+/// can follow.
+///
+/// Failure semantics are the serial loop's plus one honest addition the
+/// overlap forces, and they run through `applied`: the first `applied` that
+/// returns an error stops all further dispatch, everything already
+/// dispatched is drained to completion, and `applied` is still called for
+/// each drained item so the caller can journal the applies the server did
+/// accept. On the serial loop nothing else was in flight when an apply
+/// failed, so its behaviour is unchanged; overlapped, skipping the
+/// `Committed` write for an apply that already landed would only force a
+/// convergent redo of it on resume. A caller that deliberately accepts a
+/// failed outcome by returning `Ok` keeps the run going — the scheduler
+/// trusts `applied`, not the outcome. The first error is the return value;
+/// later errors are handed to `applied` and otherwise dropped, because the
+/// first failure is the one a retry of the same command will meet again.
+pub(crate) fn replay_windowed<T: Sync>(
+    items: &[T],
+    width: usize,
+    hooks: &mut dyn ReplayHooks<T>,
+    apply: &(dyn Fn(&T) -> Result<()> + Sync),
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    if width <= 1 || items.len() == 1 {
+        // No overlap is possible; same callbacks, same order, no threads.
+        for item in items {
+            hooks.begin(item)?;
+            hooks.applied(item, apply(item))?;
+        }
+        return Ok(());
+    }
+    let failure = std::thread::scope(|scope| -> Result<Option<anyhow::Error>> {
+        let mut next = items.iter();
+        let mut in_flight: std::collections::VecDeque<(
+            &T,
+            std::thread::ScopedJoinHandle<'_, Result<()>>,
+        )> = std::collections::VecDeque::new();
+        let mut failure: Option<anyhow::Error> = None;
+        loop {
+            while failure.is_none() && in_flight.len() < width {
+                // `begin` is the Started write: it happens on THIS thread,
+                // before the operation exists remotely, so an operation that
+                // was never dispatched is also never recorded as begun.
+                let Some(item) = next.next() else { break };
+                hooks.begin(item)?;
+                let dispatched = item;
+                in_flight.push_back((item, scope.spawn(move || apply(dispatched))));
+            }
+            let Some((item, handle)) = in_flight.pop_front() else {
+                break;
+            };
+            let outcome = handle.join().unwrap_or_else(|panic| {
+                Err(anyhow::anyhow!(
+                    "replay apply panicked: {}",
+                    panic_message(panic)
+                ))
+            });
+            let reported = hooks.applied(item, outcome);
+            if let (None, Err(error)) = (&failure, reported) {
+                // First failure stops dispatch; the drain still reports.
+                failure = Some(error);
+            }
+        }
+        Ok(failure)
+    })?;
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// The message of a panicking worker, when it carried one — a panic is not an
+/// ES answer and must not look like one.
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else {
+        "no message".to_owned()
+    }
 }
 
 /// Production ES-compatible operation backend for graph-disabled generations.
@@ -246,6 +433,10 @@ pub struct EsSyncBackend<'a> {
     /// The operation the replay loop is inside; dropping it counts the
     /// operation done and clears it from the surface's in-flight table.
     in_flight: Option<crate::progress::FileGuard<'a>>,
+    /// #933: how many operations [`Self::replay_operations`] may have in
+    /// flight at once. `1` — the default — is the historical serial loop,
+    /// and what every run without `--workers` beyond it configures.
+    replay_workers: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -263,12 +454,22 @@ impl<'a> EsSyncBackend<'a> {
             pr,
             installed_index_identity: None,
             in_flight: None,
+            replay_workers: 1,
         }
     }
 
     /// See `installed_index_identity`.
     pub fn with_installed_mappings(mut self, index_identity: String) -> Self {
         self.installed_index_identity = Some(index_identity);
+        self
+    }
+
+    /// Set the replay window width (#933). Production passes the run's
+    /// `--workers` — the same number that already bounds the run's bulk
+    /// admission window, so the operations share one AIMD gate with the
+    /// bulks they send and a 429 shrinks what THIS path offers too.
+    pub fn with_replay_workers(mut self, workers: usize) -> Self {
+        self.replay_workers = workers.max(1);
         self
     }
 
@@ -280,6 +481,57 @@ impl<'a> EsSyncBackend<'a> {
                     "ax_file": &group.content_id
                 }}),
             )?;
+        }
+        Ok(())
+    }
+
+    /// The remote work of one operation, through a shared reference: the
+    /// windowed replay (#933) runs this from several worker threads at once,
+    /// over operations whose groups — and therefore whose documents, selected
+    /// by `ax_file` content id — are disjoint. The body is the serial loop's
+    /// `apply`, unchanged; only the receiver changed.
+    fn apply_shared(
+        &self,
+        operation: &SyncOperation,
+        base: &CommittedManifest,
+        desired: &GenerationManifest,
+        snapshot: &SourceSnapshot,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            desired
+                .execution
+                .as_ref()
+                .is_some_and(|execution| !execution.graph_enabled),
+            "production incremental graph reconciliation is not enabled yet"
+        );
+        let old = base
+            .groups
+            .iter()
+            .find(|group| group.group_id == operation.group_id);
+        let new = desired
+            .groups
+            .iter()
+            .find(|group| group.group_id == operation.group_id);
+        match operation.kind {
+            crate::sync::SyncOperationKind::Delete => self.delete_group(
+                old.context("delete operation has no committed group")?,
+                &base.plan,
+            )?,
+            crate::sync::SyncOperationKind::Upsert => {
+                if let Some(old) = old {
+                    self.delete_group(old, &base.plan)?;
+                }
+                let new = new.context("upsert operation has no desired group")?;
+                // Remove a partial prior retry of the desired identity too.
+                self.delete_group(new, &desired.plan)?;
+                self.replay_prepared(snapshot, &new.content_id)?;
+            }
+            crate::sync::SyncOperationKind::Metadata => {
+                self.replay_metadata(
+                    base,
+                    new.context("metadata operation has no desired group")?,
+                )?;
+            }
         }
         Ok(())
     }
@@ -610,43 +862,77 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
         desired: &GenerationManifest,
         snapshot: &SourceSnapshot,
     ) -> Result<()> {
+        self.apply_shared(operation, base, desired, snapshot)
+    }
+
+    fn replay_operations(
+        &mut self,
+        items: &[ReplayItem<'_>],
+        base: &CommittedManifest,
+        desired: &GenerationManifest,
+        snapshot: &SourceSnapshot,
+        journal: &mut Journal,
+    ) -> Result<()> {
+        let width = self.replay_workers;
+        if width <= 1 || items.len() <= 1 {
+            return replay_serial(self, items, base, desired, snapshot, journal);
+        }
+        // The durability argument of the overlap rests on disjoint groups:
+        // one plan gives a group at most one operation (`plan_operations`
+        // walks base and desired by group id), so no two in-flight
+        // operations ever write the same documents. Refuse here rather
+        // than silently corrupt if a future planner breaks that.
+        let mut groups = std::collections::BTreeSet::new();
         anyhow::ensure!(
-            desired
-                .execution
-                .as_ref()
-                .is_some_and(|execution| !execution.graph_enabled),
-            "production incremental graph reconciliation is not enabled yet"
+            items
+                .iter()
+                .all(|item| groups.insert(item.operation.group_id.as_str())),
+            "parallel replay requires at most one operation per group; this plan needs the \
+             serial loop"
         );
-        let old = base
-            .groups
-            .iter()
-            .find(|group| group.group_id == operation.group_id);
-        let new = desired
-            .groups
-            .iter()
-            .find(|group| group.group_id == operation.group_id);
-        match operation.kind {
-            crate::sync::SyncOperationKind::Delete => self.delete_group(
-                old.context("delete operation has no committed group")?,
-                &base.plan,
-            )?,
-            crate::sync::SyncOperationKind::Upsert => {
-                if let Some(old) = old {
-                    self.delete_group(old, &base.plan)?;
+        let this: &EsSyncBackend<'_> = self;
+        let pr = this.pr;
+        let apply = |item: &ReplayItem<'_>| {
+            // The in-flight entry IS this worker's file: the guard counts the
+            // item done on every exit path, exactly as the serial loop's
+            // `operation_begins`/`operation_applied` pair does (#931).
+            let _guard = pr.file(&item.rel, item.bytes);
+            this.apply_shared(item.operation, base, desired, snapshot)
+        };
+        /// The serial loop's two journal writes, verbatim: Started before
+        /// dispatch, Committed after the apply returned — the durable order
+        /// #933 must not change, only overlap it.
+        struct JournalHooks<'j> {
+            journal: &'j mut Journal,
+        }
+        impl ReplayHooks<ReplayItem<'_>> for JournalHooks<'_> {
+            fn begin(&mut self, item: &ReplayItem<'_>) -> Result<()> {
+                let state = self
+                    .journal
+                    .pending_sync
+                    .as_ref()
+                    .and_then(|sync| sync.operation_states.get(&item.operation.operation_id))
+                    .cloned();
+                if state.is_none() {
+                    self.journal.sync_operation_state(
+                        &item.operation.operation_id,
+                        SyncOperationState::Started,
+                    )?;
                 }
-                let new = new.context("upsert operation has no desired group")?;
-                // Remove a partial prior retry of the desired identity too.
-                self.delete_group(new, &desired.plan)?;
-                self.replay_prepared(snapshot, &new.content_id)?;
+                Ok(())
             }
-            crate::sync::SyncOperationKind::Metadata => {
-                self.replay_metadata(
-                    base,
-                    new.context("metadata operation has no desired group")?,
-                )?;
+
+            fn applied(&mut self, item: &ReplayItem<'_>, outcome: Result<()>) -> Result<()> {
+                let () = outcome?;
+                replay_fail_after_apply()?;
+                self.journal.sync_operation_state(
+                    &item.operation.operation_id,
+                    SyncOperationState::Committed,
+                )
             }
         }
-        Ok(())
+        let mut hooks = JournalHooks { journal };
+        replay_windowed(items, width, &mut hooks, &apply)
     }
 
     fn publish_generation_catalog(
@@ -678,11 +964,6 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
                     }
                     SourceExecutionPolicy::AbortOnSourceChange { .. } => None,
                 });
-        let prior_documents = prior_run_id
-            .map(|run_id| self.catalog_generation(run_id))
-            .transpose()?
-            .unwrap_or_default();
-        let prior_ids = prior_documents.keys().cloned().collect();
         let stats = self.exact_dataset_catalog_stats(desired)?;
         let projection = crate::generation_catalog::project_generation(
             base,
@@ -693,7 +974,7 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
             },
             &stats,
             &BTreeMap::new(),
-            &prior_ids,
+            &BTreeSet::new(),
         )?;
         let mut body = Vec::new();
         for id in &projection.stale_ids {
@@ -710,15 +991,38 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
         // sent as ONE request under an 8 MB `--bulk-mb`, and the engine's
         // 50,000-action limit ended the run here after every operation had
         // been applied. Windowed like every other bulk; deletes stay first.
+        // #971: the projection is now incremental — a one-file change sends
+        // that file's document (plus datasets and the run document), not one
+        // document per file in the corpus.
         checked_bulk_windowed(self.es, body, self.bulk_bytes)?;
         self.es.refresh(crate::catalog::CATALOG_INDEX)?;
+        // Exactly the documents this generation wrote carry its run_id (kept
+        // documents keep the run_id of the generation that last touched them),
+        // so the run_id-scoped read-back is O(changed) by construction.
         projection.validate_observed(&self.catalog_generation(&snapshot.tx_id)?)?;
         if let Some(prior_run_id) = prior_run_id {
+            // #971 sweep. Documents still carrying the prior generation's
+            // run_id are legitimate — they are the intentionally kept
+            // (unchanged) ones — but NOTHING ELSE may: every id the prior
+            // generation published was either rewritten (new run_id), deleted
+            // (stale), or kept, and the prior generation's own exact
+            // read-back proved its published set matched its projection. A
+            // document surviving under the prior run_id that this projection
+            // did not keep is a stray the publication failed to account for.
+            // A kept document may legitimately be absent here (a same-prefix
+            // journal on another state-dir may have overwritten it — the
+            // documented cross-journal collision), so the check is a subset
+            // check, not equality.
             let remaining = self.catalog_generation(prior_run_id)?;
+            let written: BTreeSet<String> = projection.documents.keys().cloned().collect();
+            let kept: BTreeSet<&String> = projection.managed_ids.difference(&written).collect();
+            let strays: Vec<&String> = remaining.keys().filter(|id| !kept.contains(id)).collect();
             anyhow::ensure!(
-                remaining.is_empty(),
-                "prior catalog generation {prior_run_id} still has {} managed documents",
-                remaining.len()
+                strays.is_empty(),
+                "prior catalog generation {prior_run_id} still has {} document(s) this generation \
+                 neither rewrote, deleted nor kept: {:?}",
+                strays.len(),
+                strays
             );
         }
         Ok(())
@@ -751,13 +1055,31 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
             let _refreshing = self.pr.file(crate::catalog::CATALOG_INDEX, 0);
             self.es.refresh(crate::catalog::CATALOG_INDEX)?;
         }
-        // The generation-wide barrier reads every group back — three queries
-        // per file, serially — so on a large corpus it is minutes of work. It
-        // reports as its own phase with the group count as its denominator
-        // instead of hiding behind whatever phase came before it.
+        // The generation-wide barrier reads changed groups back — three
+        // queries per file, serially — so on a large corpus it is minutes of
+        // work. It reports as its own phase with the changed-group count as
+        // its denominator instead of hiding behind whatever phase came before
+        // it.
+        //
+        // #971: a group wholly equal to its committed self is skipped. That
+        // equality is exactly the condition under which `plan_operations`
+        // planned no operation — nothing this generation wrote can have moved
+        // its live counts, and its read-back was exact at the barrier of the
+        // generation that last touched it. Verifying it again every run is
+        // what made a one-file change cost O(corpus) queries.
+        let base_group_by_id: BTreeMap<&str, &ManifestGroup> = base
+            .groups
+            .iter()
+            .map(|group| (group.group_id.as_str(), group))
+            .collect();
+        let changed_groups: Vec<&ManifestGroup> = desired
+            .groups
+            .iter()
+            .filter(|group| base_group_by_id.get(group.group_id.as_str()).copied() != Some(*group))
+            .collect();
         self.pr
-            .phase("finalize-verify", desired.groups.len() as u64, 0);
-        for group in &desired.groups {
+            .phase("finalize-verify", changed_groups.len() as u64, 0);
+        for group in changed_groups {
             let _verifying = self.pr.file(&group.canonical.rel, 0);
             anyhow::ensure!(
                 self.exact_group_count(group, &desired.plan)? == group.expected_records,
@@ -780,7 +1102,10 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
             // this one's: counting them aborted a generation whose own
             // publication was exactly right (#360). What this barrier is for is
             // "this generation published one canonical document and its aliases",
-            // and that is what it now asks.
+            // and that is what it now asks. For the same #971 reason as the
+            // record counts above, only changed groups ask — a kept group's
+            // canonical/alias documents intentionally keep the run_id of the
+            // generation that last wrote them.
             let catalog = self.es.search(
                 crate::catalog::CATALOG_INDEX,
                 &serde_json::json!({
@@ -902,38 +1227,28 @@ pub fn replay_pending_operations(
         .iter()
         .filter(|operation| !committed(journal, operation))
         .collect();
+    // #931: what the loop reports per operation — its source path and its
+    // sealed bytes — resolved once here, so the serial loop and the windowed
+    // scheduler (#933) name and measure every operation identically.
+    let items: Vec<ReplayItem> = remaining
+        .iter()
+        .map(|operation| ReplayItem {
+            operation,
+            rel: desired_by_group
+                .get(operation.group_id.as_str())
+                .or_else(|| base_by_group.get(operation.group_id.as_str()))
+                .map_or(operation.group_id.as_str(), |group| {
+                    group.canonical.rel.as_str()
+                })
+                .to_owned(),
+            bytes: operation_bytes(operation),
+        })
+        .collect();
     backend.replay_begins(
-        remaining.len() as u64,
-        remaining
-            .iter()
-            .map(|operation| operation_bytes(operation))
-            .sum(),
+        items.len() as u64,
+        items.iter().map(|item| item.bytes).sum(),
     );
-
-    for operation in &pending.operations {
-        let state = journal
-            .pending_sync
-            .as_ref()
-            .and_then(|sync| sync.operation_states.get(&operation.operation_id))
-            .cloned();
-        if state == Some(SyncOperationState::Committed) {
-            continue;
-        }
-        if state.is_none() {
-            journal.sync_operation_state(&operation.operation_id, SyncOperationState::Started)?;
-        }
-        let rel = desired_by_group
-            .get(operation.group_id.as_str())
-            .or_else(|| base_by_group.get(operation.group_id.as_str()))
-            .map_or(operation.group_id.as_str(), |group| {
-                group.canonical.rel.as_str()
-            });
-        backend.operation_begins(rel, operation_bytes(operation));
-        backend.apply(operation, &base, &pending.desired, &snapshot)?;
-        replay_fail_after_apply()?;
-        journal.sync_operation_state(&operation.operation_id, SyncOperationState::Committed)?;
-        backend.operation_applied();
-    }
+    backend.replay_operations(&items, &base, &pending.desired, &snapshot, journal)?;
     backend.publish_generation_catalog(&base, &pending.desired, &snapshot)?;
     backend.validate(&base, &pending.desired, &snapshot)?;
     journal.sync_validated()?;
@@ -1175,7 +1490,7 @@ fn verify_snapshot_binding(pending: &PendingSync, snapshot: &SourceSnapshot) -> 
     Ok(())
 }
 
-fn open_committed_snapshot(
+pub(crate) fn open_committed_snapshot(
     state_dir: &Path,
     committed: &CommittedManifest,
 ) -> Result<SourceSnapshot> {
@@ -1508,6 +1823,8 @@ pub fn create_snapshot(
         "source-snapshot-v1",
         u64::MAX,
         &crate::progress::Progress::silent(),
+        None,
+        "",
     )
 }
 
@@ -1531,6 +1848,10 @@ pub fn create_prepared_snapshot(
         preparation_contract_digest,
         hard_budget_bytes,
         &crate::progress::Progress::silent(),
+        // Test-only wrapper: these snapshots are never handed back as a reuse
+        // source, so the chunker identity they seal is a fixed label.
+        None,
+        "prepared-records-v1",
     )
 }
 
@@ -1541,6 +1862,14 @@ pub fn create_prepared_snapshot(
 /// the corpus that produced #931 it is minutes of work. It used to run with no
 /// phase of its own, so the stream kept describing the `scan` that had already
 /// finished. It is now the `snapshot` phase, with a byte denominator.
+///
+/// #971: `reuse` is the prior *committed* generation's snapshot. A file whose
+/// content digest and preparation identity both match its entry there is
+/// hardlinked from it instead of being re-copied and re-extracted, so a
+/// one-file change seals O(changed) new bytes. `chunker_identity` is the run's
+/// `prepared_records_identity` and becomes part of each file's sealed
+/// preparation identity.
+#[allow(clippy::too_many_arguments)]
 pub fn create_prepared_snapshot_reporting(
     state_dir: &Path,
     tx_id: &str,
@@ -1549,6 +1878,8 @@ pub fn create_prepared_snapshot_reporting(
     preparation_contract_digest: &str,
     hard_budget_bytes: u64,
     pr: &crate::progress::Progress,
+    reuse: Option<&SourceSnapshot>,
+    chunker_identity: &str,
 ) -> Result<SourceSnapshot> {
     create_snapshot_inner(
         state_dir,
@@ -1558,9 +1889,12 @@ pub fn create_prepared_snapshot_reporting(
         preparation_contract_digest,
         hard_budget_bytes,
         pr,
+        reuse,
+        chunker_identity,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_snapshot_inner(
     state_dir: &Path,
     tx_id: &str,
@@ -1569,6 +1903,8 @@ fn create_snapshot_inner(
     preparation_contract_digest: &str,
     hard_budget_bytes: u64,
     pr: &crate::progress::Progress,
+    reuse: Option<&SourceSnapshot>,
+    chunker_identity: &str,
 ) -> Result<SourceSnapshot> {
     validate_tx_id(tx_id)?;
     ensure_inventory_lengths(inventory)?;
@@ -1639,6 +1975,30 @@ fn create_snapshot_inner(
         used: 0,
         limit: hard_budget_bytes,
     };
+    // #971: the reuse index. Sealing is O(corpus) because every file is
+    // re-copied, re-verified and re-extracted per generation — a one-file
+    // change in a 10,000-file corpus sealed 10,000 blobs twice over (verify,
+    // copy+fsync, verify, extract). A file whose content digest and size match
+    // the prior committed snapshot's entry is hardlinked from it instead. A
+    // hardlink, not a symlink and not a copy: `gc_snapshots` removes the prior
+    // snapshot's directory entries after this generation commits, and a
+    // hardlinked inode survives that while a symlink would dangle — the same
+    // manifest-referenced-GC property tantivy's `list_segment_files` relies on
+    // to share unchanged segment files across commits. The blob needs no
+    // re-verify either: `open_snapshot` (which the caller ran to hand us a
+    // digest-checked `reuse`) proved the prior blob matches its manifest, and
+    // this inventory's digest for the file is the same value — so the sealed
+    // bytes equal the scan-time bytes by construction.
+    let reuse_root = reuse.map(|prior| state_dir.join("sync-snapshots").join(&prior.tx_id));
+    let reuse_by_content: HashMap<&str, &SnapshotFile> = reuse
+        .map(|prior| {
+            prior
+                .files
+                .iter()
+                .map(|file| (file.content_id.as_str(), file))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut files = Vec::with_capacity(inventory.files.len());
     // Entered only when there is work to report: a retry that reuses a verified
     // final snapshot returned above and never claims a phase it did not run.
@@ -1654,13 +2014,8 @@ fn create_snapshot_inner(
         // the phase measures files drained, and the guard names the file a
         // quiet tail is inside.
         let _sealing = pr.file(&source.rel, source.size);
-        crate::content::verify(&source.path, source.size, content_digest)?;
         let relative_blob = format!("blobs/{ordinal:08}");
         let destination = staging.join(&relative_blob);
-        copy_synced(&source.path, &destination, &mut budget)?;
-        crate::content::verify(&destination, source.size, content_digest)?;
-        #[cfg(test)]
-        apply_post_seal_source_replacement(&source.path)?;
         // A junk/skipped file has no `plan.files` entry *by construction* — it
         // lives in `plan.junk_files` and is never indexed — so demanding one
         // here made `--no-graph` fail outright on any folder holding a single
@@ -1668,26 +2023,121 @@ fn create_snapshot_inner(
         // sealed snapshot (a resume replays from the snapshot, not from the
         // mutable tree, and the inventory it is verified against lists the
         // file), but there is nothing to prepare for it: `prepared: None`.
-        let prepared = match plan {
-            Some(plan) if plan.files.contains_key(content_id.as_str()) => Some(prepare_artifact(
-                &staging,
-                ordinal,
-                tx_id,
-                source,
-                content_id,
-                &destination,
+        let assignment = plan.and_then(|plan| plan.files.get(content_id.as_str()));
+        let prepared_identity = match (plan, assignment) {
+            (Some(plan), Some(assignment)) => Some(prepared_artifact_identity(
+                chunker_identity,
                 plan,
-                &mut budget,
+                content_id.as_str(),
+                assignment,
             )?),
             _ => None,
         };
-        files.push(SnapshotFile {
-            content_id: content_id.clone(),
-            content_digest: content_digest.clone(),
-            content_size: source.size,
-            relative_blob,
-            prepared,
-        });
+        let reusable = reuse_by_content
+            .get(content_id.as_str())
+            .copied()
+            .filter(|prior| {
+                prior.content_digest == *content_digest && prior.content_size == source.size
+            });
+        match reusable {
+            Some(prior) => {
+                let prior_blob = reuse_root
+                    .as_ref()
+                    .expect("reuse root exists whenever reuse_by_content is non-empty")
+                    .join(&prior.relative_blob);
+                std::fs::hard_link(&prior_blob, &destination).with_context(|| {
+                    format!(
+                        "hardlink unchanged snapshot blob {} -> {}",
+                        prior_blob.display(),
+                        destination.display()
+                    )
+                })?;
+                budget.charge(source.size as usize)?;
+                let prepared = match &prior.prepared {
+                    Some(prior_artifact)
+                        if prior.prepared_identity.as_deref().is_some_and(|identity| {
+                            Some(identity) == prepared_identity.as_deref()
+                        }) =>
+                    {
+                        // Extraction inputs are byte-identical to the prior
+                        // generation's, so the sealed NDJSON is too (the only
+                        // run-varying field it carries is `ax_run`, which the
+                        // prior generation stamped — and the live records this
+                        // artifact replays still carry that stamp, so reusing
+                        // it is consistent with the ax_run provenance rule:
+                        // only an Upsert, which always re-prepares, may move
+                        // it). Link it under this snapshot's ordinal and keep
+                        // the verified artifact metadata verbatim.
+                        let relative_ndjson = format!("prepared/{ordinal:08}.ndjson");
+                        let prior_path = reuse_root
+                            .as_ref()
+                            .expect("reuse root exists whenever reuse_by_content is non-empty")
+                            .join(&prior_artifact.relative_ndjson);
+                        std::fs::hard_link(&prior_path, staging.join(&relative_ndjson))
+                            .with_context(|| {
+                                format!(
+                                    "hardlink unchanged prepared artifact {}",
+                                    prior_path.display()
+                                )
+                            })?;
+                        budget.charge(prior_artifact.bytes as usize)?;
+                        Some(PreparedArtifact {
+                            relative_ndjson,
+                            ..prior_artifact.clone()
+                        })
+                    }
+                    _ => match assignment {
+                        Some(_) => Some(prepare_artifact(
+                            &staging,
+                            ordinal,
+                            tx_id,
+                            source,
+                            content_id,
+                            &destination,
+                            plan.expect("assignment implies a plan"),
+                            &mut budget,
+                        )?),
+                        None => None,
+                    },
+                };
+                files.push(SnapshotFile {
+                    content_id: content_id.clone(),
+                    content_digest: content_digest.clone(),
+                    content_size: source.size,
+                    relative_blob,
+                    prepared,
+                    prepared_identity,
+                });
+            }
+            None => {
+                crate::content::verify(&source.path, source.size, content_digest)?;
+                copy_synced(&source.path, &destination, &mut budget)?;
+                crate::content::verify(&destination, source.size, content_digest)?;
+                #[cfg(test)]
+                apply_post_seal_source_replacement(&source.path)?;
+                let prepared = match assignment {
+                    Some(_) => Some(prepare_artifact(
+                        &staging,
+                        ordinal,
+                        tx_id,
+                        source,
+                        content_id,
+                        &destination,
+                        plan.expect("assignment implies a plan"),
+                        &mut budget,
+                    )?),
+                    None => None,
+                };
+                files.push(SnapshotFile {
+                    content_id: content_id.clone(),
+                    content_digest: content_digest.clone(),
+                    content_size: source.size,
+                    relative_blob,
+                    prepared,
+                    prepared_identity,
+                });
+            }
+        }
     }
     let prepared_bytes = files.iter().try_fold(0u64, |total, file| {
         total
@@ -1986,6 +2436,60 @@ fn prepare_artifact(
     })
 }
 
+/// #971: the identity of every input `prepare_artifact` consumes for one file.
+///
+/// Equal identity + equal content digest (checked separately against the
+/// inventory) means the sealed NDJSON this run would produce is byte-identical
+/// to the prior generation's, so the prior artifact is hardlinked instead of
+/// re-extracted. The enumeration deliberately mirrors what `prepare_artifact`
+/// reads: the chunker-level settings and their version label, the document-id
+/// scheme, the file's whole assignment (rel drives `ax_path`, the sniff name
+/// and `ax_format`; `assignments` drives record routing; `as_document` switches
+/// the extractor), the alias paths folded into `ax_paths`, and the complete
+/// `PlanDataset` records for every dataset a record can land in (index name,
+/// specs/coercions, semantic field). **If `prepare_artifact` ever grows an
+/// input, it must be added here** — the chunker and document-id labels are the
+/// existing contract-digest versioning points and change with any extractor
+/// behaviour change, which is what makes this safe across builds.
+fn prepared_artifact_identity(
+    chunker_identity: &str,
+    plan: &Plan,
+    content_id: &str,
+    assignment: &crate::state::FileAssignment,
+) -> Result<String> {
+    let mut aliases: Vec<(&str, &str)> = plan
+        .duplicate_files
+        .iter()
+        .filter(|alias| alias.file_key == content_id)
+        .map(|alias| (alias.rel.as_str(), alias.path_id.as_str()))
+        .collect();
+    aliases.sort_unstable();
+    let slugs: BTreeSet<&str> = assignment
+        .assignments
+        .iter()
+        .map(|(_, slug)| slug.as_str())
+        .collect();
+    let mut datasets: BTreeMap<&str, Value> = BTreeMap::new();
+    for dataset in plan
+        .datasets
+        .iter()
+        .filter(|dataset| slugs.contains(&dataset.slug.as_str()))
+    {
+        datasets.insert(dataset.slug.as_str(), serde_json::to_value(dataset)?);
+    }
+    let encoded = serde_json::to_vec(&serde_json::json!({
+        "chunker_identity": chunker_identity,
+        "document_ids": crate::DOCUMENT_IDS_IDENTITY,
+        "assignment": serde_json::to_value(assignment)?,
+        "aliases": aliases,
+        "datasets": datasets,
+    }))?;
+    Ok(format!(
+        "axfi1-{:032x}",
+        xxhash_rust::xxh3::xxh3_128(&encoded)
+    ))
+}
+
 fn validate_relative_path(path: &str, prefix: &str) -> Result<()> {
     anyhow::ensure!(
         path.starts_with(prefix) && !path.contains("..") && !Path::new(path).is_absolute(),
@@ -2174,6 +2678,8 @@ mod tests {
     };
     use crate::walk;
     use std::collections::BTreeMap;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
 
     fn inventory(root: &Path) -> Inventory {
         crate::content::resolve_reporting(walk::walk(root, false).unwrap(), &|_| {}).unwrap()
@@ -2210,6 +2716,374 @@ mod tests {
             alias_paths_indexed: false,
             ..Plan::default()
         }
+    }
+
+    /// #971: like `plan_for` but with an assignment for EVERY file in the
+    /// inventory — the shape a real corpus plan has.
+    fn plan_for_all(inventory: &Inventory) -> Plan {
+        let files: HashMap<String, FileAssignment> = inventory
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                (
+                    inventory.keys[index].clone(),
+                    FileAssignment {
+                        rel: file.rel.clone(),
+                        path_id: file.rel_id.clone(),
+                        is_symlink: Some(file.is_symlink),
+                        family: "text".into(),
+                        gzip: false,
+                        content_digest: Some(inventory.digests[index].clone()),
+                        assignments: vec![(None, "docs".into())],
+                        as_document: false,
+                    },
+                )
+            })
+            .collect();
+        Plan {
+            datasets: vec![PlanDataset {
+                slug: "docs".into(),
+                index: "ax-docs".into(),
+                family: "text".into(),
+                group: None,
+                specs: vec![],
+                time_field: None,
+                semantic_field: None,
+                sampled_records: 1,
+                file_count: files.len(),
+            }],
+            files,
+            alias_paths_indexed: false,
+            ..Plan::default()
+        }
+    }
+
+    /// #971 fail-before shape: a one-file change in a three-file corpus must
+    /// seal new bytes ONLY for the changed file. Unchanged files' blobs and
+    /// prepared artifacts are hardlinked from the prior committed snapshot —
+    /// same inode, no copy, no re-extraction, no per-file fsync.
+    #[cfg(unix)]
+    #[test]
+    fn one_changed_file_hardlinks_unchanged_blobs_and_prepared_artifacts() {
+        let _guard = SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let corpus = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("a.md", "alpha contents one\n"),
+            ("b.md", "bravo contents two\n"),
+            ("c.md", "charlie contents three\n"),
+        ] {
+            std::fs::write(corpus.path().join(name), body).unwrap();
+        }
+        let first_inventory = inventory(corpus.path());
+        let first_plan = plan_for_all(&first_inventory);
+        let first = create_prepared_snapshot_reporting(
+            state.path(),
+            "tx-g1",
+            &first_inventory,
+            &first_plan,
+            "test-preparation-v1",
+            u64::MAX,
+            &crate::progress::Progress::silent(),
+            None,
+            "chunker-v1",
+        )
+        .unwrap();
+        assert_eq!(first.files.len(), 3);
+        assert!(first
+            .files
+            .iter()
+            .all(|file| file.prepared.is_some() && file.prepared_identity.is_some()));
+
+        // One file changes; the tree is re-scanned; generation two seals.
+        std::fs::write(corpus.path().join("b.md"), "bravo contents CHANGED\n").unwrap();
+        let second_inventory = inventory(corpus.path());
+        let second_plan = plan_for_all(&second_inventory);
+        let changed_key = second_inventory
+            .keys
+            .iter()
+            .zip(&second_inventory.digests)
+            .find(|(key, digest)| {
+                first
+                    .files
+                    .iter()
+                    .find(|file| file.content_id == **key)
+                    .is_none_or(|prior| &prior.content_digest != *digest)
+            })
+            .map(|(key, _)| key.clone())
+            .unwrap();
+        let second = create_prepared_snapshot_reporting(
+            state.path(),
+            "tx-g2",
+            &second_inventory,
+            &second_plan,
+            "test-preparation-v1",
+            u64::MAX,
+            &crate::progress::Progress::silent(),
+            Some(&first),
+            "chunker-v1",
+        )
+        .unwrap();
+
+        // Content ids are content-derived, so the changed file's id is new in
+        // generation two — gen1 holds it under the OLD id. Classify by content
+        // identity instead: a gen2 entry whose (content_id, digest) has no
+        // gen1 match is the changed file.
+        let prior_by_content: HashMap<&str, &SnapshotFile> = first
+            .files
+            .iter()
+            .map(|file| (file.content_id.as_str(), file))
+            .collect();
+        let fresh: Vec<&SnapshotFile> = second
+            .files
+            .iter()
+            .filter(|file| {
+                prior_by_content
+                    .get(file.content_id.as_str())
+                    .is_none_or(|prior| prior.content_digest != file.content_digest)
+            })
+            .collect();
+        assert_eq!(
+            fresh.len(),
+            1,
+            "exactly the changed file seals fresh bytes: {:?}",
+            fresh
+                .iter()
+                .map(|file| file.content_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(fresh[0].content_id, changed_key);
+
+        let artifact_inode = |snapshot: &SourceSnapshot, relative: &str| {
+            std::fs::metadata(
+                state
+                    .path()
+                    .join("sync-snapshots")
+                    .join(&snapshot.tx_id)
+                    .join(relative),
+            )
+            .unwrap()
+            .ino()
+        };
+        let prior_blob_inodes: std::collections::HashSet<_> = first
+            .files
+            .iter()
+            .map(|file| artifact_inode(&first, &file.relative_blob))
+            .collect();
+
+        for file in &second.files {
+            let new_prepared = file.prepared.as_ref().unwrap();
+            match prior_by_content
+                .get(file.content_id.as_str())
+                .filter(|prior| prior.content_digest == file.content_digest)
+            {
+                None => {
+                    // The changed file: everything sealed fresh, under the new
+                    // generation's identity.
+                    assert!(
+                        !prior_blob_inodes.contains(&artifact_inode(&second, &file.relative_blob)),
+                        "the changed file's blob must be a fresh inode"
+                    );
+                    let ndjson = std::fs::read_to_string(
+                        state
+                            .path()
+                            .join("sync-snapshots/tx-g2")
+                            .join(&new_prepared.relative_ndjson),
+                    )
+                    .unwrap();
+                    assert!(
+                        ndjson.contains("\"ax_run\":\"tx-g2\""),
+                        "the changed file's artifact must carry the new generation: {ndjson}"
+                    );
+                }
+                Some(prior) => {
+                    assert_eq!(
+                        artifact_inode(&first, &prior.relative_blob),
+                        artifact_inode(&second, &file.relative_blob),
+                        "an unchanged file's blob must be the prior generation's inode"
+                    );
+                    let prior_prepared = prior.prepared.as_ref().unwrap();
+                    assert_eq!(
+                        artifact_inode(&first, &prior_prepared.relative_ndjson),
+                        artifact_inode(&second, &new_prepared.relative_ndjson),
+                        "an unchanged file's prepared artifact must be the prior generation's \
+                         inode"
+                    );
+                    let ndjson = std::fs::read_to_string(
+                        state
+                            .path()
+                            .join("sync-snapshots/tx-g2")
+                            .join(&new_prepared.relative_ndjson),
+                    )
+                    .unwrap();
+                    assert!(
+                        !ndjson.contains("tx-g2"),
+                        "a reused artifact keeps the generation that extracted it: {ndjson}"
+                    );
+                    assert_eq!(new_prepared.digest, prior_prepared.digest);
+                }
+            }
+        }
+        // The sealed snapshot still opens and re-verifies every artifact,
+        // hardlinked or not.
+        let reopened = open_snapshot(state.path(), "tx-g2").unwrap();
+        assert_eq!(reopened, second);
+    }
+
+    /// #971: gc removes the prior snapshot's directory entries after a new
+    /// generation commits (`gc_snapshots`); the new generation's hardlinked
+    /// inodes must survive that, and the sealed snapshot must still verify.
+    /// This is the property that made a hardlink the right sharing primitive —
+    /// a symlink would dangle here.
+    #[test]
+    fn reused_blobs_survive_removal_of_the_prior_snapshot_directory() {
+        let _guard = SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let corpus = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("a.md", "alpha contents one\n"),
+            ("b.md", "bravo contents two\n"),
+        ] {
+            std::fs::write(corpus.path().join(name), body).unwrap();
+        }
+        let first_inventory = inventory(corpus.path());
+        let first_plan = plan_for_all(&first_inventory);
+        let first = create_prepared_snapshot_reporting(
+            state.path(),
+            "tx-g1",
+            &first_inventory,
+            &first_plan,
+            "test-preparation-v1",
+            u64::MAX,
+            &crate::progress::Progress::silent(),
+            None,
+            "chunker-v1",
+        )
+        .unwrap();
+        std::fs::write(corpus.path().join("b.md"), "bravo contents CHANGED\n").unwrap();
+        let second_inventory = inventory(corpus.path());
+        let second_plan = plan_for_all(&second_inventory);
+        let second = create_prepared_snapshot_reporting(
+            state.path(),
+            "tx-g2",
+            &second_inventory,
+            &second_plan,
+            "test-preparation-v1",
+            u64::MAX,
+            &crate::progress::Progress::silent(),
+            Some(&first),
+            "chunker-v1",
+        )
+        .unwrap();
+
+        // What gc does to the prior generation once g2 is authority.
+        std::fs::remove_dir_all(state.path().join("sync-snapshots/tx-g1")).unwrap();
+        // Every file re-verifies: blobs by content digest, prepared artifacts
+        // by size and digest — none of that consults the removed directory.
+        let reopened = open_snapshot(state.path(), "tx-g2").unwrap();
+        assert_eq!(reopened, second);
+        assert_eq!(reopened.files.len(), 2);
+    }
+
+    /// #971: a preparation-input change (chunker identity) busts prepared
+    /// reuse even when the bytes are identical — the artifact is re-extracted
+    /// under the new contract, while the blob itself is still shared.
+    #[cfg(unix)]
+    #[test]
+    fn changed_preparation_identity_reextracts_but_still_shares_the_blob() {
+        let _guard = SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let corpus = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(corpus.path().join("a.md"), "alpha contents one\n").unwrap();
+        let inventory = inventory(corpus.path());
+        let plan = plan_for_all(&inventory);
+        let first = create_prepared_snapshot_reporting(
+            state.path(),
+            "tx-g1",
+            &inventory,
+            &plan,
+            "test-preparation-v1",
+            u64::MAX,
+            &crate::progress::Progress::silent(),
+            None,
+            "chunker-v1",
+        )
+        .unwrap();
+        let second = create_prepared_snapshot_reporting(
+            state.path(),
+            "tx-g2",
+            &inventory,
+            &plan,
+            "test-preparation-v1",
+            u64::MAX,
+            &crate::progress::Progress::silent(),
+            Some(&first),
+            "chunker-v2",
+        )
+        .unwrap();
+        let key = &inventory.keys[0];
+        let blob = |snapshot: &SourceSnapshot| {
+            state
+                .path()
+                .join("sync-snapshots")
+                .join(&snapshot.tx_id)
+                .join(
+                    &snapshot
+                        .files
+                        .iter()
+                        .find(|file| file.content_id == *key)
+                        .unwrap()
+                        .relative_blob,
+                )
+        };
+        let inode = |path: std::path::PathBuf| std::fs::metadata(path).unwrap().ino();
+        assert_eq!(
+            inode(blob(&first)),
+            inode(blob(&second)),
+            "identical content still shares the blob"
+        );
+        // The artifacts live in different snapshot directories under the same
+        // ordinal name, so compare inodes, not relative paths.
+        let prepared = |snapshot: &SourceSnapshot| {
+            state
+                .path()
+                .join("sync-snapshots")
+                .join(&snapshot.tx_id)
+                .join(
+                    &snapshot
+                        .files
+                        .iter()
+                        .find(|file| file.content_id == *key)
+                        .unwrap()
+                        .prepared
+                        .as_ref()
+                        .unwrap()
+                        .relative_ndjson,
+                )
+        };
+        assert_ne!(
+            inode(prepared(&first)),
+            inode(prepared(&second)),
+            "a changed preparation identity must re-extract, not hardlink"
+        );
+        let ndjson = std::fs::read_to_string(
+            state
+                .path()
+                .join("sync-snapshots/tx-g2")
+                .join(&second.files[0].prepared.as_ref().unwrap().relative_ndjson),
+        )
+        .unwrap();
+        assert!(
+            ndjson.contains("\"ax_run\":\"tx-g2\""),
+            "a re-extracted artifact carries the new generation: {ndjson}"
+        );
     }
 
     /// One file, two tables, two datasets — the ordinary shape of a SQL dump.
@@ -3104,6 +3978,164 @@ mod tests {
         assert_eq!(backend.applications.len(), 2);
         assert!(journal.pending_sync.is_none());
         assert_eq!(journal.committed_manifest.as_ref().unwrap().generation, 1);
+    }
+
+    /// The concurrency a window of applies actually reached, counted from
+    /// inside `apply` — shared with the worker threads through an `Arc`.
+    #[derive(Default)]
+    struct WindowProbe {
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WindowProbe {
+        fn enter(&self) {
+            let entered = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.max_in_flight
+                .fetch_max(entered, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn leave(&self) {
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn max_seen(&self) -> usize {
+            self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// What the scheduling thread saw, in the order it saw it.
+    #[derive(Default)]
+    struct WindowHooks {
+        begun: Vec<usize>,
+        applied: Vec<(usize, bool)>,
+    }
+
+    impl ReplayHooks<usize> for WindowHooks {
+        fn begin(&mut self, item: &usize) -> Result<()> {
+            self.begun.push(*item);
+            Ok(())
+        }
+
+        fn applied(&mut self, item: &usize, outcome: Result<()>) -> Result<()> {
+            self.applied.push((*item, outcome.is_ok()));
+            outcome
+        }
+    }
+
+    #[test]
+    fn replay_windowed_overlaps_up_to_the_width_and_reports_in_dispatch_order() {
+        let items: Vec<usize> = (0..12).collect();
+        let probe = std::sync::Arc::new(WindowProbe::default());
+        let apply_probe = std::sync::Arc::clone(&probe);
+        let apply = move |_item: &usize| {
+            apply_probe.enter();
+            // Long enough that the whole first window is inside `apply` at
+            // once; short enough that the test stays instant.
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            apply_probe.leave();
+            Ok(())
+        };
+        let mut hooks = WindowHooks::default();
+        replay_windowed(&items, 4, &mut hooks, &apply).unwrap();
+        assert_eq!(hooks.begun, items, "every item begun, in dispatch order");
+        assert_eq!(
+            hooks
+                .applied
+                .iter()
+                .map(|(item, _)| *item)
+                .collect::<Vec<_>>(),
+            items,
+            "completions reported in dispatch order"
+        );
+        assert!(hooks.applied.iter().all(|(_, ok)| *ok));
+        let max = probe.max_seen();
+        assert!(
+            (2..=4).contains(&max),
+            "a 4-wide window over 25 ms applies must overlap; max concurrent was {max}"
+        );
+    }
+
+    #[test]
+    fn replay_windowed_stops_dispatch_on_failure_and_drains_what_was_dispatched() {
+        let items: Vec<usize> = (0..6).collect();
+        let mut hooks = WindowHooks::default();
+        let apply = |item: &usize| {
+            if *item == 1 {
+                // Inside the first window, slow enough that items 0, 2 and
+                // the next dispatch (3) are already in flight when it lands.
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                Err(anyhow::anyhow!("injected apply failure"))
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                Ok(())
+            }
+        };
+        let error = replay_windowed(&items, 3, &mut hooks, &apply)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "injected apply failure");
+        assert_eq!(
+            hooks.begun,
+            vec![0, 1, 2, 3],
+            "dispatch stops at the failure"
+        );
+        assert_eq!(
+            hooks.applied,
+            vec![(0, true), (1, false), (2, true), (3, true)],
+            "in-flight successes after the failure are still reported, so their \
+             Committed writes are not lost; undispatched items are untouched"
+        );
+    }
+
+    #[test]
+    fn replay_windowed_width_one_never_spawns_and_keeps_order() {
+        let items: Vec<usize> = (0..3).collect();
+        let mut hooks = WindowHooks::default();
+        let seen_threads =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let apply_of = std::sync::Arc::clone(&seen_threads);
+        let apply = move |_item: &usize| {
+            apply_of.lock().unwrap().insert(std::thread::current().id());
+            Ok(())
+        };
+        replay_windowed(&items, 1, &mut hooks, &apply).unwrap();
+        assert_eq!(hooks.begun, items);
+        assert_eq!(hooks.applied, vec![(0, true), (1, true), (2, true)]);
+        assert_eq!(
+            seen_threads.lock().unwrap().len(),
+            1,
+            "width 1 runs every apply on the calling thread"
+        );
+    }
+
+    #[test]
+    fn replay_windowed_converts_a_worker_panic_into_the_run_error() {
+        let items: Vec<usize> = (0..4).collect();
+        let mut hooks = WindowHooks::default();
+        let apply = |item: &usize| {
+            if *item == 0 {
+                std::panic::panic_any("worker exploded");
+            }
+            Ok(())
+        };
+        // Keep the injected panic out of the test output; it is the input,
+        // not a failure to report.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let error = replay_windowed(&items, 4, &mut hooks, &apply).unwrap_err();
+        std::panic::set_hook(previous_hook);
+        assert_eq!(error.to_string(), "replay apply panicked: worker exploded");
+        assert_eq!(hooks.begun, vec![0, 1, 2, 3], "the window was dispatched");
+        assert_eq!(
+            hooks.applied,
+            vec![(0, false), (1, true), (2, true), (3, true)],
+            "the drain still reports the applies that did land"
+        );
     }
 
     /// A backend whose Nth `apply` is the server still answering 429 after

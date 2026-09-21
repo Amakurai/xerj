@@ -19,11 +19,16 @@
 # Checks, in order:
 #   1. every target we ship is present — the set is DECLARED below, not read off
 #      the release page, so a release that lost a matrix leg fails instead of
-#      quietly verifying the targets that did make it
+#      quietly verifying the targets that did make it. Since the first tag that
+#      ships them (FIRST_DEB_TAG below), that includes a .deb for each of the
+#      two linux-gnu targets.
 #   2. every archive has a .sha256 companion, and matches it
-#   3. every archive contains the binary + LICENSE + README. An archive that
-#      matched its published checksum and still will not extract is a defect in
-#      the release, so it FAILS rather than being skipped
+#   3. every archive contains the binary + LICENSE + README — .tar.gz/.zip via
+#      tar/unzip, .deb via dpkg-deb (ar+tar as the fallback a macOS host uses).
+#      An archive that matched its published checksum and still will not
+#      extract is a defect in the release, so it FAILS rather than being
+#      skipped. A .deb with neither dpkg-deb nor ar on the host is a counted
+#      SKIP, never a silent drop.
 #   4. every binary — including the ones this host cannot execute — carries the
 #      tag's version in its startup banner, and carries no other version
 #   5. the host-native binary: --version, boot on a clean data dir, health
@@ -45,8 +50,8 @@
 #   scripts/verify-release.sh --keep           # keep the download dir
 #   scripts/verify-release.sh --no-smoke       # checksums + versions only
 #
-# Requires: gh (authenticated), curl, tar, sha256sum|shasum, and unzip for the
-# Windows archives.
+# Requires: gh (authenticated), curl, tar, sha256sum|shasum, unzip for the
+# Windows archives, and dpkg-deb (or ar) for the .deb assets.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -89,6 +94,47 @@ x86_64-pc-windows-msvc
 x86_64-unknown-linux-gnu
 x86_64-unknown-linux-musl"
 TOTAL_TARGETS=$(printf '%s\n' "$EXPECTED_TARGETS" | wc -l | tr -d ' ')
+
+# The two linux-gnu targets additionally ship a .deb (issue #810): the release
+# workflow packs one per gnu target from the same staged binary as the tar.gz.
+# musl deliberately ships no .deb, and neither do macOS or Windows.
+DEB_TARGETS="aarch64-unknown-linux-gnu
+x86_64-unknown-linux-gnu"
+
+# The first tag whose release was built by a workflow that ships the .debs.
+# Presence of the .debs is only DEMANDED from this tag on: a release cut
+# before it legitimately has none, and failing the gate against history would
+# make the verifier useless for the tags that predate the asset (the rc.10
+# drift check above still runs against any tag). If a release older than this
+# constant is re-dispatched with the current workflow it gains .debs, so ANY
+# .deb on the release turns the gate on regardless of the tag (see step 2).
+# Keep in step with the release.yml change that introduced the .deb assets.
+FIRST_DEB_TAG="v1.0.0-rc.76"
+
+# vtag_ge A B — is tag A at or after tag B? Tags here are vMAJOR.MINOR.PATCH
+# with an optional -rc.NN suffix; a pre-release sorts before the release it
+# precedes (1.0.0-rc.76 < 1.0.0). Pure bash on purpose: this runs on macOS
+# hosts too, where sort has no -V and dpkg is absent.
+vtag_ge() {
+  local a="${1#v}" b="${2#v}"
+  [ "$a" = "$b" ] && return 0
+  local a_pre="" b_pre=""
+  case "$a" in *-*) a_pre="${a#*-}"; a="${a%%-*}" ;; esac
+  case "$b" in *-*) b_pre="${b#*-}"; b="${b%%-*}" ;; esac
+  local i a_parts b_parts n x y
+  IFS='.' read -ra a_parts <<<"$a"; IFS='.' read -ra b_parts <<<"$b"
+  n=$(( ${#a_parts[@]} > ${#b_parts[@]} ? ${#a_parts[@]} : ${#b_parts[@]} ))
+  for ((i = 0; i < n; i++)); do
+    x=$((10#${a_parts[i]:-0})); y=$((10#${b_parts[i]:-0}))
+    if [ "$x" -ne "$y" ]; then [ "$x" -gt "$y" ] && return 0 || return 1; fi
+  done
+  # same mainline: the release outranks its own pre-releases, and a later
+  # pre-release outranks an earlier one (rc.2 > rc.1; the suffix is "rc.N" so
+  # its trailing number is the discriminator).
+  if [ -z "$a_pre" ] && [ -n "$b_pre" ]; then return 0; fi
+  if [ -n "$a_pre" ] && [ -z "$b_pre" ]; then return 1; fi
+  [ "$((10#${a_pre##*.}))" -ge "$((10#${b_pre##*.}))" ]
+}
 
 FAILURES=0
 # Targets that were present but could not be checked (archive not unpackable on
@@ -158,8 +204,8 @@ cd "$WORKDIR"
 
 step "1. download every published asset"
 gh release download "$TAG" --repo "$REPO" --dir "$WORKDIR" --clobber >/dev/null
-ARCHIVES=$(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | sed 's|^\./||' | sort)
-[ -n "$ARCHIVES" ] || { fail "no .tar.gz or .zip assets on $TAG"; exit 1; }
+ARCHIVES=$(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' \) | sed 's|^\./||' | sort)
+[ -n "$ARCHIVES" ] || { fail "no .tar.gz, .zip or .deb assets on $TAG"; exit 1; }
 printf '  %s%s archives%s\n' "$DIM" "$(printf '%s\n' "$ARCHIVES" | wc -l | tr -d ' ')" "$RST"
 
 step "2. every target we ship is present"
@@ -170,6 +216,22 @@ for t in $EXPECTED_TARGETS; do
     pass "$t"
   else
     fail "$t — NO archive published for this target"
+  fi
+done
+# The .deb assets get the same declared-not-discovered treatment, with a time
+# gate: they exist from FIRST_DEB_TAG on (and on any release that has one at
+# all — a re-dispatched older tag rebuilt by the new workflow). Before that,
+# demanding them would fail against every historical tag.
+DEB_GATE=0
+if vtag_ge "$TAG" "$FIRST_DEB_TAG"; then DEB_GATE=1; fi
+if find . -maxdepth 1 -type f -name '*.deb' | grep -q .; then DEB_GATE=1; fi
+for t in $DEB_TARGETS; do
+  if [ "$DEB_GATE" = 1 ]; then
+    if printf '%s\n' "$ARCHIVES" | grep -qx "xerj-$EXPECTED-$t.deb"; then
+      pass "$t  (.deb)"
+    else
+      fail "$t — NO .deb published (shipped for every release from $FIRST_DEB_TAG on)"
+    fi
   fi
 done
 
@@ -190,7 +252,7 @@ done
 
 step "4. archive contents"
 for a in $ARCHIVES; do
-  d="unpack/${a%.tar.gz}"; d="${d%.zip}"
+  d="unpack/${a%.tar.gz}"; d="${d%.zip}"; d="${d%.deb}"
   mkdir -p "$d"
   # An archive that matched its published checksum and still will not extract is
   # a defect in the RELEASE, not a gap in this host's tooling — so it is a FAIL,
@@ -203,6 +265,30 @@ for a in $ARCHIVES; do
       if ! tar -xzf "$a" -C "$d"; then
         fail "$a — matched its published checksum but did not extract"
         UNPACKABLE="$UNPACKABLE $a"
+        continue
+      fi ;;
+    *.deb)
+      # dpkg-deb on a Debian-ish host; ar + tar as the fallback (macOS has no
+      # dpkg-deb but ships ar and a tar that reads the data member directly).
+      # Neither tool is a release defect, so a .deb that cannot be opened for
+      # want of them is a counted SKIP, not a FAIL.
+      if command -v dpkg-deb >/dev/null 2>&1; then
+        if ! dpkg-deb -x "$a" "$d"; then
+          fail "$a — matched its published checksum but did not extract"
+          UNPACKABLE="$UNPACKABLE $a"
+          continue
+        fi
+      elif command -v ar >/dev/null 2>&1; then
+        member=$(ar t "$a" 2>/dev/null | grep '^data\.tar\.' | head -1 || true)
+        zflag=j; case "$member" in *.xz) zflag=J ;; *.gz) zflag=z ;; *.zst) zflag=--zstd ;; esac
+        if [ -z "$member" ] || ! ar p "$a" "$member" | tar -x"$zflag" -C "$d"; then
+          fail "$a — matched its published checksum but did not extract"
+          UNPACKABLE="$UNPACKABLE $a"
+          continue
+        fi
+      else
+        warn "$a — no dpkg-deb or ar on PATH, contents NOT checked"
+        SKIPPED_TARGETS=$((SKIPPED_TARGETS + 1))
         continue
       fi ;;
     *.zip)
@@ -229,8 +315,8 @@ step "5. version string matches the tag, on every target"
 # The rc.10 check. A binary whose banner disagrees with its own filename is the
 # defect; a binary carrying two different versions is a stale-artifact defect.
 for a in $ARCHIVES; do
-  d="unpack/${a%.tar.gz}"; d="${d%.zip}"
-  target=$(printf '%s' "$a" | sed "s/^xerj-$EXPECTED-//; s/\.tar\.gz$//; s/\.zip$//")
+  d="unpack/${a%.tar.gz}"; d="${d%.zip}"; d="${d%.deb}"
+  target=$(printf '%s' "$a" | sed "s/^xerj-$EXPECTED-//; s/\.tar\.gz$//; s/\.zip$//; s/\.deb$//")
   bin=$(find "$d" -type f \( -name xerj -o -name xerj.exe \) 2>/dev/null | head -1 || true)
   if [ -z "$bin" ]; then
     case " $UNPACKABLE " in

@@ -5,6 +5,13 @@ use crate::ignore_rules::IgnoreOptions;
 use crate::progress::ProgressMode;
 use std::path::PathBuf;
 use std::time::Duration;
+// Loopback guard + local admin-key discovery, shared with `xerj mcp` (which
+// hit the identical 401 failure mode, #961). The invariants — a false
+// positive on `url_is_loopback` is a credential leak, not a cosmetic bug —
+// are pinned by the `local admin-key discovery` tests at the bottom of this
+// file: they stayed here when the helpers moved to `xerj-common`, so they
+// are the shared helpers' tests wherever the helpers live.
+use xerj_common::localauth::{discover_local_admin_key, url_is_loopback};
 
 /// Largest `--max-minutes` accepted: one week. Past that the flag is a typo,
 /// and `--max-minutes 0` already exists to mean "never ask".
@@ -1430,68 +1437,6 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         }
         _ => Ok(Cmd::Help),
     }
-}
-
-/// True when `url`'s host is this machine, so a locally readable admin key is
-/// the right credential to send. Anything else — a LAN address, a hostname, a
-/// remote deployment — must be given a key explicitly.
-///
-/// Parsed with a real URL parser rather than string surgery, because the
-/// hand-rolled version of this was wrong in a way that leaked credentials:
-/// splitting on the last `:` treats the userinfo in
-/// `http://localhost:9200@evil.com/` as a host:port pair, judges it loopback,
-/// and sends the admin key to `evil.com`. `Url::host_str` resolves that to
-/// `evil.com`, which is the whole point of using it.
-fn url_is_loopback(url: &str) -> bool {
-    // A schemeless `localhost:9200` parses as scheme `localhost`, path `9200`,
-    // with no host at all, so retry those through `http://`. The retry still
-    // goes through the parser: `localhost:9200@evil.com` becomes
-    // `http://localhost:9200@evil.com`, whose host is `evil.com`, not loopback.
-    let parsed = match reqwest::Url::parse(url) {
-        Ok(u) if matches!(u.scheme(), "http" | "https") => u,
-        _ => match reqwest::Url::parse(&format!("http://{url}")) {
-            Ok(u) => u,
-            // Unparseable is not loopback. Failing closed here costs a user
-            // with an exotic URL one explicit --api-key; failing open costs
-            // them the key itself.
-            Err(_) => return false,
-        },
-    };
-    match parsed.host_str() {
-        // `host_str` strips the brackets from `[::1]` and does not lowercase
-        // an IPv6 literal, so compare case-insensitively and cover both forms.
-        Some(h) => {
-            let h = h.trim_start_matches('[').trim_end_matches(']');
-            h.eq_ignore_ascii_case("localhost") || h == "127.0.0.1" || h == "::1" || h == "0.0.0.0"
-        }
-        None => false,
-    }
-}
-
-/// The admin key a local server wrote for itself, if we can find it.
-///
-/// Checked in the order a user is most likely to have created them: the
-/// working directory's data dir (what the quickstart tells you to use), then
-/// the documented package install location. Absent or unreadable is not an
-/// error — the caller falls back to the actionable 401 message.
-fn discover_local_admin_key() -> Option<(String, PathBuf)> {
-    const CANDIDATES: &[&str] = &[
-        "./data/admin.key",
-        "./xerj-data/admin.key",
-        "/var/lib/xerj/admin.key",
-    ];
-    let mut paths: Vec<PathBuf> = CANDIDATES.iter().map(PathBuf::from).collect();
-    if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(&home).join(".xerj/brain/admin.key"));
-        paths.push(PathBuf::from(&home).join(".xerj/admin.key"));
-    }
-    paths.into_iter().find_map(|p| {
-        std::fs::read_to_string(&p)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .map(|k| (k, p))
-    })
 }
 
 #[cfg(test)]

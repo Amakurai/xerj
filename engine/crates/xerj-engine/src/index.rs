@@ -14,7 +14,7 @@ use uuid::Uuid;
 use xerj_common::config::Config;
 use xerj_common::schema::ManagedSchema;
 use xerj_common::types::{FieldConfig, FieldType, IndexName, Schema};
-use xerj_fts::analyzer::{AnalysisBinding, AnalyzerRegistry};
+use xerj_fts::analyzer::{AnalysisBinding, AnalyzerPipeline, AnalyzerRegistry};
 use xerj_fts::index::FtsIndexReader;
 use xerj_fts::search::{
     BoolQuery as FtsBool, DisMaxQuery as FtsDisMax, FtsSearcher, Query as FtsQuery,
@@ -7749,6 +7749,21 @@ pub struct Index {
     query_cache_hits: Arc<AtomicU64>,
     query_cache_misses: Arc<AtomicU64>,
     registry: Arc<AnalyzerRegistry>,
+    /// #937 — whether this index's SEGMENT paths (flush/merge write and the
+    /// segment FTS query projection) honour a declared
+    /// `analysis.analyzer.default`. `true` for every index created by this
+    /// build. `false` ONLY for an index opened from a pre-#937 on-disk
+    /// state that declares a default and already holds documents: its
+    /// segments were written with `standard` postings, and switching them
+    /// to the declared analyzer mid-life would silently split the index
+    /// into two term spaces (the exact bug being fixed, in the other
+    /// direction). See `segment_analyzer_binding_for_open`.
+    ///
+    /// The memtable is NOT bound by this flag — it has resolved the
+    /// declared default since before #937, and a legacy index keeps that
+    /// (pre-existing, split) behaviour rather than silently changing how
+    /// its unflushed documents match.
+    segment_default_analyzer_honored: bool,
     data_dir: PathBuf,
     /// Doc count threshold for auto-flush (default: 10,000).
     flush_doc_threshold: usize,
@@ -8489,8 +8504,14 @@ impl Index {
 
         // Build analyzer registry, applying any custom analysis settings.
         // A NEW index always gets the canonical binding, and records that it
-        // did — see `analysis_binding_for_open` (issue #204).
-        record_canonical_analysis_binding(&index_dir);
+        // did — see `analysis_binding_for_open` (issue #204). #937: it also
+        // honours a declared `default` analyzer on the SEGMENT paths from
+        // birth, and records THAT too, so the first reopen cannot mistake it
+        // for a pre-#937 index.
+        write_analysis_binding_keys(
+            &index_dir,
+            &[("binding", "canonical"), ("segment_analyzers", "honored")],
+        );
         let registry = Arc::new(build_registry_from_settings(&settings));
 
         info!(name = name.as_str(), "index created");
@@ -8537,6 +8558,7 @@ impl Index {
             query_cache_hits: Arc::new(AtomicU64::new(0)),
             query_cache_misses: Arc::new(AtomicU64::new(0)),
             registry,
+            segment_default_analyzer_honored: true,
             data_dir: index_dir,
             flush_doc_threshold,
             flush_byte_threshold,
@@ -8738,6 +8760,14 @@ impl Index {
             &settings,
             analysis_binding,
         ));
+        // #937 — do this index's SEGMENT paths honour a declared `default`
+        // analyzer? Decided once, recorded in the binding marker, stable for
+        // the life of the index (see `segment_analyzer_binding_for_open`).
+        let segment_default_analyzer_honored = segment_analyzer_binding_for_open(
+            &index_dir,
+            &registry,
+            segment_doc_count > 0 || store.version_map.live_count() > 0,
+        );
         let passage_scored_fields_at_open = passage_scored_vector_fields(&schema.schema);
         let mut wal_passage_chunk_fields = HashSet::new();
 
@@ -8980,6 +9010,7 @@ impl Index {
             query_cache_hits: Arc::new(AtomicU64::new(0)),
             query_cache_misses: Arc::new(AtomicU64::new(0)),
             registry,
+            segment_default_analyzer_honored,
             data_dir: index_dir,
             flush_doc_threshold,
             flush_byte_threshold,
@@ -10611,7 +10642,9 @@ impl Index {
         let collection_publication = Arc::clone(&self.collection_publication);
         let registry = Arc::clone(&self.registry);
         let data_dir = self.data_dir.clone();
-        let field_configs = self.flush_signal.field_configs(&self.schema);
+        let field_configs = self
+            .flush_signal
+            .field_configs(&self.schema, self.segment_text_analyzer());
         let excluded_fts_fields = self.flush_signal.fts_excluded_fields(&self.schema);
         let dv_skip = self.flush_signal.doc_values_skip_set(&self.schema);
         let dataset_version = Arc::clone(&self.dataset_version);
@@ -10861,6 +10894,35 @@ impl Index {
         generated_embedding_companion_fields(&schema.schema)
     }
 
+    /// The analyzer name the flush/merge FTS writer uses for `Text` fields
+    /// (#937): the registry's `default` when one was declared via index
+    /// settings AND this index's segments honour it, else `standard`.
+    ///
+    /// This MUST agree with the memtable's
+    /// `get_analyzer("default").or_else(standard)` resolution or the same
+    /// document analyses differently before and after `_flush` — the exact
+    /// bug #937 reports. The one divergence kept on purpose is a pre-#937
+    /// index with documents (see `segment_analyzer_binding_for_open`):
+    /// its segments stay `standard` until the operator reindexes.
+    fn segment_text_analyzer(&self) -> &'static str {
+        if self.segment_default_analyzer_honored && self.registry.get_analyzer("default").is_some()
+        {
+            "default"
+        } else {
+            "standard"
+        }
+    }
+
+    /// How the segment FTS query projection analyses text clauses (#937) —
+    /// the same term space [`Self::segment_text_analyzer`] writes.
+    fn segment_analyzer_binding(&self) -> SegmentAnalyzerBinding<'_> {
+        if self.segment_default_analyzer_honored {
+            SegmentAnalyzerBinding::Honored(&self.registry)
+        } else {
+            SegmentAnalyzerBinding::Standard
+        }
+    }
+
     pub async fn refresh(&self) -> Result<()> {
         {
             let mem = &*self.memtable;
@@ -10876,7 +10938,7 @@ impl Index {
         let (field_configs, excluded_fts_fields, dv_skip) = {
             let schema = self.schema.read().await;
             (
-                build_fts_field_configs(&schema.schema),
+                build_fts_field_configs(&schema.schema, self.segment_text_analyzer()),
                 crate::memtable::fts_excluded_fields(&schema.schema),
                 doc_values_skip_set(&schema.schema),
             )
@@ -11006,7 +11068,7 @@ impl Index {
                 cfg.clone()
             } else {
                 let schema = self.schema.read().await;
-                let cfg = build_fts_field_configs(&schema.schema);
+                let cfg = build_fts_field_configs(&schema.schema, self.segment_text_analyzer());
                 let _ = field_configs_once.set(cfg.clone());
                 cfg
             };
@@ -11299,7 +11361,7 @@ impl Index {
         let (field_configs, excluded_fts_fields, mapped_field_names) = {
             let schema = self.schema.read().await;
             (
-                build_fts_field_configs(&schema.schema),
+                build_fts_field_configs(&schema.schema, self.segment_text_analyzer()),
                 crate::memtable::fts_excluded_fields(&schema.schema),
                 // #876 — a side-car whose field name is not a portable
                 // filename is stored under a SHA-256 digest. Enumerating a
@@ -11430,6 +11492,10 @@ impl Index {
             let store_for_task = Arc::clone(&self.store);
             let registry_for_task = Arc::clone(&self.registry);
             let field_configs_for_task = field_configs.clone();
+            // #937 — the text analyzer this merge writes (and whose term
+            // space its replay gate demands of every input), resolved once
+            // with the same rule the flush path uses.
+            let text_analyzer_for_task = self.segment_text_analyzer();
             let excluded_fts_fields_for_task = excluded_fts_fields.clone();
             let mapped_field_names_for_task = mapped_field_names.clone();
             let reanalysed_docs_for_task = Arc::clone(&self.merge_fts_reanalysed_docs);
@@ -11517,6 +11583,7 @@ impl Index {
                                 &field_configs_for_task,
                                 &excluded_fts_fields_for_task,
                                 &mapped_field_names_for_task,
+                                text_analyzer_for_task,
                             )
                         };
                     let merge_postings = merge_readers.is_some();
@@ -15366,6 +15433,15 @@ impl Index {
             // windows together, drain both, then consume results in input
             // order. This bounds native work and keeps retry/publication
             // behavior deterministic when one sibling fails.
+            //
+            // Every other backend runs the same windows through a
+            // bounded-concurrency scheduler: the default bound of 1 is the
+            // historical one-window-at-a-time loop, and
+            // `embedding.neural_window_concurrency` raises it so a single
+            // `_bulk` stream can keep several neural forward passes in flight
+            // on the shared model instead of one (#938). Each window is still
+            // embedded as its own batch and reassembled by position, so the
+            // vectors computed per passage are identical to the serial loop.
             let mut window_results = Vec::with_capacity(windows.len());
             if dual_session_scheduler_enabled(
                 onnx_pinned,
@@ -15383,14 +15459,21 @@ impl Index {
                         .map(|(window, result)| (window.0, window.1, window.2, result)),
                 );
             } else {
-                for &(start, end, passages) in &windows {
-                    window_results.push((
-                        start,
-                        end,
-                        passages,
-                        embedder.embed_batch(window_texts(start, end)).await,
-                    ));
-                }
+                let results = collect_ordinal_buffered(
+                    windows.len(),
+                    self.embedding_config.neural_window_concurrency,
+                    |ordinal| {
+                        let (start, end, _passages) = windows[ordinal];
+                        embedder.embed_batch(window_texts(start, end))
+                    },
+                )
+                .await;
+                window_results.extend(
+                    windows
+                        .iter()
+                        .zip(results)
+                        .map(|(window, result)| (window.0, window.1, window.2, result)),
+                );
             }
 
             for (start, end, passages, batch_result) in window_results {
@@ -18069,6 +18152,29 @@ impl Index {
                 .await;
         }
 
+        // ── #943: a `hybrid` the ladder above declined is about to be
+        // silently dropped ──────────────────────────────────────────────────
+        // Every hybrid-aware peel has passed by now, so a Hybrid node still
+        // in the tree is heading for the generic path, where the doc
+        // matcher's catch-all (`_ => false`) makes the clause match nothing:
+        // `bool{must:[hybrid, …]}`, a hybrid beside a must_not, dis_max over
+        // a hybrid … all answered 200 with 0 hits (or with the non-hybrid
+        // clauses' hits and the hybrid silently dropped). Fail loud with a
+        // 400 naming the supported spellings, mirroring the `_passage` guard
+        // above and the aggs-beside-hybrid rejection in
+        // `run_hybrid_with_deadline`. `unwrap_single_clause_bool` has already
+        // erased the harmless one-clause wrappers, so this only fires on
+        // shapes that genuinely cannot execute.
+        if query.contains_hybrid() {
+            return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
+                "hybrid queries are supported at the top level or as \
+                 bool{must: [hybrid], filter: […]} (the filter clauses are pushed \
+                 into every leg); this query nests a hybrid where it cannot be \
+                 executed and would silently match nothing — put the filter inside \
+                 each leg of hybrid.queries, or move the hybrid to the top level",
+            )));
+        }
+
         // ── #825: `knn` clause inside a compound `bool` ────────────────────────
         // Every vector-aware short-circuit above has declined by now, so a
         // `Knn` node still in the tree is about to hit the generic path,
@@ -19575,6 +19681,7 @@ impl Index {
             &text_fields,
             &exact_fields,
             &kw_fields,
+            self.segment_analyzer_binding(),
             pinned_probe,
         )
         .is_some();
@@ -19821,6 +19928,7 @@ impl Index {
                 &text_fields,
                 &exact_fields,
                 &kw_fields,
+                self.segment_analyzer_binding(),
                 pinned_probe,
             );
             let needs_fts = fts_query_probe.is_some();
@@ -19836,6 +19944,7 @@ impl Index {
                     &text_fields,
                     &exact_fields,
                     &kw_fields,
+                    self.segment_analyzer_binding(),
                     pinned_probe,
                 );
             // A `query_string` whose projection DECLINED still has to be
@@ -20061,6 +20170,7 @@ impl Index {
                         &text_fields,
                         &exact_fields,
                         &kw_fields,
+                        self.segment_analyzer_binding(),
                         pinned_positions
                             .as_ref()
                             .map(|map| PinnedIds::Positions(map)),
@@ -22528,7 +22638,7 @@ impl Index {
         let (field_configs, excluded_fts_fields, dv_skip) = {
             let schema = self.schema.read().await;
             (
-                build_fts_field_configs(&schema.schema),
+                build_fts_field_configs(&schema.schema, self.segment_text_analyzer()),
                 crate::memtable::fts_excluded_fields(&schema.schema),
                 doc_values_skip_set(&schema.schema),
             )
@@ -24113,15 +24223,27 @@ fn read_doc_values_sidecar(
 /// the FST has no entry for the literal value, so `term_doc_freq` falls
 /// through to the slow stored-doc scan.
 ///
+/// `text_analyzer` is the analyzer for `Text` fields — `default` when the
+/// index settings declare one AND this index's segments honour it, else
+/// `standard` (see [`Index::segment_text_analyzer`], #937). The memtable
+/// has always resolved `get_analyzer("default").or_else(standard)`
+/// (`memtable.rs`), so before #937 an index with a declared default
+/// analysed documents one way until `_flush` and another way after it.
+///
 /// Mapping rules (matches Lucene's behaviour):
-/// - `Text` → `standard` analyzer (tokenise, lowercase, stop-words)
+/// - `Text` → `text_analyzer` (`standard`, or the declared `default`)
 /// - `Keyword`, `Long`, `Integer` (alias), `Double`, `Float`, `Date`,
 ///   `Boolean`, `Ip` → `keyword` analyzer (whole input as one token, no
 ///   stop-words)
-/// - Any unknown / unmapped field defaults to `standard` because the
-///   memtable insert path passes every source field through and we must
-///   not stop-word user data unexpectedly.
-fn build_fts_field_configs(schema: &Schema) -> HashMap<String, xerj_fts::index::FieldIndexConfig> {
+/// - Any unknown / unmapped field defaults to the registry's `default`
+///   (else `standard`) in the writer itself — see
+///   `FtsIndexWriter::unconfigured_field_config` — because the memtable
+///   insert path passes every source field through and we must not
+///   stop-word user data unexpectedly.
+fn build_fts_field_configs(
+    schema: &Schema,
+    text_analyzer: &str,
+) -> HashMap<String, xerj_fts::index::FieldIndexConfig> {
     use xerj_fts::index::FieldIndexConfig;
     let mut out = HashMap::new();
     let excluded = crate::memtable::fts_excluded_fields(schema);
@@ -24130,7 +24252,7 @@ fn build_fts_field_configs(schema: &Schema) -> HashMap<String, xerj_fts::index::
             continue;
         }
         let analyzer = match f.field_type {
-            FieldType::Text => "standard",
+            FieldType::Text => text_analyzer,
             // Everything else is exact-match.  We use the registered
             // "keyword" analyzer (KeywordTokenizer) which emits the input
             // string as a single token.
@@ -24166,7 +24288,10 @@ fn build_fts_field_configs(schema: &Schema) -> HashMap<String, xerj_fts::index::
 ///   postings are not on disk, so the only way to give the output an index is
 ///   to build one);
 /// * a field stored with a different position setting than this merge would
-///   write for it — a re-encode, not a merge.
+///   write for it — a re-encode, not a merge;
+/// * a field whose postings were written with a different ANALYZER than this
+///   merge would use (#937) — the term spaces differ, so only a re-analysis
+///   can produce the output the mapping now calls for.
 ///
 /// The returned readers hold each input's decompressed postings for the rest
 /// of the batch. That is a real allocation, but it replaces `fts_input`'s
@@ -24178,6 +24303,7 @@ fn fts_merge_readers(
     field_configs: &HashMap<String, xerj_fts::index::FieldIndexConfig>,
     excluded: &std::collections::HashSet<String>,
     mapped_field_names: &[String],
+    text_analyzer: &str,
 ) -> Option<Vec<xerj_fts::index::FtsIndexReader>> {
     let default_store_positions = xerj_fts::index::FieldIndexConfig::default().store_positions;
     // ONE directory scan for the whole batch: a converging index keeps tens of
@@ -24224,6 +24350,43 @@ fn fts_merge_readers(
                     return None;
                 }
             };
+        // #937 — the analyzer equality gate. Replay copies input postings
+        // verbatim, so an input whose TEXT postings were produced by a
+        // DIFFERENT analyzer than this merge would write can only be merged
+        // by re-analysing it: the term spaces differ. A pre-#937 segment has
+        // no `{id}.ftsan` marker and reports `standard`, which is exactly
+        // what a build that never read the declared default wrote.
+        let recorded_analyzers =
+            xerj_fts::index::segment_recorded_analyzers(segments_dir, meta.id.as_str());
+        let analyzer_mismatch = reader.indexed_fields().iter().find_map(|field| {
+            let expected = match field_configs.get(*field) {
+                Some(config) => config.analyzer.as_str(),
+                // A field the mapping no longer knows was written by the
+                // flush writer's own fallback (see
+                // `FtsIndexWriter::unconfigured_field_config`), which resolves
+                // exactly `text_analyzer`.
+                None => text_analyzer,
+            };
+            if expected == "keyword" {
+                // Keyword postings predate #937 unchanged — nothing to
+                // compare against.
+                return None;
+            }
+            let recorded = recorded_analyzers
+                .as_ref()
+                .and_then(|map| map.get(*field).map(String::as_str))
+                .unwrap_or("standard");
+            (recorded != expected).then(|| field.to_string())
+        });
+        if let Some(field) = analyzer_mismatch {
+            tracing::info!(
+                segment = %meta.id,
+                field,
+                "merge: field's postings were written with a different analyzer than this \
+                 merge would use, re-analysing this batch"
+            );
+            return None;
+        }
         let mismatch = reader
             .indexed_fields()
             .into_iter()
@@ -25795,8 +25958,14 @@ impl Index {
         // convention as `MAX_QS_CROSS_PRODUCT`).
         const MAX_STATS_PROBES: usize = 4096;
 
-        let fq =
-            query_node_to_fts_projected(query, text_fields, exact_fields, keyword_fields, pinned)?;
+        let fq = query_node_to_fts_projected(
+            query,
+            text_fields,
+            exact_fields,
+            keyword_fields,
+            self.segment_analyzer_binding(),
+            pinned,
+        )?;
         let mut fields: Vec<String> = Vec::new();
         collect_fts_query_fields(&fq, &mut fields);
         if fields.is_empty() {
@@ -30050,9 +30219,12 @@ impl SyncFlushCoord {
     }
 
     /// Get the cached field_configs, or build + cache them on first call.
+    /// `text_analyzer` is #937's per-index text analyzer name — fixed at
+    /// index open, so caching the configs against it is sound.
     fn field_configs(
         &self,
         schema: &Arc<RwLock<ManagedSchema>>,
+        text_analyzer: &str,
     ) -> HashMap<String, xerj_fts::index::FieldIndexConfig> {
         if let Some(cfg) = self.field_configs_cache.read().as_ref() {
             return cfg.clone();
@@ -30063,7 +30235,7 @@ impl SyncFlushCoord {
         };
         let cfg = rt.block_on(async {
             let guard = schema.read().await;
-            build_fts_field_configs(&guard.schema)
+            build_fts_field_configs(&guard.schema, text_analyzer)
         });
         *self.field_configs_cache.write() = Some(cfg.clone());
         cfg
@@ -36708,6 +36880,60 @@ fn peel_hybrid_query(
         QueryNode::Constant { query, .. }
         | QueryNode::Boosted { query, .. }
         | QueryNode::Named { query, .. } => peel_hybrid_query(query),
+        QueryNode::Bool {
+            must,
+            should,
+            filter,
+            must_not,
+            minimum_should_match,
+        } => {
+            // #943: mirror peel_knn_query / peel_semantic_query — dispatch the
+            // simple case of a bool with exactly one must/should clause
+            // holding a `hybrid`. The Hybrid AST has no filter field, so the
+            // wrapper's `filter` clauses are pushed into EVERY leg as
+            // `Bool{must:[leg], filter:[…]}` — mechanically identical to the
+            // spelling the issue verified as correct (filter inside each
+            // leg), where each wrapped leg re-enters search_inner and the
+            // semantic/knn/bool paths all apply filters. Without this arm the
+            // wrapper fell through to the generic path, whose doc matcher has
+            // no `QueryNode::Hybrid` arm (catch-all `_ => false`), so the
+            // must clause matched NOTHING — a 200 with 0 hits. Multi-clause
+            // bools (a hybrid clause beside a lexical one) still fall through
+            // to the contains-hybrid guard below.
+            if !must_not.is_empty() {
+                return None;
+            }
+            let candidates: Vec<&QueryNode> = must.iter().chain(should.iter()).collect();
+            if candidates.len() != 1 {
+                return None;
+            }
+            // A lone `should` clause with an explicit minimum_should_match
+            // changes the wrapper's own semantics (0 = optional, ≥2 with one
+            // clause = matches nothing, Field/Script resolve per doc) — those
+            // are not equivalent to `must`, so decline instead of silently
+            // re-reading them.
+            if !should.is_empty() && minimum_should_match.is_some() {
+                return None;
+            }
+            let (sub_queries, fusion) = peel_hybrid_query(candidates[0])?;
+            if filter.is_empty() {
+                return Some((sub_queries, fusion));
+            }
+            let wrapped = sub_queries
+                .into_iter()
+                .map(|wq| xerj_query::ast::WeightedQuery {
+                    query: QueryNode::Bool {
+                        must: vec![wq.query],
+                        should: Vec::new(),
+                        must_not: Vec::new(),
+                        filter: filter.clone(),
+                        minimum_should_match: None,
+                    },
+                    weight: wq.weight,
+                })
+                .collect();
+            Some((wrapped, fusion))
+        }
         _ => None,
     }
 }
@@ -40420,7 +40646,10 @@ fn is_doc_scan_query(q: &QueryNode) -> bool {
 /// `block_in_place` across many worker threads; a shared map would just
 /// re-serialise the hot loop.  Capped and cleared at 64 entries — the
 /// pattern set is query-supplied and must not grow unbounded.
-fn compiled_anchored_regex(pattern: &str) -> Option<Regex> {
+// pub(crate) for #959: the filter/filters aggregations evaluate `regexp`
+// clauses through this same compile-once cache (aggs.rs
+// `doc_matches_filter`) instead of silently counting every document.
+pub(crate) fn compiled_anchored_regex(pattern: &str) -> Option<Regex> {
     use std::cell::RefCell;
     thread_local! {
         static REGEX_CACHE: RefCell<std::collections::HashMap<String, Option<Regex>>> =
@@ -45504,7 +45733,10 @@ fn json_scalar_equal(dv: &Value, query_val: &Value) -> bool {
 }
 
 /// Simple wildcard pattern matching: `?` = any single char, `*` = zero or more chars.
-fn wildcard_match(text: &str, pattern: &str) -> bool {
+// pub(crate) for #959: the filter/filters aggregations evaluate their
+// clauses with this same glob matcher (aggs.rs `doc_matches_filter`) so a
+// `wildcard` counts identically inside an agg and as a query.
+pub(crate) fn wildcard_match(text: &str, pattern: &str) -> bool {
     let text: Vec<char> = text.chars().collect();
     let pattern: Vec<char> = pattern.chars().collect();
     wildcard_match_inner(&text, &pattern)
@@ -46058,7 +46290,14 @@ fn query_node_to_fts(
     // The projection tests below pass the exact-field set as their keyword
     // subset. The search path uses the schema-aware helper so IP/date/numeric
     // terms retain their source/DV semantics.
-    query_node_to_fts_projected(q, text_fields, exact_fields, exact_fields, None)
+    query_node_to_fts_projected(
+        q,
+        text_fields,
+        exact_fields,
+        exact_fields,
+        SegmentAnalyzerBinding::Standard,
+        None,
+    )
 }
 
 /// #892: how the projection may resolve a #825-pinned kNN disjunct.
@@ -46158,6 +46397,49 @@ fn pinned_constant_ids_pairs(q: &QueryNode) -> Option<Vec<(&str, f32)>> {
     Some(out)
 }
 
+/// How a segment-side FTS projection analyses text clauses (#937).
+///
+/// `Honored(&registry)` — the index's own analyzer registry. An unnamed text
+/// clause resolves the registry's `default` when the index settings declared
+/// one (the analyzer the segment's postings were built with at flush), else
+/// `standard`; a clause that names an analyzer resolves it against the
+/// index's custom analyzers too.
+///
+/// `Standard` — a pre-#937 index whose segments hold `standard` postings
+/// (`segment_default_analyzer_honored == false`): exactly the pre-fix
+/// behaviour, a fresh default registry, `standard` for unnamed clauses,
+/// built-ins only for named ones.
+///
+/// The memtable needs no equivalent: it has resolved
+/// `get_analyzer("default").or_else(standard)` on both its insert and its
+/// query side since before #937.
+#[derive(Clone, Copy)]
+enum SegmentAnalyzerBinding<'a> {
+    Honored(&'a AnalyzerRegistry),
+    Standard,
+}
+
+impl SegmentAnalyzerBinding<'_> {
+    /// Resolve the analyzer pipeline for one text clause. `None` declines
+    /// the projection (unknown analyzer name), same as pre-#937.
+    fn resolve(&self, requested: Option<&str>) -> Option<Arc<AnalyzerPipeline>> {
+        match self {
+            SegmentAnalyzerBinding::Honored(registry) => {
+                let fallback = if registry.get_analyzer("default").is_some() {
+                    "default"
+                } else {
+                    "standard"
+                };
+                let name = requested.unwrap_or(fallback);
+                registry.get_analyzer(name)
+            }
+            SegmentAnalyzerBinding::Standard => {
+                AnalyzerRegistry::default().get_analyzer(requested.unwrap_or("standard"))
+            }
+        }
+    }
+}
+
 /// The projection proper. `pinned` is `None` everywhere except the #825
 /// kNN-beside-`query` route (#892), where it lets the pinned disjunct become
 /// an FTS leaf instead of aborting the projection.
@@ -46166,6 +46448,7 @@ fn query_node_to_fts_projected(
     text_fields: &[String],
     exact_fields: &std::collections::HashSet<String>,
     keyword_fields: &std::collections::HashSet<String>,
+    binding: SegmentAnalyzerBinding<'_>,
     pinned: Option<PinnedIds<'_>>,
 ) -> Option<FtsQuery> {
     // #892: the pinned kNN disjunct, resolved to this segment's positions.
@@ -46194,9 +46477,14 @@ fn query_node_to_fts_projected(
         // applied post-hoc by the top-level override in `search` (the
         // keyword-schema shape is served bit-exactly by `scored_columnar`
         // before this projection is ever consulted).
-        QueryNode::Constant { query, .. } => {
-            query_node_to_fts_projected(query, text_fields, exact_fields, keyword_fields, pinned)
-        }
+        QueryNode::Constant { query, .. } => query_node_to_fts_projected(
+            query,
+            text_fields,
+            exact_fields,
+            keyword_fields,
+            binding,
+            pinned,
+        ),
         QueryNode::Match {
             field,
             query,
@@ -46223,8 +46511,15 @@ fn query_node_to_fts_projected(
             // `whitespace` preserves case, so "BROWN" must never equal the
             // lowercased indexed term "brown". An unknown analyzer name
             // projects to None → correct (slower) stored-doc scan.
-            let registry = AnalyzerRegistry::default();
-            let analyzer = registry.get_analyzer(analyzer.as_deref().unwrap_or("standard"))?;
+            //
+            // #937: an UNNAMED clause analyses with the same analyzer the
+            // segment's postings were written with — the index's declared
+            // `default` when one exists and this index honours it, else
+            // `standard` (see `SegmentAnalyzerBinding`). Before #937 this
+            // always tokenised with `standard`, so a `match` answered
+            // differently before and after `_flush` on an index that
+            // declared an analyzer.
+            let analyzer = binding.resolve(analyzer.as_deref())?;
             let tokens = analyzer.analyze(query);
             if tokens.is_empty() {
                 return None;
@@ -46295,8 +46590,14 @@ fn query_node_to_fts_projected(
             let is_phrase_prefix =
                 matches!(match_type, xerj_query::ast::MultiMatchType::PhrasePrefix);
             let query_analyzer_name = analyzer.as_deref();
-            let registry = AnalyzerRegistry::default();
-            let analyzer = registry.get_analyzer("standard")?;
+            // #937: the field's indexing analyzer (declared `default` else
+            // `standard`) for unnamed clauses / an explicit `standard`; a
+            // named non-standard analyzer still tokenises with the resolved
+            // default here and declines the phrase arm in the gate below.
+            let analyzer = binding.resolve(match query_analyzer_name {
+                Some("standard") => Some("standard"),
+                _ => None,
+            })?;
             let tokens = analyzer.analyze(query);
             // Split boost factors out of field specs (e.g. "title^3" → ("title", 3.0)).
             //
@@ -46540,6 +46841,7 @@ fn query_node_to_fts_projected(
                         text_fields,
                         exact_fields,
                         keyword_fields,
+                        binding,
                         pinned,
                     )
                 })
@@ -46628,6 +46930,7 @@ fn query_node_to_fts_projected(
                     text_fields,
                     exact_fields,
                     keyword_fields,
+                    binding,
                     pinned,
                 )?;
                 bool_q = bool_q.must(fq);
@@ -46660,6 +46963,7 @@ fn query_node_to_fts_projected(
                     text_fields,
                     exact_fields,
                     keyword_fields,
+                    binding,
                     pinned,
                 ) {
                     bool_q = bool_q.filter(fq);
@@ -46677,6 +46981,7 @@ fn query_node_to_fts_projected(
                     text_fields,
                     exact_fields,
                     keyword_fields,
+                    binding,
                     pinned,
                 )?;
                 bool_q = bool_q.should(fq);
@@ -46694,6 +46999,7 @@ fn query_node_to_fts_projected(
                     text_fields,
                     exact_fields,
                     keyword_fields,
+                    binding,
                     pinned,
                 ) {
                     bool_q = bool_q.must_not(fq);
@@ -46719,8 +47025,10 @@ fn query_node_to_fts_projected(
                 if exact_fields.contains(field) {
                     return Some(FtsQuery::Term(FtsTerm::boosted(field, query.as_str(), b)));
                 }
-                let registry = AnalyzerRegistry::default();
-                let analyzer = registry.get_analyzer("standard")?;
+                // #937: analyse with the field's indexing analyzer — the
+                // declared `default` when the index honours one — so the
+                // query terms meet the segment's postings.
+                let analyzer = binding.resolve(None)?;
                 let tokens = analyzer.analyze(query);
                 if tokens.is_empty() {
                     return None;
@@ -46746,8 +47054,8 @@ fn query_node_to_fts_projected(
             } else {
                 text_fields
             };
-            let registry = AnalyzerRegistry::default();
-            let analyzer = registry.get_analyzer("standard")?;
+            // #937: same resolution as the default_field arm above.
+            let analyzer = binding.resolve(None)?;
             let tokens = analyzer.analyze(query);
             if tokens.is_empty() {
                 return None;
@@ -46821,18 +47129,17 @@ fn query_node_to_fts_projected(
             // stores term POSITIONS for analyzed text (store_positions=true), so
             // route to a positional phrase intersection bounded to candidate
             // docs (`FtsQuery::Phrase`) instead of the O(N·field_len) stored
-            // scan.  The query is analyzed with the SAME standard analyzer the
-            // field was indexed with (tokenize + lowercase, no stemming), so the
-            // phrase terms line up byte-for-byte with the indexed terms — and
-            // lowercasing makes it case-insensitive exactly like ES's analyzed
-            // phrase.  slop>0 and non-standard analyzers keep the stored scan
-            // (None): the sloppy/analyzer semantics stay on the proven path.
+            // scan.  The query is analyzed with the SAME analyzer the field
+            // was indexed with — `standard`, or the declared `default` the
+            // segment's postings were written with (#937) — so the phrase
+            // terms line up byte-for-byte with the indexed terms.  slop>0 and
+            // non-standard NAMED analyzers keep the stored scan (None): the
+            // sloppy/analyzer semantics stay on the proven path.
             if *slop == 0
                 && text_fields.iter().any(|f| f == field)
                 && matches!(analyzer.as_deref(), None | Some("standard"))
             {
-                let registry = AnalyzerRegistry::default();
-                let analyzer = registry.get_analyzer("standard")?;
+                let analyzer = binding.resolve(analyzer.as_deref())?;
                 let tokens = analyzer.analyze(query);
                 if tokens.is_empty() {
                     // Empty analyzed phrase — fall back to the stored scan.
@@ -46874,16 +47181,17 @@ fn query_node_to_fts_projected(
                     constant_score: false,
                 }));
             }
-            // TEXT field: analyze the query with the standard analyzer (the
-            // indexing analyzer) — the leading tokens form an ordered phrase and
-            // the LAST token is a prefix expanded against the field's term
-            // dictionary (bounded by `max_expansions`).  Positional, bounded to
-            // candidate docs, instead of the O(N) stored scan.  The analyzer
-            // lowercases every token, so the head phrase and the prefix are
+            // TEXT field: analyze the query with the field's indexing
+            // analyzer (`standard`, or the declared `default` the segment's
+            // postings were written with — #937) — the leading tokens form
+            // an ordered phrase and the LAST token is a prefix expanded
+            // against the field's term dictionary (bounded by
+            // `max_expansions`).  Positional, bounded to candidate docs,
+            // instead of the O(N) stored scan.  The analyzer lowercases
+            // every token, so the head phrase and the prefix are
             // case-insensitive exactly like ES (which analyzes the input).
             if text_fields.iter().any(|f| f == field) {
-                let registry = AnalyzerRegistry::default();
-                let analyzer = registry.get_analyzer("standard")?;
+                let analyzer = binding.resolve(None)?;
                 let tokens = analyzer.analyze(query);
                 if tokens.is_empty() {
                     return None;
@@ -47084,6 +47392,7 @@ fn bool_has_nonprojectable_nonscoring(
     text_fields: &[String],
     exact_fields: &std::collections::HashSet<String>,
     keyword_fields: &std::collections::HashSet<String>,
+    binding: SegmentAnalyzerBinding<'_>,
     pinned: Option<PinnedIds<'_>>,
 ) -> bool {
     // #892: the #825 pinned sub-tree projects WHOLE (to a `DocScores` leaf),
@@ -47109,6 +47418,7 @@ fn bool_has_nonprojectable_nonscoring(
                     text_fields,
                     exact_fields,
                     keyword_fields,
+                    binding,
                     pinned,
                 )
                 .is_none()
@@ -47126,6 +47436,7 @@ fn bool_has_nonprojectable_nonscoring(
                         text_fields,
                         exact_fields,
                         keyword_fields,
+                        binding,
                         pinned,
                     )
                 })
@@ -47135,6 +47446,7 @@ fn bool_has_nonprojectable_nonscoring(
             text_fields,
             exact_fields,
             keyword_fields,
+            binding,
             pinned,
         ),
         _ => false,
@@ -48528,10 +48840,75 @@ fn dual_session_scheduler_enabled(onnx_pinned: bool, pool_size: usize) -> bool {
     onnx_pinned && pool_size == 2
 }
 
+/// Run at most `bound` futures concurrently and return every result in input
+/// order (#938). With `bound = 1` this is the historical strictly-serial loop;
+/// higher bounds let one `_bulk` request keep several embedding scheduling
+/// windows in flight at once. Like `collect_ordinal_buffered_two`, a future
+/// that resolves with an error (as a value) neither cancels nor reorders its
+/// neighbours — every launched ordinal yields exactly one result, and the
+/// caller keeps per-window failure semantics. Only completed results at the
+/// front of the window are retired, so no ordinal is launched before an
+/// in-flight slot is free and nothing is materialized beyond `bound` windows.
+async fn collect_ordinal_buffered<T, F, Fut>(count: usize, bound: usize, launch: F) -> Vec<T>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    let bound = bound.max(1);
+    let mut next_ordinal = 0usize;
+    // Futures are boxed so the window can shrink and grow without moving a
+    // pinned future; `done` mirrors it slot-for-slot so a finished future is
+    // never polled twice.
+    let mut in_flight: VecDeque<Pin<Box<Fut>>> = VecDeque::new();
+    let mut done: VecDeque<Option<T>> = VecDeque::new();
+    let mut results = Vec::with_capacity(count);
+    while results.len() < count {
+        while in_flight.len() < bound && next_ordinal < count {
+            in_flight.push_back(Box::pin(launch(next_ordinal)));
+            done.push_back(None);
+            next_ordinal += 1;
+        }
+        // Poll the whole window each wakeup; wake when the FRONT is finished,
+        // because results are retired strictly in ordinal order.
+        std::future::poll_fn(|cx| {
+            let mut front_done = false;
+            for (slot, fut) in in_flight.iter_mut().enumerate() {
+                if done[slot].is_some() {
+                    front_done |= slot == 0;
+                    continue;
+                }
+                if let Poll::Ready(value) = fut.as_mut().poll(cx) {
+                    done[slot] = Some(value);
+                    front_done |= slot == 0;
+                }
+            }
+            if front_done {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        // Retire every already-finished future at the front of the window,
+        // freeing slots (this is the only place the bound is enforced).
+        while let Some(value) = done.front_mut().and_then(Option::take) {
+            done.pop_front();
+            in_flight.pop_front();
+            results.push(value);
+        }
+    }
+    results
+}
+
 #[cfg(test)]
 mod semantic_embedding_window_tests {
     use super::{
-        collect_ordinal_buffered_two, dual_session_scheduler_enabled, semantic_embedding_window_end,
+        collect_ordinal_buffered, collect_ordinal_buffered_two, dual_session_scheduler_enabled,
+        semantic_embedding_window_end,
     };
 
     fn windows(counts: &[usize], limit: usize) -> Vec<(std::ops::Range<usize>, usize)> {
@@ -48589,6 +48966,169 @@ mod semantic_embedding_window_tests {
         .await;
         assert_eq!(completed.load(Ordering::SeqCst), 3);
         assert_eq!(results, vec![Err("first failed"), Ok(1), Ok(2)]);
+    }
+
+    /// #938: the bounded scheduler must actually fill its window. Ordinal 0
+    /// yields until `bound` futures have entered, so it can only complete if
+    /// the scheduler truly launched `bound` windows before retiring any — a
+    /// scheduler that ignored the bound and ran serially would spin here
+    /// forever and trip the bounded loop's assertion.
+    #[tokio::test]
+    async fn bounded_scheduler_runs_a_full_window_concurrently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let bound = 4;
+        let count = 10;
+        let entered = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let results = collect_ordinal_buffered(count, bound, |ordinal| {
+            let entered = Arc::clone(&entered);
+            let in_flight = Arc::clone(&in_flight);
+            let max_in_flight = Arc::clone(&max_in_flight);
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(now, Ordering::SeqCst);
+                if ordinal < bound {
+                    // Hold the front of the window open until the whole first
+                    // window is in flight (the gate is one-shot: only the
+                    // first `bound` ordinals wait).
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    for _ in 0..10_000 {
+                        if entered.load(Ordering::SeqCst) >= bound {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    assert!(
+                        entered.load(Ordering::SeqCst) >= bound,
+                        "ordinal {ordinal} released without {bound} windows in flight"
+                    );
+                }
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                ordinal * 2
+            }
+        })
+        .await;
+
+        assert_eq!(results, (0..count).map(|i| i * 2).collect::<Vec<_>>());
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            bound,
+            "the scheduler must reach exactly its bound and never exceed it"
+        );
+    }
+
+    /// #938: reversed completion drains in ordinal order and a window that
+    /// fails as a value neither cancels nor displaces its neighbours — the
+    /// same per-window failure contract the pair scheduler has.
+    #[tokio::test]
+    async fn bounded_scheduler_drains_reversed_completion_in_ordinal_order() {
+        use std::sync::Arc;
+        let front_park = Arc::new(tokio::sync::Notify::new());
+        let results = collect_ordinal_buffered(5, 3, |ordinal| {
+            let front_park = Arc::clone(&front_park);
+            async move {
+                if ordinal == 0 {
+                    // The front window finishes LAST: ordinal 2 must pass it
+                    // through before it can retire.
+                    front_park.notified().await;
+                    Err("first failed")
+                } else {
+                    if ordinal == 2 {
+                        front_park.notify_one();
+                    }
+                    Ok(ordinal)
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            results,
+            vec![Err("first failed"), Ok(1), Ok(2), Ok(3), Ok(4)]
+        );
+    }
+
+    /// #938 golden-vector guard: raising the bound must not change WHAT is
+    /// computed, only how many windows compute at once. Each window is
+    /// embedded as its own batch with its own texts in every configuration,
+    /// and results are reassembled by position.
+    #[tokio::test]
+    async fn bounded_scheduler_output_is_independent_of_the_bound() {
+        use std::sync::{Arc, Mutex};
+
+        // ~120-passage jobs cut into windows of 64 passages, like a `_bulk`
+        // request of 3-4 passage documents through the default window.
+        let counts = [30, 34, 60, 4, 64, 10, 1, 7];
+        let windowed = windows(&counts, 64);
+        assert!(windowed.len() >= 3, "exercise multiple windows");
+
+        for bound in [1usize, 2, 8] {
+            // The launch closure must be `Fn`: share the window table by
+            // reference instead of letting each iteration capture it by move.
+            let windowed = &windowed;
+            let batches: Arc<Mutex<Vec<(usize, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+            let batches_for_launch = Arc::clone(&batches);
+            let results = collect_ordinal_buffered(windowed.len(), bound, |ordinal| {
+                let batches = Arc::clone(&batches_for_launch);
+                async move {
+                    let range = windowed[ordinal].0.clone();
+                    let texts: Vec<String> = range
+                        .map(|job| format!("passages:{}:{}", counts[job], job))
+                        .collect();
+                    let vectors: Vec<Vec<f32>> = texts
+                        .iter()
+                        .map(|t| vec![t.len() as f32, ordinal as f32])
+                        .collect();
+                    // Completion order varies with the bound; the ordinal
+                    // restores the launch order for the comparison below.
+                    batches.lock().unwrap().push((ordinal, texts));
+                    vectors
+                }
+            })
+            .await;
+            let mut batches = batches.lock().unwrap().clone();
+            batches.sort_by_key(|(ordinal, _)| *ordinal);
+
+            // Same window batches, in the same order, at every bound.
+            let expected_texts: Vec<Vec<String>> = windowed
+                .iter()
+                .map(|(range, _)| {
+                    range
+                        .clone()
+                        .map(|job| format!("passages:{}:{}", counts[job], job))
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                batches
+                    .into_iter()
+                    .map(|(_, texts)| texts)
+                    .collect::<Vec<_>>(),
+                expected_texts,
+                "bound={bound} changed the batches"
+            );
+            // Same vectors at the same positions at every bound.
+            let expected_vectors: Vec<Vec<Vec<f32>>> = windowed
+                .iter()
+                .enumerate()
+                .map(|(ordinal, (range, _))| {
+                    range
+                        .clone()
+                        .map(|job| {
+                            let text = format!("passages:{}:{}", counts[job], job);
+                            vec![text.len() as f32, ordinal as f32]
+                        })
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                results, expected_vectors,
+                "bound={bound} changed the vectors"
+            );
+        }
     }
 }
 
@@ -49096,6 +49636,12 @@ fn build_registry_from_settings_with_binding(
 /// Its ABSENCE is the load-bearing signal: an index directory laid down before
 /// the #204 sweep has no such file, and its postings were produced by a build
 /// that read `settings.analysis` only.
+///
+/// #937 added a second decision to the same file: `segment_analyzers` records
+/// whether the SEGMENT paths (flush/merge write, segment query projection)
+/// honour a declared `analysis.analyzer.default`. A pre-#937 file carries only
+/// `{"binding":"canonical"}` and no `segment_analyzers` key — see
+/// [`segment_analyzer_binding_for_open`].
 const ANALYSIS_BINDING_MARKER: &str = "analysis-binding.json";
 
 /// Which `analysis` spellings to honour when REOPENING an existing index.
@@ -49125,8 +49671,13 @@ fn analysis_binding_for_open(
     settings: &Value,
     has_documents: bool,
 ) -> AnalysisBinding {
-    if index_dir.join(ANALYSIS_BINDING_MARKER).exists() {
-        return AnalysisBinding::Canonical;
+    // #937 made the marker content-aware: a file that records only the
+    // segment-analyzer decision (no `binding` key) must not be mistaken for
+    // a #204 canonical-binding record.
+    if let Some(marker) = read_analysis_binding_marker(index_dir) {
+        if marker.binding.as_deref() == Some("canonical") {
+            return AnalysisBinding::Canonical;
+        }
     }
     if !AnalyzerRegistry::declares_namespaced_analysis_only(settings) {
         record_canonical_analysis_binding(index_dir);
@@ -49147,26 +49698,112 @@ fn analysis_binding_for_open(
     AnalysisBinding::LegacyShorthandOnly
 }
 
+/// The parsed `analysis-binding.json` marker. Every field is optional: the
+/// file grew a key per fix (#204 `binding`, #937 `segment_analyzers`), and
+/// an older file simply lacks the newer decisions.
+#[derive(Default, serde::Deserialize)]
+struct AnalysisBindingMarker {
+    binding: Option<String>,
+    segment_analyzers: Option<String>,
+}
+
+fn read_analysis_binding_marker(index_dir: &Path) -> Option<AnalysisBindingMarker> {
+    let bytes = std::fs::read(index_dir.join(ANALYSIS_BINDING_MARKER)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Merge one decision into the marker file, preserving the keys already
+/// recorded. Best effort in the same sense as
+/// [`record_canonical_analysis_binding`]: a failed write costs a re-derived
+/// (identical) decision at the next boot, except where documents written in
+/// between could flip it — worth an ERROR, not worth refusing the open.
+fn write_analysis_binding_keys(index_dir: &Path, keys: &[(&str, &str)]) -> Option<()> {
+    let path = index_dir.join(ANALYSIS_BINDING_MARKER);
+    let mut map: serde_json::Map<String, Value> = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    for (key, value) in keys {
+        map.insert((*key).to_owned(), Value::String((*value).to_owned()));
+    }
+    let bytes = serde_json::to_vec(&Value::Object(map)).ok()?;
+    write_file_atomic(&path, &bytes)
+        .map_err(|e| {
+            tracing::error!(
+                path = %path.display(), error = %e,
+                "could not record this index's analysis binding — if the index is empty \
+                 now and analyzers are declared, a later restart may disagree with how \
+                 documents written in the meantime were analysed"
+            );
+        })
+        .ok()
+}
+
 /// Record that this index's analyzer registry is built with the canonical
 /// binding, so the decision cannot change under it later.
-///
-/// Best effort: a failure here means the next boot re-derives the same answer
-/// from the same inputs, EXCEPT for the empty-index case, where documents
-/// written in between would flip it. That is worth an ERROR and is not worth
-/// refusing to open the index over.
 fn record_canonical_analysis_binding(index_dir: &Path) {
     let path = index_dir.join(ANALYSIS_BINDING_MARKER);
     if path.exists() {
         return;
     }
-    if let Err(e) = write_file_atomic(&path, br#"{"binding":"canonical"}"#) {
-        tracing::error!(
-            path = %path.display(), error = %e,
-            "could not record this index's analysis binding — if the index is empty now \
-             and analyzers are declared under `index.analysis`, a later restart may \
-             disagree with how documents written in the meantime were analysed"
-        );
+    write_analysis_binding_keys(index_dir, &[("binding", "canonical")]);
+}
+
+/// Decide, at index OPEN, whether this index's segment paths honour a
+/// declared `analysis.analyzer.default` (#937).
+///
+/// Mirrors [`analysis_binding_for_open`] (#204) decision-for-decision:
+///
+/// * marker records `segment_analyzers` → that decision stands, unchanged,
+///   for the life of the index;
+/// * no record and nothing at stake (no `default` declared, or the index is
+///   empty) → honour it and record `honored`, so documents written from now
+///   on cannot flip the answer at the next boot;
+/// * no record, a `default` IS declared, and the index has documents → the
+///   segments on disk were written with `standard` postings by a pre-#937
+///   build. Honouring the declaration now would put new segments in the
+///   declared analyzer's term space while every old segment stays in
+///   `standard`'s — queries answering differently per segment, silently.
+///   Keep the segments on `standard`, record `standard`, and say so at
+///   ERROR: reindex into a newly-created index is the only correct repair.
+///
+/// The memtable is deliberately NOT bound by this: it has resolved the
+/// declared `default` since before #937, and freezing it too would silently
+/// change how an existing index's unflushed documents match.
+fn segment_analyzer_binding_for_open(
+    index_dir: &Path,
+    registry: &AnalyzerRegistry,
+    has_documents: bool,
+) -> bool {
+    if let Some(marker) = read_analysis_binding_marker(index_dir) {
+        match marker.segment_analyzers.as_deref() {
+            Some("honored") => return true,
+            Some("standard") => {
+                tracing::error!(
+                    index_dir = %index_dir.display(),
+                    "this index was created by a build that wrote `standard` postings for \
+                     its declared `default` analyzer; the segments keep `standard` and the \
+                     reindex needed to activate the declared analyzer has not happened"
+                );
+                return false;
+            }
+            _ => {}
+        }
     }
+    let declares_default = registry.get_analyzer("default").is_some();
+    if !declares_default || !has_documents {
+        write_analysis_binding_keys(index_dir, &[("segment_analyzers", "honored")]);
+        return true;
+    }
+    write_analysis_binding_keys(index_dir, &[("segment_analyzers", "standard")]);
+    tracing::error!(
+        index_dir = %index_dir.display(),
+        "index declares a `default` analyzer and was created by a build that dropped it \
+         at flush — its segments hold `standard` postings. Honouring the declaration now \
+         would split the index into two term spaces, so the segments keep `standard`. \
+         Reindex into a newly-created index to activate the declared analyzer."
+    );
+    false
 }
 
 #[cfg(test)]
@@ -52806,7 +53443,7 @@ mod flush_memory_integration_tests {
         let (field_configs, excluded_fts_fields, dv_skip) = {
             let schema = idx.schema.read().await;
             (
-                build_fts_field_configs(&schema.schema),
+                build_fts_field_configs(&schema.schema, idx.segment_text_analyzer()),
                 crate::memtable::fts_excluded_fields(&schema.schema),
                 doc_values_skip_set(&schema.schema),
             )
@@ -53287,7 +53924,15 @@ mod pinned_knn_fts_892_tests {
         // Without a resolver the projection declines exactly as it did before
         // #892 — `Ids` is not a term.
         assert!(
-            query_node_to_fts_projected(&pinned, &text_fields, &empty, &empty, None).is_none(),
+            query_node_to_fts_projected(
+                &pinned,
+                &text_fields,
+                &empty,
+                &empty,
+                SegmentAnalyzerBinding::Standard,
+                None,
+            )
+            .is_none(),
             "no resolver ⇒ the pinned sub-tree must still decline"
         );
 
@@ -53299,6 +53944,7 @@ mod pinned_knn_fts_892_tests {
             &text_fields,
             &empty,
             &empty,
+            SegmentAnalyzerBinding::Standard,
             Some(PinnedIds::Positions(&positions)),
         )
         .expect("a resolvable pinned sub-tree must project");

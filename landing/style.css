@@ -2738,6 +2738,62 @@ html[data-theme='night'] .prompt-stage::before { opacity: 0.5; }
   border-color: var(--z-ink);
   color: var(--z-bg);
 }
+/* hero benchmark strip — sits directly under the prompt card. Figures must
+   stay verbatim with /benchmarks/decisions (hand-duplicated constants are
+   what landing-constants-guard.sh exists for; these two pages must not drift).
+   --z-neg is page-local to benchmarks/decisions.html, so the pre-fix number
+   repeats its values here rather than referencing a var that is unset on /. */
+.hero-bench {
+  max-width: 880px;
+  margin: 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2) var(--sp-4);
+  font-family: var(--font-data);
+  font-size: var(--fs-13);
+  line-height: 1.55;
+  color: var(--z-mute);
+}
+.hero-bench .hb-tag {
+  flex-basis: 100%;
+  font-size: var(--fs-11);
+  font-weight: 600;
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+}
+.hero-bench .hb-chip {
+  border: 1px solid var(--z-line);
+  border-radius: 8px;
+  padding: 5px 12px;
+}
+.hero-bench b {
+  color: var(--z-ink);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.hero-bench b.hb-bad { color: #d9575f; }
+html[data-theme='day'] .hero-bench b.hb-bad { color: #a32b2e; }
+.hero-bench .hb-arrow { color: var(--z-accent); font-weight: 700; }
+.hero-bench .hb-link {
+  font-size: var(--fs-11);
+  font-weight: 700;
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  color: var(--z-accent);
+  text-decoration: none;
+  border-bottom: 1px solid var(--z-accent);
+  padding-bottom: 1px;
+}
+.hero-bench .hb-link:hover, .hero-bench .hb-link:focus-visible {
+  color: var(--z-ink);
+  border-color: var(--z-ink);
+}
+@media (max-width: 720px) {
+  .hero-bench { font-size: 12px; }
+  .hero-bench .hb-chip { padding: 5px 10px; }
+}
 .hero-proof {
   font-family: var(--font-prose);
   font-size: var(--fs-13);
