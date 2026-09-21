@@ -7,7 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.76] - 2026-09-21
+
+The JEV-interface and honest-fixes release. The headline is a measured answer
+to a specific judge: the node now speaks the Jev reranker's wire protocol
+locally. Everything else in this cut is a fix with a reproduction behind it.
+
 ### Added
+
+- **The node speaks System One — `/v1/systemone` + `/_decide`.** A rank-weighted
+  kNN vote over a labelled-history index; nothing leaves the node. Two
+  deliberate, test-pinned breaks from the hosted protocol: `model` echoes
+  `xerj-history-vote-1` (never a Jev name), and zero support is a 422, never a
+  fabricated 0.5. Acceptance gate: the unmodified pip-installed `jev-reranker`
+  ran against the node and passed its own strict validation (spam 0.9014 vs
+  ham 0.0956). `/_decide` on the ES-compat port returns the evidence —
+  neighbours, labels, engine scores, weights. (#975)
+
+- **Two public datasets on the record.** FiQA (BEIR, 57,638 docs / 648 judged
+  queries; harness validated 0.2382 vs published 0.236): **BM25 0.2382 → Jev
+  0.3638**, the judge's biggest lift and its worst calibration case (ECE
+  0.3109). AG News (120k train history, all 7,600 test items): **0.9182
+  accuracy, no model, no tokens**. Hosted-reranker rows stay labelled "not run
+  by us"; no Jev row exists for AG News and none is claimed.
+- **WAND fast path in xerj-fts — 2.0× on the vote, bit-identical.**
+  `wand_should_bool`: doc-at-a-time top-cap evaluation for the shape every
+  `match` query lowers to, strict-below pruning, allocation-free inner loop.
+  AG News vote 68.7 → 34.2 ms/item; `/v1/systemone` p50 70.6 → 42.7 ms.
+  Bit-identity proven three ways: BEIR figures reproduce to four decimals, a
+  648-query A/B over a byte-identical index found 0 order and 0 score-bit
+  changes, ES-YAML conformance 0 failed on the final binary.
 
 - **`xerj code` and `xerj corpus add|index|list` — the reference-coding loop
   is in the binary ([#977](https://github.com/xerj-org/xerj/issues/977)).**
@@ -34,26 +63,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `xerj corpus add`). Semantics live in the new `xerj-common::xccode` pure
   core, shared byte-for-byte by the CLI prose and the MCP tool text.
 
-### Removed
-
-- `tools/xerj-code/scripts/{xc.py,xc-index.sh,xc-corpus.sh}` and their
-  Python/shell test suites. Most behaviour is ported and gated by scoped cargo
-  tests (`xerj-common::xccode`, `xerj-autoindex::xc`, the MCP schema drift
-  test); the `--fresh` swap contract — the destructive side of
-  `xerj corpus index --fresh` — is re-pinned in `xerj-autoindex/src/xc.rs` as
-  ten contract tests running the REAL flow against a fake node and a fake
-  autoindex runner behind injected seams
-  ([#1004](https://github.com/xerj-org/xerj/issues/1004)): switch-readers-
-  before-retiring, deletes by exact name only, a failed or empty build leaving
-  the old index untouched, a count the node never answered authorising no
-  delete and no switch, sibling corpora never touched, first-build salvage,
-  resume under the recorded prefix and state dir, build-id collisions inside
-  one second, and the legacy no-ledger path. The deliberate
-  drops are the post-query field-report nudge (2026-09-18 llms.txt directive:
-  no obligation language) and per-hit hybrid arm annotations (server-side RRF
-  exposes no per-leg ranks).
-
 ### Fixed
+
+- **The rerank stage, fixed and measured honestly.** As it shipped in rc.75
+  the `rerank` stage scored 0.3822 nDCG@10 where BM25 alone scored 0.7750
+  (40-query SciFact pilot) — every candidate sat in one shared `state` blob, so
+  the judge scored the pile once. Each candidate now rides in its own noul:
+  **0.8299** through the real stage path. Full runs, 3 shuffled repeats each:
+  SciFact **0.6572 → 0.7410**, NFCorpus **0.3016 → 0.3312** (still losing to
+  the local hybrid 0.3448 — kept, not hidden). Two published caveats: provider
+  non-determinism is ±0.01 nDCG@10, and the probabilities order well but are
+  not calibrated (ECE 0.1023 / 0.1332).
+
+- **Ingest memory: a 1 GB mailbox no longer aborts under the default 16 GiB
+  cap, and at-rest settled memory halved**
+  ([#948](https://github.com/xerj-org/xerj/issues/948), PR #1002). A 1 GB
+  mailbox peaked at 25.4 GiB VmHWM under the 16 GiB cap (aborted: 510/2,530
+  needles missing, 0 edges; 68.5 GiB uncapped). The ingest-memory ledger found
+  four causes: `memtable_shards` retained one parsed `Arc<Value>` per
+  explicit-id write forever (flush drained the FTS memtable, never the storage
+  shards — ~2.4-3.1x source bytes invisible to every ledger category);
+  raw-bytes entries charged a flat 800 B regardless of payload; merge batches
+  were cut by segment count while the executor materialises 5-9x input bytes;
+  and the RSS breaker only 429'd, never drained. Now: published memtable
+  entries are pruned at flush finalise, entry charges are structural, merge
+  batches are cut by input bytes (`XERJ_MERGE_BATCH_MAX_INPUT_MB`), and an
+  engaged breaker drains (flush + release caches + jemalloc arena purge,
+  rate-limited). Measured, same harness both sides: at-rest settled
+  972.8 -> 481-488 MiB (variant A, 3 runs) and 883.0 -> 280.8 MiB (variant C,
+  100k x 100 B; retention ~677 -> ~108 MB). Merge batching follows the
+  quickwit/tantivy approach (streaming_writer.rs:378, log_merge_policy.rs:22 —
+  no code copied).
+- **scalar8 keeps its promise: 2.3x faster kNN, and `_score` no longer depends
+  on the filter**
+  ([#392](https://github.com/xerj-org/xerj/issues/392), PR #999). scalar8
+  advertised a ~4x smaller vector working set and an ES-like score and
+  delivered neither: candidates were quantised per query from `_source`
+  f32s (nothing smaller resident), and the SQ8 codebook was fitted per query
+  over the candidate set, so `_score` changed with the filter (measured:
+  up to 2e-05 drift, 19/30 order swaps from an unrelated-only filter). Codes
+  are now written at ingest into a per-field flat `Sq8CodeStore`
+  (slot-addressed, tombstoned on delete, codebook fitted from ingested
+  vectors and widened on out-of-range), re-derived by a background
+  authoritative walk on restart, and served by `run_knn_sq8_codes_scan` —
+  which fails safe to the exact scan on any coverage gate miss. Measured,
+  50k x 128-d cosine: recall@10 0.9700 -> 0.9620, p50 0.55 -> 0.24 ms
+  (**2.3x**), codes resident exactly 50k*128 bytes, filter drift **exactly
+  0.0**. Scoring working set 4x smaller; total memory is not (f32 `_source`
+  kept) — docs say both. qdrant's encoded_vectors_u8.rs approach adapted
+  (Apache-2.0, cited in module docs); Lucene approach-only.
+- **The Windows build compiles again: the jemalloc purge hook is cfg-gated out
+  on MSVC** (PR #999). #948's boot hook called `tikv_jemalloc_ctl`
+  unguarded, but the tikv crates are target-gated out on msvc in
+  xerj-server/Cargo.toml — every merge-ref off main failed the Windows FD
+  smoke with E0433 since #948 landed (the serialised runner queue completed
+  the job after the merge decision, which is why main slid red for two
+  merges). Statement-level `#[cfg(not(target_env = "msvc"))]` on the hook
+  install only; the engine's default no-op purge covers MSVC and the
+  resource sampler still runs everywhere.
+- `_bulk` no longer truncates an action-line `_id` at an escaped quote: two
+  ids sharing a prefix up to a `"` collapsed onto one stored id and the
+  second document silently overwrote the first; `\\`, `\/` and `\uXXXX`
+  in ids were stored as literal escape text
+  ([#954](https://github.com/xerj-org/xerj/issues/954), PR #983).
+- The docs fact-check rule no longer rejects `xerj search`, which exists: the
+  pattern's subcommand list predated the query clients, so every page
+  demonstrating the search CLI shipped with an ERROR-level finding
+  ([#963](https://github.com/xerj-org/xerj/issues/963), PR #978).
+
+- `mcp`: `xerj_search` defaults its index to the `ax-*` autoindex prefix, so
+  the documented no-argument call works on a fresh node (#962, PR #980).
+- `xerj feedback --open-pr` only runs in a checkout of xerj-org/xerj — it no
+  longer commits and pushes into whatever repository it is run from (#960,
+  PR #981).
+- Console passkey enrolment works on any port: the WebAuthn RP is derived from
+  the bound address instead of a hard-coded localhost (#935, PR #987).
+- Filters around a hybrid query are applied instead of ignored: a
+  `bool{must: hybrid, filter}` pushes the filter into every leg, and
+  `post_filter` beside `hybrid` is rejected with a 400 (#943, PR #988).
+- `filter` / `filters` aggregations with wildcards or regexps share the query
+  path's matchers instead of counting 0 or everything (#959, PR #992).
+- `autoindex --no-graph` replays the index phase through a bounded parallel
+  window — **1.64× the index phase** on the repro corpus, deterministic by
+  construction (#933, PR #989).
+- `xerj init` on a default (auth-on) node writes an MCP entry that actually
+  works: the loopback console falls back to the admin key instead of answering
+  401 to every tool call (#961, PR #982).
+- A `fields` clause is no longer silently dropped when `_source` includes omit
+  the field — both apply, as siblings (#932, PR #991).
+- A declared per-field analyzer keeps applying after `_flush`: analysis config
+  persists instead of reverting to the memtable-only default (#937, PR #994).
+- Neural ingest no longer keeps ~3.4 of 32 threads busy behind one window:
+  bounded window concurrency for a single `_bulk` stream (settings count now
+  127, enforced by `journey_zero_config`) — first slice of #938 (#938, PR #995).
+- `autoindex`: a one-file change no longer costs O(corpus) twice — snapshot and
+  catalog updates are incremental (#971, PR #998).
+- Semantic/hybrid over multi-passage documents hydrates only the winners
+  instead of deep-cloning every `_source` per query — the repro query drops
+  ~410 ms (≈2.3×) (#939, PR #979).
+- Generated articles carry an explicit `updated:` date so regenerated pages
+  stop drifting on merge (#974, PR #984).
+- Console graph (Reader panel, Second Brain dashboard) reads go through the
+  signed-in console session instead of keyless routes — a signed-in operator on
+  an auth-on node gets the graph, and a refused listing says so instead of
+  rendering as an empty graph (#936, PR #996).
 
 - **The Second Brain dashboard and the reader's graph panel are no longer 401
   for a signed-in operator on an auth-enabled engine (the default).** The
@@ -72,6 +185,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still refuses the reserved namespace. `/v1/metrics` (the dashboard's
   searches-per-index tile) stays key-only by decision; the tile shows the
   refusal honestly. [#936](https://github.com/xerj-org/xerj/issues/936)
+
+### Packaging
+
+- .deb assets ship with every release (amd64/arm64), built by
+  `scripts/build-deb.sh` and verified by `scripts/verify-release.sh`;
+  docs/PACKAGING_DEBIAN.md states the Debian archive path honestly (#810).
+
+### Removed
+
+- `tools/xerj-code/scripts/{xc.py,xc-index.sh,xc-corpus.sh}` and their
+  Python/shell test suites. Most behaviour is ported and gated by scoped cargo
+  tests (`xerj-common::xccode`, `xerj-autoindex::xc`, the MCP schema drift
+  test); the `--fresh` swap contract — the destructive side of
+  `xerj corpus index --fresh` — is re-pinned in `xerj-autoindex/src/xc.rs` as
+  ten contract tests running the REAL flow against a fake node and a fake
+  autoindex runner behind injected seams
+  ([#1004](https://github.com/xerj-org/xerj/issues/1004)): switch-readers-
+  before-retiring, deletes by exact name only, a failed or empty build leaving
+  the old index untouched, a count the node never answered authorising no
+  delete and no switch, sibling corpora never touched, first-build salvage,
+  resume under the recorded prefix and state dir, build-id collisions inside
+  one second, and the legacy no-ledger path. The deliberate
+  drops are the post-query field-report nudge (2026-09-18 llms.txt directive:
+  no obligation language) and per-hit hybrid arm annotations (server-side RRF
+  exposes no per-leg ranks).
 
 ## [1.0.0-rc.75] - 2026-09-20
 
