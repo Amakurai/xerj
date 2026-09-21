@@ -17549,6 +17549,29 @@ impl Index {
                 .await;
         }
 
+        // ── #943: a `hybrid` the ladder above declined is about to be
+        // silently dropped ──────────────────────────────────────────────────
+        // Every hybrid-aware peel has passed by now, so a Hybrid node still
+        // in the tree is heading for the generic path, where the doc
+        // matcher's catch-all (`_ => false`) makes the clause match nothing:
+        // `bool{must:[hybrid, …]}`, a hybrid beside a must_not, dis_max over
+        // a hybrid … all answered 200 with 0 hits (or with the non-hybrid
+        // clauses' hits and the hybrid silently dropped). Fail loud with a
+        // 400 naming the supported spellings, mirroring the `_passage` guard
+        // above and the aggs-beside-hybrid rejection in
+        // `run_hybrid_with_deadline`. `unwrap_single_clause_bool` has already
+        // erased the harmless one-clause wrappers, so this only fires on
+        // shapes that genuinely cannot execute.
+        if query.contains_hybrid() {
+            return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
+                "hybrid queries are supported at the top level or as \
+                 bool{must: [hybrid], filter: […]} (the filter clauses are pushed \
+                 into every leg); this query nests a hybrid where it cannot be \
+                 executed and would silently match nothing — put the filter inside \
+                 each leg of hybrid.queries, or move the hybrid to the top level",
+            )));
+        }
+
         // ── #825: `knn` clause inside a compound `bool` ────────────────────────
         // Every vector-aware short-circuit above has declined by now, so a
         // `Knn` node still in the tree is about to hit the generic path,
@@ -36189,6 +36212,60 @@ fn peel_hybrid_query(
         QueryNode::Constant { query, .. }
         | QueryNode::Boosted { query, .. }
         | QueryNode::Named { query, .. } => peel_hybrid_query(query),
+        QueryNode::Bool {
+            must,
+            should,
+            filter,
+            must_not,
+            minimum_should_match,
+        } => {
+            // #943: mirror peel_knn_query / peel_semantic_query — dispatch the
+            // simple case of a bool with exactly one must/should clause
+            // holding a `hybrid`. The Hybrid AST has no filter field, so the
+            // wrapper's `filter` clauses are pushed into EVERY leg as
+            // `Bool{must:[leg], filter:[…]}` — mechanically identical to the
+            // spelling the issue verified as correct (filter inside each
+            // leg), where each wrapped leg re-enters search_inner and the
+            // semantic/knn/bool paths all apply filters. Without this arm the
+            // wrapper fell through to the generic path, whose doc matcher has
+            // no `QueryNode::Hybrid` arm (catch-all `_ => false`), so the
+            // must clause matched NOTHING — a 200 with 0 hits. Multi-clause
+            // bools (a hybrid clause beside a lexical one) still fall through
+            // to the contains-hybrid guard below.
+            if !must_not.is_empty() {
+                return None;
+            }
+            let candidates: Vec<&QueryNode> = must.iter().chain(should.iter()).collect();
+            if candidates.len() != 1 {
+                return None;
+            }
+            // A lone `should` clause with an explicit minimum_should_match
+            // changes the wrapper's own semantics (0 = optional, ≥2 with one
+            // clause = matches nothing, Field/Script resolve per doc) — those
+            // are not equivalent to `must`, so decline instead of silently
+            // re-reading them.
+            if !should.is_empty() && minimum_should_match.is_some() {
+                return None;
+            }
+            let (sub_queries, fusion) = peel_hybrid_query(candidates[0])?;
+            if filter.is_empty() {
+                return Some((sub_queries, fusion));
+            }
+            let wrapped = sub_queries
+                .into_iter()
+                .map(|wq| xerj_query::ast::WeightedQuery {
+                    query: QueryNode::Bool {
+                        must: vec![wq.query],
+                        should: Vec::new(),
+                        must_not: Vec::new(),
+                        filter: filter.clone(),
+                        minimum_should_match: None,
+                    },
+                    weight: wq.weight,
+                })
+                .collect();
+            Some((wrapped, fusion))
+        }
         _ => None,
     }
 }
@@ -39901,7 +39978,10 @@ fn is_doc_scan_query(q: &QueryNode) -> bool {
 /// `block_in_place` across many worker threads; a shared map would just
 /// re-serialise the hot loop.  Capped and cleared at 64 entries — the
 /// pattern set is query-supplied and must not grow unbounded.
-fn compiled_anchored_regex(pattern: &str) -> Option<Regex> {
+// pub(crate) for #959: the filter/filters aggregations evaluate `regexp`
+// clauses through this same compile-once cache (aggs.rs
+// `doc_matches_filter`) instead of silently counting every document.
+pub(crate) fn compiled_anchored_regex(pattern: &str) -> Option<Regex> {
     use std::cell::RefCell;
     thread_local! {
         static REGEX_CACHE: RefCell<std::collections::HashMap<String, Option<Regex>>> =
@@ -44985,7 +45065,10 @@ fn json_scalar_equal(dv: &Value, query_val: &Value) -> bool {
 }
 
 /// Simple wildcard pattern matching: `?` = any single char, `*` = zero or more chars.
-fn wildcard_match(text: &str, pattern: &str) -> bool {
+// pub(crate) for #959: the filter/filters aggregations evaluate their
+// clauses with this same glob matcher (aggs.rs `doc_matches_filter`) so a
+// `wildcard` counts identically inside an agg and as a query.
+pub(crate) fn wildcard_match(text: &str, pattern: &str) -> bool {
     let text: Vec<char> = text.chars().collect();
     let pattern: Vec<char> = pattern.chars().collect();
     wildcard_match_inner(&text, &pattern)

@@ -1,0 +1,177 @@
+# Issue #959: a `wildcard` with an inner `*`, a `*` at both ends, or a `?`
+# counted 0 inside a `filter`/`filters` aggregation, and a `regexp` counted
+# EVERY document — while the same clause as a query (`_count`/`_search`)
+# was right. One section per row of the issue's table; each row checks the
+# `filter` agg AND the `filters` agg.
+setup:
+  - do:
+      indices.create:
+          index: aggrepro
+          body:
+            mappings:
+              properties:
+                loc:
+                  type: keyword
+                subject:
+                  type: keyword
+
+  - do:
+      bulk:
+        refresh: true
+        index: aggrepro
+        body: |
+          {"index":{}}
+          {"loc": "m0-msg-s0", "subject": "Lunch on Friday?"}
+          {"index":{}}
+          {"loc": "m812-msg-s0", "subject": "Quarterly report"}
+          {"index":{}}
+          {"loc": "m812-att0-s0", "subject": "Quarterly report"}
+
+---
+"Wildcard with an inner star":
+  - do:
+      search:
+        size: 0
+        body:
+          aggs:
+            f:
+              filter:
+                wildcard:
+                  loc:
+                    value: "m*-msg-s0"
+
+  - match: { hits.total.value: 3 }
+  - match: { aggregations.f.doc_count: 2 }
+
+  - do:
+      search:
+        size: 0
+        body:
+          aggs:
+            f:
+              filters:
+                filters:
+                  the_bucket:
+                    wildcard:
+                      loc:
+                        value: "m*-msg-s0"
+
+  - match: { aggregations.f.buckets.the_bucket.doc_count: 2 }
+
+---
+"Wildcard with a star at both ends and case_insensitive":
+  - do:
+      search:
+        size: 0
+        body:
+          aggs:
+            f:
+              filter:
+                wildcard:
+                  subject:
+                    value: "*lunch*"
+                    case_insensitive: true
+
+  - match: { aggregations.f.doc_count: 1 }
+
+  - do:
+      search:
+        size: 0
+        body:
+          aggs:
+            f:
+              filters:
+                filters:
+                  the_bucket:
+                    wildcard:
+                      subject:
+                        value: "*lunch*"
+                        case_insensitive: true
+
+  - match: { aggregations.f.buckets.the_bucket.doc_count: 1 }
+
+---
+"Wildcard question mark matches one char":
+  - do:
+      search:
+        size: 0
+        body:
+          aggs:
+            f:
+              filter:
+                wildcard:
+                  loc:
+                    value: "m0-msg-s?"
+
+  - match: { aggregations.f.doc_count: 1 }
+
+  - do:
+      search:
+        size: 0
+        body:
+          aggs:
+            f:
+              filters:
+                filters:
+                  the_bucket:
+                    wildcard:
+                      loc:
+                        value: "m0-msg-s?"
+
+  - match: { aggregations.f.buckets.the_bucket.doc_count: 1 }
+
+---
+"Regexp counts only matching documents":
+  - do:
+      search:
+        size: 0
+        body:
+          aggs:
+            f:
+              filter:
+                regexp:
+                  loc: "m[0-9]+-msg-s0"
+
+  - match: { aggregations.f.doc_count: 2 }
+
+  - do:
+      search:
+        size: 0
+        body:
+          aggs:
+            f:
+              filters:
+                filters:
+                  the_bucket:
+                    regexp:
+                      loc: "m[0-9]+-msg-s0"
+
+  - match: { aggregations.f.buckets.the_bucket.doc_count: 2 }
+
+---
+"Match nothing still counts zero":
+  - do:
+      search:
+        size: 0
+        body:
+          aggs:
+            f:
+              filter:
+                match:
+                  subject: "nothing-matches-this"
+
+  - match: { aggregations.f.doc_count: 0 }
+
+  - do:
+      search:
+        size: 0
+        body:
+          aggs:
+            f:
+              filters:
+                filters:
+                  the_bucket:
+                    match:
+                      subject: "nothing-matches-this"
+
+  - match: { aggregations.f.buckets.the_bucket.doc_count: 0 }

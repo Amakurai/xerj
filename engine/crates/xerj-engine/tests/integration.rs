@@ -1794,6 +1794,316 @@ async fn passage_provenance_rejects_ambiguous_multi_vector_composition_in_any_or
     }
 }
 
+// ── #943: filters around a hybrid query ──────────────────────────────────────
+//
+// Two shapes were accepted and wrong: `bool{must: hybrid, filter: […]}` matched
+// NOTHING (the generic doc matcher has no Hybrid arm, so the must clause failed
+// every doc → 200 with 0 hits), and a top-level `post_filter` beside `hybrid`
+// was silently ignored. The fix gives `peel_hybrid_query` the same Bool arm its
+// siblings `peel_knn_query` / `peel_semantic_query` already have: the wrapper's
+// filter clauses are pushed into EVERY leg, which is exactly the
+// "filter inside each leg" spelling the issue verified as correct.
+
+/// Docs shared by the #943 tests: two legs (`match` on `title`, `match` on
+/// `body`, both operator AND) whose match sets are singletons, so the fused
+/// union, the per-leg ranks, and therefore the RRF scores are fully
+/// deterministic.
+async fn hyb943_index() -> std::sync::Arc<xerj_engine::Index> {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    engine.create_index("hyb943", Schema::empty()).unwrap();
+    let idx = engine.get_index("hyb943").unwrap();
+    for (id, title, body, ax_format) in [
+        ("d1", "alpha beta", "gamma delta", "eml"),
+        ("d2", "gamma delta", "alpha beta", "pdf"),
+        ("d3", "epsilon zeta", "eta theta", "txt"),
+        ("d4", "alpha zeta", "alpha theta", "eml"),
+    ] {
+        idx.index_document(
+            Some(id.into()),
+            json!({ "title": title, "body": body, "ax_format": ax_format }),
+        )
+        .await
+        .unwrap();
+    }
+    idx.refresh().await.unwrap();
+    idx
+}
+
+/// Legs shared by the #943 tests: title match hits only d1, body match hits
+/// only d2, weights 1.0 / 0.8 like the issue's reproduce.
+fn hyb943_legs() -> Value {
+    json!([
+        { "query": { "match": { "title": { "query": "alpha beta", "operator": "and" } } },
+           "weight": 1.0 },
+        { "query": { "match": { "body": { "query": "alpha beta", "operator": "and" } } },
+           "weight": 0.8 }
+    ])
+}
+
+/// #943 shape A: `bool{must: hybrid, filter: […]}` must apply the filter —
+/// same hit set AND same fused scores as the verified-correct "filter inside
+/// each leg" spelling (the fix builds exactly that), instead of the pre-fix
+/// 200-with-0-hits.
+#[tokio::test]
+async fn bool_must_hybrid_with_filter_applies_the_filter() {
+    let idx = hyb943_index().await;
+
+    let hybrid = json!({
+        "hybrid": { "queries": hyb943_legs(), "fusion": { "type": "rrf", "k": 60 } }
+    });
+
+    // Baseline: the root hybrid is untouched by the fix — d1 (title leg) and
+    // d2 (body leg) in some RRF order, d3/d4 nowhere.
+    let root = idx.search(&make_search(hybrid.clone())).await.unwrap();
+    let root_ids: Vec<&str> = root.hits.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(root.total.value, 2, "root hybrid baseline: {root_ids:?}");
+    assert!(
+        root_ids.contains(&"d1") && root_ids.contains(&"d2"),
+        "root hybrid baseline hits: {root_ids:?}"
+    );
+
+    // Shape A (pre-fix: 0 hits).
+    let shape_a = idx
+        .search(&make_search(json!({
+            "bool": {
+                "must": hybrid,
+                "filter": [ { "term": { "ax_format": "eml" } } ]
+            }
+        })))
+        .await
+        .unwrap();
+    assert!(
+        shape_a.total.value > 0,
+        "#943: bool{{must: hybrid, filter}} returned 0 hits (the hybrid clause \
+         matched nothing on the generic path)"
+    );
+    let a_hits: Vec<(String, f32)> = shape_a
+        .hits
+        .iter()
+        .map(|h| (h.id.clone(), h.score))
+        .collect();
+    assert!(
+        a_hits.iter().all(|(id, _)| id == "d1"),
+        "shape A must keep only the eml docs that match the legs: {a_hits:?}"
+    );
+
+    // The verified-correct spelling B: the filter inside each leg.
+    let legs_eml: Vec<Value> = hyb943_legs()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|leg| {
+            json!({ "query": {
+                "bool": {
+                    "must": [leg["query"].clone()],
+                    "filter": [ { "term": { "ax_format": "eml" } } ]
+                }
+            }, "weight": leg["weight"] })
+        })
+        .collect();
+    let shape_b = idx
+        .search(&make_search(json!({
+            "hybrid": { "queries": legs_eml, "fusion": { "type": "rrf", "k": 60 } }
+        })))
+        .await
+        .unwrap();
+    let b_hits: Vec<(String, f32)> = shape_b
+        .hits
+        .iter()
+        .map(|h| (h.id.clone(), h.score))
+        .collect();
+    assert_eq!(
+        a_hits, b_hits,
+        "#943: shape A (filter pushed into every leg) must equal spelling B \
+         (filter written inside every leg) — ids AND fused scores"
+    );
+}
+
+/// #943 regression: plain `bool{must: hybrid}` with NO filter also used to
+/// fall through to the generic path (0 hits). It must now be bit-identical to
+/// the root hybrid.
+#[tokio::test]
+async fn bool_must_hybrid_without_filter_matches_the_root_hybrid() {
+    let idx = hyb943_index().await;
+
+    let hybrid = json!({
+        "hybrid": { "queries": hyb943_legs(), "fusion": { "type": "rrf", "k": 60 } }
+    });
+    let root = idx.search(&make_search(hybrid.clone())).await.unwrap();
+    let wrapped = idx
+        .search(&make_search(json!({ "bool": { "must": hybrid } })))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        wrapped.total.value, root.total.value,
+        "#943: bool{{must: hybrid}} used to return 0 hits"
+    );
+    let root_hits: Vec<(String, f32)> = root.hits.iter().map(|h| (h.id.clone(), h.score)).collect();
+    let wrapped_hits: Vec<(String, f32)> = wrapped
+        .hits
+        .iter()
+        .map(|h| (h.id.clone(), h.score))
+        .collect();
+    assert_eq!(
+        wrapped_hits, root_hits,
+        "#943: bool{{must: hybrid}} must be bit-identical to the root hybrid"
+    );
+}
+
+/// #943 with a semantic leg (the issue's exact leg types): the wrapper filter
+/// is pushed into the semantic leg too, where `peel_semantic_query`'s own Bool
+/// arm merges it into the kNN filter.
+#[tokio::test]
+async fn bool_must_hybrid_with_filter_covers_the_semantic_leg() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    // The schema shape es_compat produces for `"type": "semantic_text"`
+    // (see `test_semantic_text_match_survives_flush`): lexical side = Text,
+    // plus the built-in lexical embedder for the companion vector.
+    let mut schema = Schema::empty();
+    let mut fc = FieldConfig::new("body", FieldType::Text);
+    fc.options.dimensions = Some(16);
+    fc.options.similarity = Some("cosine".to_string());
+    fc.embedding = Some(xerj_common::types::EmbeddingConfig {
+        endpoint: None,
+        model: None,
+        target_field: Some("body_vector".to_string()),
+    });
+    schema.fields.push(fc);
+    engine.create_index("hyb943-sem", schema).unwrap();
+    let idx = engine.get_index("hyb943-sem").unwrap();
+    for (id, body, ax_format) in [
+        ("s1", "retention policy backup deletion", "eml"),
+        ("s2", "retention policy archive", "pdf"),
+        ("s3", "retention policy backup deletion", "txt"),
+        ("s4", "quarterly unrelated prose", "eml"),
+    ] {
+        idx.index_document(
+            Some(id.into()),
+            json!({ "body": body, "ax_format": ax_format }),
+        )
+        .await
+        .unwrap();
+    }
+    idx.refresh().await.unwrap();
+
+    let legs = json!([
+        { "query": { "match": { "body": "retention backup" } }, "weight": 1.0 },
+        { "query": { "semantic": { "field": "body", "query": "retention policy backup", "k": 10 } },
+           "weight": 0.8 }
+    ]);
+    let run = |query: Value| {
+        let idx = idx.clone();
+        async move { idx.search(&make_search(query)).await.unwrap() }
+    };
+
+    let shape_a = run(json!({
+        "bool": {
+            "must": { "hybrid": { "queries": legs, "fusion": { "type": "rrf", "k": 60 } } },
+            "filter": [ { "term": { "ax_format": "eml" } } ]
+        }
+    }))
+    .await;
+    assert!(
+        shape_a.total.value > 0,
+        "#943: filtered hybrid with a semantic leg returned 0 hits"
+    );
+    assert!(
+        shape_a
+            .hits
+            .iter()
+            .all(|h| h.source["ax_format"] == json!("eml")),
+        "every hit must be an eml doc: {:?}",
+        shape_a
+            .hits
+            .iter()
+            .map(|h| h.id.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let legs_eml: Vec<Value> = legs
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|leg| {
+            json!({ "query": {
+                "bool": {
+                    "must": [leg["query"].clone()],
+                    "filter": [ { "term": { "ax_format": "eml" } } ]
+                }
+            }, "weight": leg["weight"] })
+        })
+        .collect();
+    let shape_b = run(json!({
+        "hybrid": { "queries": legs_eml, "fusion": { "type": "rrf", "k": 60 } }
+    }))
+    .await;
+    let a: Vec<(String, f32)> = shape_a
+        .hits
+        .iter()
+        .map(|h| (h.id.clone(), h.score))
+        .collect();
+    let b: Vec<(String, f32)> = shape_b
+        .hits
+        .iter()
+        .map(|h| (h.id.clone(), h.score))
+        .collect();
+    assert_eq!(
+        a, b,
+        "#943: semantic-leg hybrid — shape A must equal the per-leg spelling"
+    );
+}
+
+/// #943 defense-in-depth: shapes the Bool peel arm deliberately declines
+/// (`must_not` beside the hybrid; a hybrid beside another should-clause) used
+/// to silently return wrong hits — 0 hits, or the non-hybrid clause's hits
+/// with the hybrid dropped. They must now fail loud (400-class invalid_query)
+/// naming the supported spellings instead of answering.
+#[tokio::test]
+async fn unpeelable_hybrid_fails_loud_instead_of_returning_wrong_hits() {
+    let idx = hyb943_index().await;
+    let hybrid = json!({
+        "hybrid": { "queries": hyb943_legs(), "fusion": { "type": "rrf", "k": 60 } }
+    });
+
+    // bool{must: hybrid, must_not: […]}: pre-fix 200 with 0 hits.
+    let err = idx
+        .search(&make_search(json!({
+            "bool": {
+                "must": hybrid,
+                "must_not": [ { "term": { "ax_format": "txt" } } ]
+            }
+        })))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("hybrid") && err.contains("filter"),
+        "#943: must_not-beside-hybrid must fail loud naming the supported spellings: {err}"
+    );
+
+    // bool{should: [hybrid, match]}: pre-fix 200 with the match half's hits
+    // only (the hybrid clause silently matched nothing).
+    let err = idx
+        .search(&make_search(json!({
+            "bool": {
+                "should": [
+                    hybrid,
+                    { "match": { "title": { "query": "alpha beta", "operator": "and" } } }
+                ]
+            }
+        })))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("hybrid"),
+        "#943: a hybrid beside another should-clause must fail loud: {err}"
+    );
+}
+
 fn make_search(query_json: Value) -> SearchRequest {
     parse_request(&json!({ "query": query_json, "size": 100 })).expect("parse_request")
 }

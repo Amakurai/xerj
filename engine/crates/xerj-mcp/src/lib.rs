@@ -472,7 +472,12 @@ pub fn tool_specs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "index": { "type": "string", "description": "Index name to search." },
+                    "index": {
+                        "type": "string",
+                        "description": "Index name or pattern to search. Defaults to `ax-*` — \
+                         the prefix `xerj autoindex` writes — so the common case needs \
+                         no argument. Pass an explicit name to search anything else."
+                    },
                     "query": {
                         "type": ["object", "string"],
                         "description": "Plain string (definition-first code search) or ES query-DSL clause. Omit for match_all.",
@@ -482,8 +487,7 @@ pub fn tool_specs() -> Value {
                     "sort": { "description": "ES sort clause (array or object)." },
                     "_source": { "description": "Source filtering (bool, field, or {includes,excludes})." },
                     "rerank": rerank_arg_schema(false)
-                },
-                "required": ["index"]
+                }
             }
         },
         {
@@ -960,7 +964,17 @@ fn apply_rerank(
 }
 
 fn build_search(args: &Value) -> Result<BuiltRequest, String> {
-    let index = req_str(args, "index")?;
+    // #962: `index` used to be required, but nothing an agent reads said what
+    // to pass — the first real tool call after `xerj autoindex` was an error
+    // until the agent guessed `ax-*`. Default to the prefix autoindex writes
+    // (matching the CLI's `xerj search`, which defaults to "ax"); an explicit
+    // index still wins.
+    let index = args
+        .get("index")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("ax-*");
     let mut body = serde_json::Map::new();
     let mut plain_string = false;
     match args.get("query") {
@@ -1311,8 +1325,18 @@ mod tests {
     }
 
     #[test]
-    fn search_requires_index() {
-        assert!(build_search(&json!({})).is_err());
+    fn search_index_defaults_to_the_autoindex_prefix() {
+        // #962: an agent that ran `xerj autoindex` and then called
+        // xerj_search with no index got isError on its first real tool
+        // call — nothing said the corpus lives under `ax-*`. The default
+        // now matches what autoindex writes (and what `xerj search` uses).
+        let (_, path, _) = built(build_search(&json!({})));
+        assert_eq!(path, "/ax-*/_search");
+        // Whitespace-only is treated as absent; explicit index still wins.
+        let (_, path, _) = built(build_search(&json!({ "index": "  " })));
+        assert_eq!(path, "/ax-*/_search");
+        let (_, path, _) = built(build_search(&json!({ "index": "docs" })));
+        assert_eq!(path, "/docs/_search");
     }
 
     #[test]
@@ -1507,9 +1531,8 @@ mod tests {
             assert!(
                 !spec["inputSchema"]["required"]
                     .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|r| r == "rerank"),
+                    .map(|r| r.iter().any(|r| r == "rerank"))
+                    .unwrap_or(false),
                 "{tool}: `rerank` is optional"
             );
         }

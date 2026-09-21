@@ -89,7 +89,7 @@ use tracing_subscriber::EnvFilter;
 use xerj_api::{build_es_compat_router, build_native_router, AppState};
 use xerj_cluster::{transport::TcpTransport, ClusterNode, ClusterRunner};
 use xerj_common::{config::Config, metrics::Metrics};
-use xerj_console_api::{state::ClusterMode, ConsoleState};
+use xerj_console_api::{state::ClusterMode, ConsoleState, RpConfig};
 use xerj_engine::Engine;
 
 mod brain;
@@ -2327,14 +2327,13 @@ async fn async_main() -> Result<()> {
     //    key or partially-initialized stores.
     let xerj_console_bind_url = format!(
         "http://{}:{}",
-        if cfg.server.bind_address == "0.0.0.0" || cfg.server.bind_address == "::" {
-            "localhost".to_string()
-        } else {
-            // Bracketed for IPv6 — an unbracketed `http://::1:9200/…` is not a
-            // URL any browser will open, and this string is printed in the
-            // first-launch console link.
-            url_host(&cfg.server.bind_address)
-        },
+        // Every loopback or unspecified bind is *addressed* as `localhost`
+        // (issue #935): browsers refuse an IP-literal WebAuthn origin
+        // outright, so a first-launch link printed with `127.0.0.1` or
+        // `[::1]` could never complete passkey enrolment even once the
+        // relying party is derived from this same URL. Non-loopback
+        // addresses keep their spelling, IPv6 bracketed.
+        xerj_console_api::public_bind_host(&cfg.server.bind_address),
         // The bound ES-compat port (8c), not `cfg.server.es_compat_port`: with
         // an ephemeral port (`= 0`) the config value is never the port the
         // node ends up listening on (issue #469).
@@ -2379,15 +2378,31 @@ async fn async_main() -> Result<()> {
         )
         .await
         .context("xerj-console bootstrap")?;
-        Some(
-            ConsoleState::new(
+        Some({
+            // #935: the WebAuthn relying party follows the address and port
+            // the console is actually served on — `ConsoleState::new`'s
+            // hard-coded `http://localhost:9200` origin meant every node on
+            // another port refused the very first passkey enrolment with
+            // "origin does not match". A non-loopback IP bind has no honest
+            // RP (WebAuthn ids must be domains), so the console's passkey
+            // sign-in is unavailable there rather than the node refusing to
+            // serve its data-plane API over a console-only limitation.
+            let console_rp = match RpConfig::from_bind_url(&xerj_console_bind_url) {
+                Ok(rp) => rp,
+                Err(why) => {
+                    warn!("Xerj Console passkey sign-in is unavailable: {why}");
+                    RpConfig::default()
+                }
+            };
+            ConsoleState::new_with_rp(
                 engine.clone(),
                 xerj_console_node_id,
                 outcome.master_key,
                 xerj_console_cluster_mode,
+                console_rp,
             )
-            .with_trusted_proxies(trusted_proxies),
-        )
+            .with_trusted_proxies(trusted_proxies)
+        })
     } else {
         warn!(
             "Xerj Console bootstrap and routes are disabled while cluster-state storage is unavailable"
