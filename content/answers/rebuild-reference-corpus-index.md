@@ -1,28 +1,28 @@
 ---
 title: "How do I rebuild a reference-coding corpus index from scratch?"
-h1: "xc-index.sh --fresh failed. How do I rebuild a corpus index?"
-description: "xc-index.sh --fresh builds a replacement index beside the old one, verifies it has records, switches the state file, and only then retires the old index. A failed build costs nothing."
+h1: "xerj corpus index --fresh failed. How do I rebuild a corpus index?"
+description: "xerj corpus index --fresh builds a replacement index beside the old one, verifies it has records, switches the state file, and only then retires the old index. A failed build costs nothing."
 slug: "rebuild-reference-corpus-index"
 cluster: "Coding agents: reference retrieval"
 question: "How do I rebuild a reference-coding corpus index from scratch?"
 intent: "how-to"
 published: "2026-09-18"
-updated: "2026-09-20"
+updated: "2026-09-21"
 author: "XERJ documentation team"
 reviewer: "XERJ engineering team"
 schema_type: "TechArticle"
-agent_prompt: "Act as a coding agent maintaining a reference-coding corpus. Read https://xerj.org/llms.txt. When xc.py reports an index older than 30 days, or a plain xc-index.sh run says the state directory cannot become generation authority, run tools/xerj-code/scripts/xc-index.sh <corpus> --fresh. Do not delete the old indices yourself and do not pass --fresh to xerj autoindex directly. Read the script's last lines: it states the record count of the verified replacement, or that the existing index was NOT touched."
+agent_prompt: "Act as a coding agent maintaining a reference-coding corpus. Read https://xerj.org/llms.txt. When xerj code reports an index older than 30 days, or a plain `xerj corpus index` run says the state directory cannot become generation authority, run `xerj corpus index <corpus> --fresh`. Do not delete the old indices yourself and do not pass --fresh to xerj autoindex directly. Read the command's last lines: it states the record count of the verified replacement, or that the existing index was NOT touched."
 commands:
-  - cmd: "bash tools/xerj-code/scripts/xc-index.sh xerj-storage"
+  - cmd: "xerj corpus index xerj-storage"
     note: "Index a corpus, or update in place the build an earlier run recorded."
-  - cmd: "bash tools/xerj-code/scripts/xc-index.sh xerj-storage --fresh"
+  - cmd: "xerj corpus index xerj-storage --fresh"
     note: "Rebuild from scratch: build beside the old index, verify, switch, then retire."
   - cmd: "bash -c 'cat ~/.xerj-code/state/xerj-storage.json'"
     note: "Read the ledger. prefix is the whole namespace; index_prefix is the one verified build."
   - cmd: "curl -s 'http://127.0.0.1:9200/xc-xerj-storage*/_count'"
-    note: "Count the records yourself. The script already did, and refused to switch on zero."
-  - cmd: "env XERJ_URL=http://127.0.0.1:9200 tools/xerj-code/scripts/xc.py xerj-storage 'merge policy segment selection'"
-    note: "Query the rebuilt corpus. xc.py addresses the verified build, not the whole namespace."
+    note: "Count the records yourself. The command already did, and refused to switch on zero."
+  - cmd: "env XERJ_URL=http://127.0.0.1:9200 xerj code xerj-storage 'merge policy segment selection'"
+    note: "Query the rebuilt corpus. xerj code addresses the verified build, not the whole namespace."
 links_out:
   - "index-reference-library-for-coding-agent"
   - "resume-interrupted-autoindex-run"
@@ -33,34 +33,34 @@ evidence:
     source: "benchmarks/autoindex-resilience/fresh-before-rc74.legacy-state.txt"
   - claim: "On v1.0.0-rc.74 xerj autoindex --fresh over a committed generation aborted with exit 1: --fresh cannot discard committed corpus generation 1 under the same destination."
     source: "benchmarks/autoindex-resilience/fresh-before-rc74.committed-generation.txt"
-  - claim: "The --fresh contract is pinned by 81 offline checks: a new state directory and prefix, --fresh never forwarded to autoindex, nothing deleted before the replacement's count was read, deletes by exact name, a failed or empty build leaves the old index and state file untouched, a sibling corpus is never touched, an interrupted first build is kept, recorded as salvaged with its real exit code, and resumed by a plain re-run under the same prefix and state directory, and a record count the node does not answer is never read as zero: it cannot get a working index retired or a finished build deleted."
-    source: "tools/xerj-code/tests/test_xc_index_fresh.py"
-  - claim: "When the ledger records a salvaged build or an autoindex exit other than 0 or 3, xc.py prints a coverage-may-be-INCOMPLETE warning on stderr on every query, keeps --json stdout parseable, and marks the corpus INCOMPLETE in --list. Exit 3 is not reported as incomplete."
-    source: "tools/xerj-code/tests/test_state_ledger.py"
-  - claim: "xc.py queries index_prefix, the one verified build, and never the bare namespace glob once a corpus has been rebuilt."
-    source: "tools/xerj-code/tests/test_state_ledger.py"
+  - claim: "When the ledger records a salvaged build or an autoindex exit other than 0 or 3, xerj code prints a coverage-may-be-INCOMPLETE warning on stderr on every query, keeps --json stdout parseable, and xerj corpus list marks the corpus INCOMPLETE. Exit 3 is not reported as incomplete. Pinned by the state-ledger tests in xccode/state.rs."
+    source: "engine/crates/xerj-common/src/xccode/state.rs"
+  - claim: "xerj code queries index_prefix, the one verified build, and never the bare namespace glob once a corpus has been rebuilt. Pinned by the prefix-fallback tests in xccode/state.rs."
+    source: "engine/crates/xerj-common/src/xccode/state.rs"
+  - claim: "The full --fresh swap contract (nothing deleted before the replacement's count was read, deletes by exact name, sibling corpora never touched, unknown counts never read as zero) was pinned by 81 offline checks against a fake node in the retired script suite; re-pinning those contracts as Rust tests around xerj corpus index is open."
+    source: "https://github.com/xerj-org/xerj/issues/1004"
 faq:
   - q: "How do I rebuild a reference-coding corpus index from scratch?"
-    a: "Run `xc-index.sh <corpus> --fresh`. It builds a replacement beside the existing index, verifies that it holds records, switches the state file, and only then deletes the old indices by exact name."
-  - q: "xc-index.sh --fresh failed. How do I rebuild a corpus index?"
-    a: "Update the script. Older versions forwarded `--fresh` to `xerj autoindex`, which refuses it once a corpus generation has committed. The current script never forwards it and rebuilds under a new prefix instead."
+    a: "Run `xerj corpus index <corpus> --fresh`. It builds a replacement beside the existing index, verifies that it holds records, switches the state file, and only then deletes the old indices by exact name."
+  - q: "xerj corpus index --fresh failed. How do I rebuild a corpus index?"
+    a: "Update the binary. Older releases shipped wrapper scripts that forwarded `--fresh` to `xerj autoindex`, which refuses it once a corpus generation has committed. The built-in command never forwards it and rebuilds under a new prefix instead."
   - q: "Does --fresh delete my working index first?"
     a: "No. The old index stays live until the replacement exited 0 or 3 and its record count is above zero. A build that fails or comes back empty is removed, and the old index and state file are left exactly as they were."
   - q: "Why does the state file have both prefix and index_prefix?"
-    a: "`prefix` is always `xc-<corpus>`, the whole namespace, so anything that globs on it keeps working. `index_prefix` is the one verified build, and it is what `xc.py` queries."
-  - q: "Is xc-index.sh --fresh the same as xerj autoindex --fresh?"
-    a: "No. `xerj autoindex --fresh` only discards the resume journal, never removes records, and is refused once a durable generation exists. The script's `--fresh` is a full rebuild under a new prefix and state directory."
+    a: "`prefix` is always `xc-<corpus>`, the whole namespace, so anything that globs on it keeps working. `index_prefix` is the one verified build, and it is what `xerj code` queries."
+  - q: "Is xerj corpus index --fresh the same as xerj autoindex --fresh?"
+    a: "No. `xerj autoindex --fresh` only discards the resume journal, never removes records, and is refused once a durable generation exists. The corpus command's `--fresh` is a full rebuild under a new prefix and state directory."
   - q: "What happens if the first build of a corpus is interrupted?"
-    a: "With no working index to fall back to, the script keeps the partial build, records `salvaged: true` and the real exit code in the state file, and warns. `xc.py` then warns on every query that coverage is incomplete. A plain `xc-index.sh <corpus>` resumes the run under the same prefix and state directory."
+    a: "With no working index to fall back to, the command keeps the partial build, records `salvaged: true` and the real exit code in the state file, and warns. `xerj code` then warns on every query that coverage is incomplete. A plain `xerj corpus index <corpus>` resumes the run under the same prefix and state directory."
   - q: "How much disk does a rebuild need?"
     a: "Room for the corpus twice. Both builds exist on the node from the start of the rebuild until the old one is retired. This was not measured; plan for double."
 ---
 
-**TL;DR** — Run `xc-index.sh <corpus> --fresh`. It builds a replacement beside the existing index, checks that it holds records, switches the state file, and only then deletes the old indices by exact name. A build that fails costs you nothing. Older versions of the script failed on every corpus that had been indexed before.
+**TL;DR** — Run `xerj corpus index <corpus> --fresh`. It builds a replacement beside the existing index, checks that it holds records, switches the state file, and only then deletes the old indices by exact name. A build that fails costs you nothing. Older releases' wrapper scripts failed on every corpus that had been indexed before.
 
 ## Why the old --fresh failed
 
-The script used to forward `--fresh` to `xerj autoindex`. That flag means something narrower than its name suggests. It discards the resume journal. It never removes records from the node. And it is refused once a durable corpus generation exists.
+The wrapper scripts used to forward `--fresh` to `xerj autoindex`. That flag means something narrower than its name suggests. It discards the resume journal. It never removes records from the node. And it is refused once a durable corpus generation exists.
 
 So the rebuild failed in both states a previously indexed corpus can be in.
 
@@ -76,7 +76,7 @@ A state directory written since refuses the flag outright:
 error: this attempt made no remote mutations. `--fresh` cannot discard committed corpus generation 1 under the same destination
 ```
 
-Both messages give the same advice: build into a new `--state-dir` and a new `--prefix`, validate, then switch readers. A wrapper that owns the whole `xc-<corpus>` namespace can do exactly that. Now it does.
+Both messages give the same advice: build into a new `--state-dir` and a new `--prefix`, validate, then switch readers. A command that owns the whole `xc-<corpus>` namespace can do exactly that. Since rc.76 it is built in: `xerj corpus index`.
 
 ## What --fresh does now
 
@@ -91,31 +91,31 @@ The old indices are listed before the build starts. The retire step can therefor
 
 ## A failed build costs nothing
 
-If autoindex aborts, or exits 0 with zero records, the script removes only what that build created. The old indices, the old state file and the old state directory stay exactly as they were, and the script says so:
+If autoindex aborts, or exits 0 with zero records, the command removes only what that build created. The old indices, the old state file and the old state directory stay exactly as they were, and the command says so:
 
 ```text
-xc-index: the existing index was NOT touched and is still what xc.py serves.
+xerj corpus index: the existing index was NOT touched and is still what `xerj code` serves.
 ```
 
-There is one case where a failed build is kept: it wrote records, and there is no working index to fall back to. Throwing it away would leave no corpus at all. autoindex can abort in finalisation after every document was written, and it can also stop part-way through a large corpus, for example when the node keeps rejecting writes. The script cannot tell the two apart, so it treats both the same way. It records the build, stores the real exit code in `autoindex_exit` with `salvaged: true`, and prints a warning that coverage is not guaranteed. It never swaps a working index out for a build that failed.
+There is one case where a failed build is kept: it wrote records, and there is no working index to fall back to. Throwing it away would leave no corpus at all. autoindex can abort in finalisation after every document was written, and it can also stop part-way through a large corpus, for example when the node keeps rejecting writes. The command cannot tell the two apart, so it treats both the same way. It records the build, stores the real exit code in `autoindex_exit` with `salvaged: true`, and prints a warning that coverage is not guaranteed. It never swaps a working index out for a build that failed.
 
-A kept build can be partial, so the reader is told. While the state file says `salvaged`, or records an exit code other than 0 or 3, `xc.py` prints this on stderr with every query, and `xc.py --list` marks the corpus `INCOMPLETE`:
+A kept build can be partial, so the reader is told. While the state file says `salvaged`, or records an exit code other than 0 or 3, `xerj code` prints this on stderr with every query, and `xerj corpus list` marks the corpus `INCOMPLETE`:
 
 ```text
-WARNING: the index for 'xerj-storage' was NOT verified complete (autoindex exit 1, kept unverified). Coverage may be INCOMPLETE: a miss here is not evidence that the code is absent. Re-run xc-index.sh xerj-storage to resume or confirm it.
+WARNING: the index for 'xerj-storage' was NOT verified complete (autoindex exit 1, kept unverified). A miss here is not evidence that the code is absent. Re-run `xerj corpus index xerj-storage` to resume or confirm it.
 ```
 
 ## A count the node does not answer is not zero
 
-Every decision above rests on a record count, and a busy node does not always answer one. A timeout, a 5xx or a refused connection is "did not say". It is not zero. The script asks up to 6 times, 5 seconds apart (`XC_COUNT_TRIES`, `XC_COUNT_PAUSE`). Only a number, or a 404 because no index matches, is believed.
+Every decision above rests on a record count, and a busy node does not always answer one. A timeout, a 5xx or a refused connection is "did not say". It is not zero. The command asks up to 6 times, 5 seconds apart (`XC_COUNT_TRIES`, `XC_COUNT_PAUSE`). Only a number, or a 404 because no index matches, is believed.
 
-When the node never says how many records the existing index holds, the script presumes it is a working index. A failed build is then not kept over it.
+When the node never says how many records the existing index holds, the command presumes it is a working index. A failed build is then not kept over it.
 
-When the node never says how many records the new build holds, nothing is deleted and nothing is switched. The build's indices and its state directory are kept. If there is a working index it keeps serving, and the next `--fresh` that verifies retires the leftover. If there is none, the build is recorded as unverified, `xc.py` warns as above, and a plain re-run confirms it once the node answers.
+When the node never says how many records the new build holds, nothing is deleted and nothing is switched. The build's indices and its state directory are kept. If there is a working index it keeps serving, and the next `--fresh` that verifies retires the leftover. If there is none, the build is recorded as unverified, `xerj code` warns as above, and a plain re-run confirms it once the node answers.
 
-An earlier draft of this script read "did not say" as zero. One 503 on one request then retired a working 500-record index in favour of a failed build, and another deleted a finished build together with its resume state. Both are reproduced in the test file and fail against that draft.
+An earlier draft of this command read "did not say" as zero. One 503 on one request then retired a working 500-record index in favour of a failed build, and another deleted a finished build together with its resume state. Both are reproduced in the retired script's test file and fail against that draft.
 
-A plain `xc-index.sh <corpus>` resumes a kept build. The kept build has its own prefix and state directory, so the re-run passes both back to autoindex, which continues from its journal. When that run exits 0 or 3 the `salvaged` mark is cleared and the warning stops.
+A plain `xerj corpus index <corpus>` resumes a kept build. The kept build has its own prefix and state directory, so the re-run passes both back to autoindex, which continues from its journal. When that run exits 0 or 3 the `salvaged` mark is cleared and the warning stops.
 
 ## Two prefixes in the state file
 
@@ -125,17 +125,17 @@ A plain `xc-index.sh <corpus>` resumes a kept build. The kept build has its own 
 
 `prefix` is always `xc-<corpus>`. It matches every build's indices, so anything that globs `xc-<corpus>*` keeps working across a rebuild.
 
-`index_prefix` is the one build that was verified. `xc.py` queries it. During a rebuild the namespace holds two builds, and a query against the whole namespace would return passages twice, or from a half-built index.
+`index_prefix` is the one build that was verified. `xerj code` queries it. During a rebuild the namespace holds two builds, and a query against the whole namespace would return passages twice, or from a half-built index.
 
-A state file written before builds existed has no `index_prefix`. `xc.py` falls back to `prefix` for it.
+A state file written before builds existed has no `index_prefix`. `xerj code` falls back to `prefix` for it.
 
 ## Siblings are safe
 
-`xc-battle-*` also matches the indices of a corpus named `battle-terse`. The script knows which corpus names extend this one, from `corpora/` and from `state/`, and leaves their indices out of every list. Deletes are by exact index name. There is no wildcard delete anywhere in the script.
+`xc-battle-*` also matches the indices of a corpus named `battle-terse`. The command knows which corpus names extend this one, from `corpora/` and from `state/`, and leaves their indices out of every list. Deletes are by exact index name. There is no wildcard delete anywhere in the command.
 
 ## A plain re-run updates in place
 
-`xc-index.sh <corpus>` without `--fresh` re-runs autoindex against the recorded build's prefix and state directory. Additions, edits, deletions and renames reconcile incrementally, and the index prefix does not change.
+`xerj corpus index <corpus>` without `--fresh` re-runs autoindex against the recorded build's prefix and state directory. Additions, edits, deletions and renames reconcile incrementally, and the index prefix does not change.
 
 If that run fails with the `generation authority` message, the corpus predates the generation format. Run `--fresh` once.
 
@@ -143,14 +143,14 @@ If that run fails with the `generation authority` message, the corpus predates t
 
 A rebuild holds the corpus on the node twice until the old build is retired. Plan disk for double. This was not measured.
 
-The old state directory of a corpus indexed before builds existed lives under `~/.xerj/autoindex/`, in a folder named by a hash. The script cannot compute that name, so it leaves the folder behind. It is harmless, and you can delete it by hand.
+The old state directory of a corpus indexed before builds existed lives under `~/.xerj/autoindex/`, in a folder named by a hash. The command cannot compute that name, so it leaves the folder behind. It is harmless, and you can delete it by hand.
 
 ## How this page was checked
 
 The two error messages are captures from v1.0.0-rc.74, committed under `benchmarks/autoindex-resilience/`. Local paths in them were shortened; nothing else was changed.
 
-The new behaviour is pinned by `tools/xerj-code/tests/test_xc_index_fresh.py`: 81 offline checks against a fake node and a fake `xerj` binary that refuses what the real one refuses. The same test fails against the old script with the first error above.
+The state-ledger contracts the warning section rests on — the salvaged warning on every query, exit 3 not reported as incomplete, `index_prefix` preferred over the bare namespace glob, the staleness refusal — are pinned by the tests in `engine/crates/xerj-common/src/xccode/state.rs`.
 
-The warning and the `--list` mark are pinned by `tools/xerj-code/tests/test_state_ledger.py` (25 offline checks). Resuming a kept build was checked against the fake binary only: that the re-run passes the same prefix and state directory. autoindex resuming an interrupted generation from its journal is a separate capture, `benchmarks/autoindex-resilience/after-fix.resume-probe.stderr.txt`. The two were not run together end to end.
+The full `--fresh` swap contract was pinned by 81 offline checks in the retired script suite (`tools/xerj-code/tests/test_xc_index_fresh.py`, deleted with the scripts): nothing deleted before the replacement's count was read, deletes by exact name, a failed or empty build leaving the old index untouched, sibling corpora never touched, an interrupted first build kept and resumable, unknown counts never read as zero. Those contracts are re-pinned as ten Rust tests in `engine/crates/xerj-autoindex/src/xc.rs` ([issue #1004](https://github.com/xerj-org/xerj/issues/1004)): the build/verify/swap flow runs unchanged against a fake node and a fake autoindex runner behind two injected seams, so every delete and every state-file switch is asserted on an audit trail rather than on stdout prose. What the old suite shelled out to a PATH-shimmed fake binary, the tests now inject; what it checked over HTTP against a fake node, they check against the same four operations the real node client implements.
 
-Writing that test found five defects in drafts of the new script. An index listing that never reached its filter, a record count that read as zero when the node put a space after the colon, two rebuilds inside one second retiring the build they had just verified, and the two unanswered-count defects described above. All five are fixed and covered. The unanswered count was exercised against the fake node only, with a 503. It was not provoked on a real node.
+Writing the old suite found five defects in drafts of the new command. An index listing that never reached its filter, a record count that read as zero when the node put a space after the colon, two rebuilds inside one second retiring the build they had just verified, and the two unanswered-count defects described above. All five were fixed in the port; the unanswered count was exercised against a fake node only, with a 503. It was not provoked on a real node.

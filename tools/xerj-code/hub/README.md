@@ -4,8 +4,8 @@ Each file here defines a reference corpus by **domain**, pinned to exact
 commits. Rebuild one anywhere:
 
 ```sh
-tools/xerj-code/scripts/xc-corpus.sh --from tools/xerj-code/hub/xerj-storage.json
-tools/xerj-code/scripts/xc-index.sh  xerj-storage
+xerj corpus add --from tools/xerj-code/hub/xerj-storage.json
+xerj corpus index  xerj-storage
 ```
 
 | corpus | projects | use it for | approx. checkout |
@@ -48,13 +48,15 @@ pasting ES source would make that claim false.
 
 ## Contributing a corpus
 
-1. Build it locally: `xc-corpus.sh <name> <git-url>...`
+1. Build it locally: `xerj corpus add <name> <git-url>...`
 2. Copy the generated `~/.xerj-code/corpora/<name>/corpus.json` to
    `hub/<name>.json` — the filename must match the `corpus` field.
 3. Open each repo's licence file yourself and fill in a `review` block per
    entry. Do not copy the detector's answer without looking; it has been wrong
    in both directions (see [`../README.md`](../README.md)).
-4. Check it: `python3 tools/xerj-code/tests/validate_manifest.py --hub hub/<name>.json`
+4. Check it: `cd engine && cargo test --profile ci-test -p xerj-common xccode::manifest`
+   (the same untrusted-input gate `xerj corpus add --from` enforces; CI runs
+   it over every file in `hub/`)
 5. Open a PR. Say what the corpus is *for* — a domain a reviewer can judge, not
    a pile of repositories.
 
@@ -62,5 +64,5 @@ pasting ES source would make that claim false.
 
 The SHAs are deliberately frozen: a shared pin is what makes two people's
 retrieval results comparable. To move a corpus forward, rebuild without `--from`
-(`xc-corpus.sh <name> <url>...` in a clean `XERJ_CODE_HOME`), re-review any
+(`xerj corpus add <name> <url>...` in a clean `XERJ_CODE_HOME`), re-review any
 licence that changed, and open a PR with the new manifest.

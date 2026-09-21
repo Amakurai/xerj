@@ -67,7 +67,11 @@ COMMAND_TOKEN_RE = re.compile(r"^-{1,2}[A-Za-z][A-Za-z0-9-]*(?:=.*)?$")
 # through a command nobody can run. Check the binary before editing this.
 # `share` added 2026-09-18 with the subcommand itself (`xerj share --help`,
 # engine/crates/xerj-server/src/share.rs).
-XERJ_COMMANDS = frozenset({"index", "autoindex", "brain", "mcp", "share", "help", "version"})
+# `code` and `corpus` added 2026-09-21 with #977's port of the xc wrapper
+# scripts into the binary (engine/crates/xerj-autoindex/src/xc.rs).
+XERJ_COMMANDS = frozenset({
+    "index", "autoindex", "brain", "mcp", "share", "code", "corpus", "help", "version",
+})
 SHELL_PRIMITIVES = frozenset({
     "bash", "cd", "command", "curl", "env", "export", "git", "sh", "until", "wget",
 })

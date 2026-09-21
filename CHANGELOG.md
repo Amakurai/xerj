@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`xerj code` and `xerj corpus add|index|list` — the reference-coding loop
+  is in the binary ([#977](https://github.com/xerj-org/xerj/issues/977)).**
+  `xerj code <corpus> "<query>"` retrieves the matching definition from a
+  locally indexed corpus of peer projects (`-k`, `--lang`, `--mode
+  bm25|semantic|hybrid`, `--full`, `--no-symbol`, `--meatl`, `--json`,
+  `--stale-ok`, `--url`, `--api-key`), keeping the wrapper scripts' exit
+  triangle: `0` hits, `1` no-match (including `--json` with empty hits),
+  `2` usage/transport/30-day-staleness refusal, `3` corpus-in-ledger-but-not-
+  loaded-on-this-node. `xerj corpus add` clones (or rebuilds from a pinned
+  manifest via `--from`, preserving `review` blocks), detects licences with
+  the restrictive-first heuristics and warns on approach-only sources;
+  `xerj corpus index` is the #930 build-verify-swap (unverified builds are
+  removed by exact name, an uncountable old index is never presumed empty,
+  state switches by atomic rename only after `_count > 0`); `xerj corpus
+  list` shows what is actually loaded on the node. Hybrid retrieval now fuses
+  server-side — one native top-level `hybrid` query, RRF `k=60`, aimed at the
+  semantic-capable indices, with an arms-ran note on every run. Existing
+  `~/.xerj-code` corpora, state files and indexes work unchanged: same layout,
+  same `corpus.json` schema, same `xc-<corpus>` namespaces. The `xerj_code_search`
+  MCP tool (the 11th) exposes the same pipeline to shell-less agents, with
+  `licence_policy: "strict"` stripping passage text from restricted-licence
+  hits. No `python3`/`curl` dependency remains; `git` still is one (for
+  `xerj corpus add`). Semantics live in the new `xerj-common::xccode` pure
+  core, shared byte-for-byte by the CLI prose and the MCP tool text.
+
+### Removed
+
+- `tools/xerj-code/scripts/{xc.py,xc-index.sh,xc-corpus.sh}` and their
+  Python/shell test suites. Most behaviour is ported and gated by scoped cargo
+  tests (`xerj-common::xccode`, `xerj-autoindex::xc`, the MCP schema drift
+  test); the `--fresh` swap contract — the destructive side of
+  `xerj corpus index --fresh` — is re-pinned in `xerj-autoindex/src/xc.rs` as
+  ten contract tests running the REAL flow against a fake node and a fake
+  autoindex runner behind injected seams
+  ([#1004](https://github.com/xerj-org/xerj/issues/1004)): switch-readers-
+  before-retiring, deletes by exact name only, a failed or empty build leaving
+  the old index untouched, a count the node never answered authorising no
+  delete and no switch, sibling corpora never touched, first-build salvage,
+  resume under the recorded prefix and state dir, build-id collisions inside
+  one second, and the legacy no-ledger path. The deliberate
+  drops are the post-query field-report nudge (2026-09-18 llms.txt directive:
+  no obligation language) and per-hit hybrid arm annotations (server-side RRF
+  exposes no per-leg ranks).
+
 ### Fixed
 
 - **The Second Brain dashboard and the reader's graph panel are no longer 401

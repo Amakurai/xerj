@@ -26,7 +26,6 @@ import argparse, json, os, subprocess, tempfile, shutil, sys, time, pathlib
 
 XERJ_URL = os.environ.get("XERJ_URL", "http://localhost:9200")
 XERJ_BIN = os.environ.get("XERJ_BIN", "xerj")
-XC = os.path.join(os.path.dirname(__file__), "..", "scripts", "xc.py")
 
 
 def sh(cmd, cwd=None, timeout=None, env=None):
@@ -49,8 +48,10 @@ def retrieve_context(repo_dir, instance_id, problem, k=6, chars=8000):
         return None, f"index-failed:{idx.returncode}:{idx.stderr[:160]}"
     # first ~3 lines of the issue make the best lexical query on the default embedder
     query = " ".join(problem.split("\n")[:3])[:300]
-    r = sh(["python3", XC, prefix, query, "--k", str(k), "--chars", str(chars),
-            "--full"], env={"XERJ_URL": XERJ_URL})
+    # `xerj code` (issue #977): same retrieval the xc.py wrapper used to do.
+    # exit 1 == no match == no context injected; only 0 carries passages.
+    r = sh([XERJ_BIN, "code", prefix, query, "-k", str(k),
+            "--full", str(chars)], env={"XERJ_URL": XERJ_URL})
     if r.returncode != 0:
         return None, f"retrieve-failed:{r.returncode}:{r.stderr[:160]}"
     return r.stdout, None

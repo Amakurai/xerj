@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Model Context Protocol (MCP) stdio server exposing the 10 canonical XERJ agent operations (search, memory, second-brain graph) as thin proxies to an ES-compatible XERJ endpoint"
+description = "Model Context Protocol (MCP) stdio server exposing the 11 canonical XERJ agent operations (search, memory, second-brain graph, reference-code) as thin proxies to an ES-compatible XERJ endpoint"
 
 # Library first: the `xerj mcp` subcommand on the main binary calls
 # `xerj_mcp::run`, so a user with the installed `xerj` binary already has the

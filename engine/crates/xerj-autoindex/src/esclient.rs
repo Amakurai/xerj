@@ -1821,6 +1821,81 @@ impl Es {
             Ok(None)
         }
     }
+
+    /// `GET /_cat/indices/{pattern}?format=json&h=index` as index names.
+    ///
+    /// The JSON sibling of [`Self::cat_indices`], which parses the TEXT form
+    /// and is deliberately NOT retrofit — its callers depend on the text
+    /// column layout. The engine honours `format=json` on this endpoint
+    /// (`cat_indices_format_json_returns_a_real_json_array`), which is what
+    /// the reference-coding loop counts live indices with. A 404 on a
+    /// wildcard means "no such indices" -> `Ok(vec![])`; every other failure
+    /// is `Err`: a node that cannot answer must never be reported as
+    /// "0 live indices".
+    pub fn cat_indices_json(&self, pattern: &str) -> Result<Vec<String>> {
+        let path = format!("/_cat/indices/{pattern}?format=json&h=index");
+        let (status, v) = self.request_json("GET", &path, None)?;
+        match status {
+            200 => v
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|r| r.get("index").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .ok_or_else(|| anyhow!("{path} returned non-array JSON")),
+            404 => Ok(Vec::new()),
+            other => Err(anyhow!("{path} returned HTTP {other}: {v}")),
+        }
+    }
+
+    /// Tri-state `GET /{pattern}/_count` — the #930 build-verify primitive.
+    ///
+    /// NOT [`Self::count`]: that is a `size:0` search pinned by its own
+    /// comment, and verification needs exactly the `_count` endpoint's
+    /// semantics, where 404 IS the answer "the wildcard matches no index, so
+    /// zero records". The three states and the difference between the last
+    /// two are the whole point:
+    ///
+    /// * `Number(n)` — the node counted them;
+    /// * `Zero`      — the node answered 404;
+    /// * `Unknown`   — the node DID NOT SAY (timeout, 5xx, refused, junk).
+    ///
+    /// "Did not say" used to be folded into 0 by every caller, and 0 is what
+    /// authorises the destructive steps of a build swap. A node under memory
+    /// pressure — the node a long build produces — answers exactly like that,
+    /// so UNKNOWN authorises no delete and no swap, ever.
+    pub fn count_endpoint(&self, pattern: &str) -> Count {
+        let path = format!("/{pattern}/_count");
+        let (status, v) = match self.request_json("GET", &path, None) {
+            Ok(r) => r,
+            Err(e) => return Count::Unknown(format!("{e:#}")),
+        };
+        match status {
+            200 => match v.get("count").and_then(Value::as_u64) {
+                Some(n) => Count::Number(n),
+                None => Count::Unknown(format!("no count in _count reply: {v}")),
+            },
+            404 => Count::Zero,
+            other => Count::Unknown(format!("{path} HTTP {other}: {v}")),
+        }
+    }
+}
+
+/// The tri-state answer of [`Es::count_endpoint`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Count {
+    Number(u64),
+    Zero,
+    /// The node did not say. NEVER to be treated as zero.
+    Unknown(String),
+}
+
+impl Count {
+    pub fn is_number(&self) -> bool {
+        matches!(self, Count::Number(_))
+    }
 }
 
 #[cfg(test)]

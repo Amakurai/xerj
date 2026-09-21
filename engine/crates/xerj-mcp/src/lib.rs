@@ -9,12 +9,12 @@
 //!
 //! It speaks the MCP **stdio transport**: newline-delimited
 //! JSON-RPC 2.0 messages on stdin/stdout. It exposes XERJ to any MCP-capable
-//! agent host (Claude Desktop, IDE agents, custom orchestrators) as ten
+//! agent host (Claude Desktop, IDE agents, custom orchestrators) as eleven
 //! tools that map 1:1 onto XERJ's real, verified REST surface. Every tool is
 //! a *thin proxy*: it constructs exactly the request the running engine
 //! already accepts and forwards it to a configurable base URL.
 //!
-//! ## The ten canonical agent operations
+//! ## The eleven canonical agent operations
 //!
 //! | MCP tool               | XERJ endpoint                         | Real capability |
 //! |------------------------|---------------------------------------|-----------------|
@@ -102,9 +102,10 @@ USAGE:
     xerj mcp [OPTIONS]              (or the standalone binary: xerj-mcp [OPTIONS])
 
 Speaks MCP over stdio (newline-delimited JSON-RPC 2.0 on stdin/stdout) and
-proxies ten tools — xerj_search, xerj_semantic_search, xerj_vector_search,
+proxies eleven tools — xerj_search, xerj_semantic_search, xerj_vector_search,
 xerj_hybrid_search, xerj_memory_store, xerj_memory_recall, xerj_brain_ego,
-xerj_brain_link, xerj_brain_unlink, xerj_brain_overview — to a XERJ node that
+xerj_brain_link, xerj_brain_unlink, xerj_brain_overview, xerj_code_search — to a
+XERJ node that
 is ALREADY RUNNING. This command does not start a node; start one first with
 `xerj --data-dir ./data`.
 
@@ -826,6 +827,32 @@ pub fn tool_specs() -> Value {
                 },
                 "required": ["brain"]
             }
+        },
+        {
+            "name": "xerj_code_search",
+            "description": concat!(
+                "Reference-coding retrieval over a corpus of peer projects: how did ",
+                "real codebases solve this problem? Returns the matching definition ",
+                "(not a byte window), the file:line to cite, and per-hit licence ",
+                "warnings — AGPL/SSPL/Elastic/BUSL/GPL/LGPL/MPL sources are approach-only. ",
+                "Refuses indices older than 30 days (override with stale_ok). ",
+                "A no-match is NOT an error: it says the corpus is wrong for the task. ",
+                "Corpora: `xerj corpus list`."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "corpus": { "type": "string", "description": "Corpus name (`xerj corpus list`)." },
+                    "query": { "type": "string", "description": "What you need, in code terms (e.g. 'merge policy segment expiry')." },
+                    "k": { "type": "integer", "description": "Passages to return; clamped to 1..=50 (default 5)." },
+                    "mode": { "type": "string", "enum": ["bm25", "semantic", "hybrid"], "description": "Retrieval arm (default bm25 — measured best)." },
+                    "lang": { "type": "string", "description": "Filter to one language field (e.g. rust, go)." },
+                    "full": { "type": "integer", "description": "Max chars per passage (default 800; 0 = file head only)." },
+                    "no_symbol": { "type": "boolean", "description": "Window selection instead of the matching definition." },
+                    "stale_ok": { "type": "boolean", "description": "Override the 30-day staleness refusal." },
+                    "licence_policy": { "type": "string", "enum": ["warn", "strict"], "description": "strict strips passage text from restricted-licence hits, keeping locator + warning (default warn)." }
+                },
+                "required": ["corpus", "query"]
+            }
         }
     ])
 }
@@ -858,6 +885,7 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
         "xerj_brain_link" => build_brain_link(&args),
         "xerj_brain_unlink" => build_brain_unlink(&args),
         "xerj_brain_overview" => build_brain_overview(&args),
+        "xerj_code_search" => return run_code_search(ctx, &args).await,
         other => return tool_text(format!("unknown tool: {other}"), true),
     };
 
@@ -1318,6 +1346,173 @@ fn build_brain_overview(args: &Value) -> Result<BuiltRequest, String> {
         format!("/_graph/{}/overview{}", enc(brain), qs(&q)),
         None,
     ))
+}
+
+// ── xerj_code_search: the shared reference-coding pipeline ──────────────────
+
+/// Synchronous [`XcHttp`] over a fresh reqwest client. This crate is
+/// deliberately async-only (no `blocking` feature), so each call runs on a
+/// private current-thread runtime inside the `spawn_blocking` below — no
+/// query logic lives here, only transport.
+struct McpXc {
+    base_url: String,
+    auth: Option<String>,
+}
+
+impl McpXc {
+    fn request(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime: {e}"))?;
+        let url = format!("{}{}", self.base_url, path);
+        let auth = self.auth.clone();
+        let method = method.to_string();
+        let body = body.cloned();
+        rt.block_on(async move {
+            let client = reqwest::Client::new();
+            let m = reqwest::Method::from_bytes(method.as_bytes())
+                .map_err(|_| format!("not an HTTP method: {method}"))?;
+            let mut req = client.request(m, &url);
+            if let Some(h) = auth.as_deref() {
+                req = req.header("Authorization", h);
+            }
+            if let Some(b) = &body {
+                req = req.json(b);
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| format!("no response from {url}: {e}"))?;
+            // Surface the status WITH the body: the tri-state callers (404 =
+            // zero, not error) classify it themselves.
+            let status = resp.status().as_u16();
+            let text = resp.text().await.map_err(|e| format!("read {url}: {e}"))?;
+            let v: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
+            match status {
+                200..=299 => Ok(v),
+                404 => Err("__404__".to_string()),
+                other => Err(format!("HTTP {other}: {v}")),
+            }
+        })
+    }
+}
+
+impl xerj_common::xccode::XcHttp for McpXc {
+    fn get_mapping(&self, path: &str) -> Result<Value, String> {
+        self.request("GET", path, None)
+    }
+    fn cat_indices_json(&self, pattern: &str) -> Result<Vec<String>, String> {
+        let v = match self.request(
+            "GET",
+            &format!("/_cat/indices/{pattern}?format=json&h=index"),
+            None,
+        ) {
+            Ok(v) => v,
+            // A 404 on a wildcard means "no such indices" -> none, not an error.
+            Err(e) if e.contains("__404__") => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        v.as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r.get("index").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .ok_or_else(|| "non-array _cat reply".to_string())
+    }
+    fn search(&self, index: &str, body: &Value) -> Result<Value, String> {
+        self.request("POST", &format!("/{index}/_search"), Some(body))
+    }
+}
+
+/// `xerj_code_search` — the SAME pipeline `xerj code` runs, from the SAME
+/// renderer; only the surface differs. Warnings ride the TOP of the tool text
+/// (MCP has no stderr channel, so warnings are content), and the exit-code
+/// triangle maps onto `isError`: staleness/not-loaded/transport are errors, a
+/// no-match is NOT.
+async fn run_code_search(ctx: &Ctx, args: &Value) -> Value {
+    let corpus = match args.get("corpus").and_then(Value::as_str) {
+        Some(c) if !c.is_empty() => c.to_string(),
+        _ => return tool_text("xerj_code_search: `corpus` is required", true),
+    };
+    let query = match args.get("query").and_then(Value::as_str) {
+        Some(q) if !q.is_empty() => q.to_string(),
+        _ => return tool_text("xerj_code_search: `query` is required", true),
+    };
+    let mut p = xerj_common::xccode::CodeParams::new(&corpus, &query);
+    if let Some(k) = args.get("k") {
+        match k.as_u64().filter(|n| (1..=50).contains(n)) {
+            Some(n) => p.k = n as usize,
+            None => return tool_text("xerj_code_search: `k` must be an integer 1..=50", true),
+        }
+    }
+    if let Some(m) = args.get("mode").and_then(Value::as_str) {
+        match xerj_common::xccode::Mode::parse(m) {
+            Some(mode) => p.mode = mode,
+            None => return tool_text(format!("xerj_code_search: unknown mode '{m}'"), true),
+        }
+    }
+    if let Some(l) = args.get("lang").and_then(Value::as_str) {
+        p.lang = Some(l.to_string());
+    }
+    match args.get("full").and_then(Value::as_u64) {
+        Some(n) => p.full = n as usize,
+        None => {
+            if args.get("full").is_some() {
+                return tool_text(
+                    "xerj_code_search: `full` must be a non-negative integer",
+                    true,
+                );
+            }
+        }
+    }
+    p.no_symbol = args
+        .get("no_symbol")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    p.stale_ok = args
+        .get("stale_ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    p.strict_licence = matches!(
+        args.get("licence_policy").and_then(Value::as_str),
+        Some("strict")
+    );
+
+    let base_url = ctx.base_url.clone();
+    let auth = ctx.auth.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let http = McpXc { base_url, auth };
+        let root = code_root();
+        xerj_common::xccode::run_code_query(&root, &http, &http.base_url, &p, "stale_ok:true")
+    })
+    .await;
+
+    let out = match res {
+        Ok(out) => out,
+        Err(e) => return tool_text(format!("xerj_code_search: join error: {e}"), true),
+    };
+    let mut text = String::new();
+    for w in &out.warnings {
+        text.push_str(w);
+        text.push('\n');
+    }
+    text.push_str(&out.text);
+    tool_text(text, out.is_error)
+}
+
+/// `~/.xerj-code` unless `XERJ_CODE_HOME` says otherwise — the SAME root the
+/// CLI uses, so both surfaces see the same corpora.
+fn code_root() -> std::path::PathBuf {
+    if let Ok(home) = std::env::var("XERJ_CODE_HOME") {
+        if !home.is_empty() {
+            return std::path::PathBuf::from(home);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::Path::new(&home).join(".xerj-code")
 }
 
 // ── Engine transport ─────────────────────────────────────────────────────────
@@ -1810,7 +2005,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_all_ten() {
+    fn tools_list_has_all_eleven() {
         let specs = tool_specs();
         let names: Vec<&str> = specs
             .as_array()
@@ -1818,7 +2013,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
         for n in [
             "xerj_search",
             "xerj_semantic_search",
@@ -1830,6 +2025,9 @@ mod tests {
             "xerj_brain_link",
             "xerj_brain_unlink",
             "xerj_brain_overview",
+            // #977: reference-coding retrieval, served by the same pipeline
+            // as `xerj code` (LAST in the list, by design).
+            "xerj_code_search",
         ] {
             assert!(names.contains(&n), "missing tool {n}");
         }
