@@ -23,12 +23,15 @@
 //! - [`metrics`] — Prometheus counters, histograms, and gauges
 //! - [`net`]     — Network trust primitives (trusted-proxy CIDR matching)
 //! - [`resource`] — The machine-resource policy: cores, memory budget, thread priority
+//! - [`localauth`] — Loopback guard + `<data_dir>/admin.key` discovery for
+//!   same-machine CLI/MCP commands (`xerj mcp`, `xerj autoindex`, `xerj init`)
 
 pub mod config;
 pub mod error;
 pub mod feedback;
 pub mod field_coercion;
 pub mod fsio;
+pub mod localauth;
 pub mod metrics;
 pub mod net;
 pub mod resource;

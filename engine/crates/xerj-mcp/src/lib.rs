@@ -60,6 +60,15 @@
 //! * `XERJ_AUTH` — optional; if set, sent verbatim as the `Authorization`
 //!   header on every proxied request (e.g. `ApiKey <token>`).
 //!
+//! When neither `XERJ_AUTH` nor `--auth` is given **and** the target is
+//! loopback, the server falls back to the admin key a local node wrote for
+//! itself (`<data_dir>/admin.key` — the same discovery `xerj autoindex`
+//! uses) and announces the file it used on stderr. Auth is on by default, so
+//! this fallback is what makes the documented `xerj init` one-command setup
+//! work against a default node instead of 401-ing on every tool call (#961).
+//! It never fires for a non-loopback URL: a locally readable key sent to
+//! another host is a credential leak, not a convenience.
+//!
 //! Both have a flag form — `--url` and `--auth` — which wins over the
 //! environment. MCP client configs usually set the `env` block, so the
 //! environment stays the documented path; the flags exist for hosts that only
@@ -132,6 +141,9 @@ default is ~/.local/bin/xerj. An MCP host launched from a desktop icon does
 not inherit your shell's PATH, so a bare \"xerj\" fails there with no useful
 error. When the node is not running --insecure, add
 \"XERJ_AUTH\": \"ApiKey <key>\" beside XERJ_URL; the key is <data-dir>/admin.key.
+For a loopback node (localhost / 127.0.0.1 / [::1]) that step is optional:
+with no XERJ_AUTH given, the server reads <data-dir>/admin.key itself (the
+same locations `xerj autoindex` checks) and says which file on stderr.
 
 Diagnostics go to stderr; stdout carries only the JSON-RPC stream.
 ";
@@ -150,6 +162,46 @@ pub fn help_text(feedback: bool) -> String {
         "{first}\n{}USAGE:{rest}",
         xerj_common::feedback::block(feedback)
     )
+}
+
+/// Resolve the `Authorization` header value every proxied request will carry.
+///
+/// Precedence: `--auth` > `XERJ_AUTH` >, for a loopback base URL only, the
+/// admin key a local node wrote for itself. The fallback exists because auth
+/// is ON by default and `xerj init` deliberately writes no credential into
+/// `.mcp.json` (project scope, meant to be committed) — without it, the
+/// documented one-command setup 401s on every tool call (#961).
+///
+/// Returns the header value plus, when the value came from disk, the file it
+/// came from — the caller announces that path on stderr so the fallback is
+/// never silent (stdout stays JSON-RPC-only).
+///
+/// The loopback guard is the security boundary: discovery only ever runs for
+/// a URL whose host is this machine, so a locally readable key can never be
+/// sent off-box (including via the `http://localhost:9200@evil.com/` userinfo
+/// trick — see `xerj_common::localauth`).
+fn resolve_auth(
+    auth_override: Option<String>,
+    env_auth: Option<String>,
+    base_url: &str,
+) -> (Option<String>, Option<std::path::PathBuf>) {
+    // Empty strings count as unset: an empty XERJ_AUTH in a committed
+    // .mcp.json must not shadow discovery and turn into `Authorization: `.
+    if let Some(explicit) = auth_override
+        .filter(|s| !s.is_empty())
+        .or_else(|| env_auth.filter(|s| !s.is_empty()))
+    {
+        return (Some(explicit), None);
+    }
+    if !xerj_common::localauth::url_is_loopback(base_url) {
+        return (None, None);
+    }
+    match xerj_common::localauth::discover_local_admin_key() {
+        // `XERJ_AUTH` is a complete header value ("ApiKey <token>"), so the
+        // discovered bare key is formatted to the same documented shape.
+        Some((key, path)) => (Some(format!("ApiKey {key}")), Some(path)),
+        None => (None, None),
+    }
 }
 
 /// Library entry point. `args` are the arguments *after* the subcommand
@@ -205,9 +257,8 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
         .unwrap_or_else(|| DEFAULT_XERJ_URL.to_string())
         .trim_end_matches('/')
         .to_string();
-    let auth = auth_override
-        .or_else(|| std::env::var("XERJ_AUTH").ok())
-        .filter(|s| !s.is_empty());
+    let (auth, auth_key_file) =
+        resolve_auth(auth_override, std::env::var("XERJ_AUTH").ok(), &base_url);
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -224,6 +275,17 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION"),
         ctx.base_url
     );
+
+    // Announced, never silent (same rule as `xerj autoindex`): MCP hosts
+    // spawn this server with an arbitrary cwd, so which `admin.key` the
+    // relative candidates resolved to is exactly the thing an onboarding
+    // user needs to see when it works here and not there.
+    if let Some(path) = auth_key_file {
+        eprintln!(
+            "xerj-mcp: no --auth/XERJ_AUTH given; using the admin key at {}",
+            path.display()
+        );
+    }
 
     // stdout is the JSON-RPC channel; stderr is for logs only.
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -1798,5 +1860,154 @@ mod tests {
                 "{name} missing the not-a-graph-database honesty string"
             );
         }
+    }
+
+    // ── loopback admin-key fallback (#961) ──────────────────────────────
+
+    /// Serialises the tests that move process-global state. Discovery reads
+    /// the working directory and `HOME`, both per-process.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A temporary working directory and `HOME`, restored on drop (including
+    /// on panic) so the discovery tests see only the key files they wrote —
+    /// the same sandbox shape as `xerj-autoindex`'s cli tests, where the
+    /// helper this exercises was born.
+    struct Sandbox {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        dir: tempfile::TempDir,
+        previous_dir: std::path::PathBuf,
+        previous_home: Option<std::ffi::OsString>,
+    }
+
+    impl Sandbox {
+        fn new() -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let previous_dir = std::env::current_dir().unwrap();
+            let previous_home = std::env::var_os("HOME");
+            std::env::set_current_dir(dir.path()).unwrap();
+            std::env::set_var("HOME", dir.path().join("home"));
+            Self {
+                _lock: lock,
+                dir,
+                previous_dir,
+                previous_home,
+            }
+        }
+
+        fn write(&self, relative: &str, contents: &str) {
+            let path = self.dir.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous_dir).unwrap();
+            match &self.previous_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// The gap #961 is about: `xerj init` writes only XERJ_URL, auth is on by
+    /// default, and the documented setup 401'd on every tool call. With a
+    /// loopback URL and a key on disk, discovery closes that gap.
+    #[test]
+    fn loopback_url_with_no_auth_picks_up_the_local_admin_key() {
+        let sandbox = Sandbox::new();
+        sandbox.write("data/admin.key", "local-admin-key\n");
+        let (auth, from) = resolve_auth(None, None, "http://localhost:9200");
+        assert_eq!(auth.as_deref(), Some("ApiKey local-admin-key"));
+        assert_eq!(
+            from,
+            Some(sandbox.dir.path().join("data/admin.key")),
+            "the announced path is the file actually used"
+        );
+
+        // The no-configuration shape: XERJ_URL unset means the loopback
+        // default, which is exactly the `xerj init` entry.
+        let (auth, _) = resolve_auth(None, None, DEFAULT_XERJ_URL);
+        assert_eq!(auth.as_deref(), Some("ApiKey local-admin-key"));
+    }
+
+    /// Discovery is loopback-only. A locally readable admin key sent to a
+    /// host that did not write it is a credential leak — including via the
+    /// userinfo trick, where everything before `@` is credentials and the
+    /// host is `evil.com`.
+    #[test]
+    fn non_loopback_urls_never_receive_a_discovered_key() {
+        let sandbox = Sandbox::new();
+        sandbox.write("data/admin.key", "local-admin-key\n");
+        for url in [
+            "http://search.example.com:9200",
+            "http://192.168.1.5:9200",
+            "https://localhost.evil.com:9200",
+            "http://localhost:9200@evil.com/",
+            "http://127.0.0.1:80@evil.com/",
+            "localhost:9200@evil.com",
+        ] {
+            let (auth, from) = resolve_auth(None, None, url);
+            assert!(
+                auth.is_none() && from.is_none(),
+                "{url} must never be sent a key found on this disk"
+            );
+        }
+    }
+
+    /// A credential the user supplied is never overwritten by one found on
+    /// disk — and an *empty* value is unset, not a credential: shadowing
+    /// discovery with `Authorization: ` would reproduce the silent 401.
+    #[test]
+    fn explicit_auth_wins_over_loopback_discovery() {
+        let sandbox = Sandbox::new();
+        sandbox.write("data/admin.key", "local-admin-key\n");
+
+        let (auth, from) = resolve_auth(
+            Some("Bearer token".into()),
+            Some("ApiKey env".into()),
+            "http://localhost:9200",
+        );
+        assert_eq!(auth.as_deref(), Some("Bearer token"));
+        assert!(
+            from.is_none(),
+            "an explicit --auth is never re-sourced from disk"
+        );
+
+        let (auth, from) = resolve_auth(None, Some("ApiKey env".into()), "http://localhost:9200");
+        assert_eq!(auth.as_deref(), Some("ApiKey env"));
+        assert!(from.is_none(), "XERJ_AUTH also wins over discovery");
+
+        let (auth, _) = resolve_auth(Some(String::new()), None, "http://localhost:9200");
+        assert_eq!(
+            auth.as_deref(),
+            Some("ApiKey local-admin-key"),
+            "an empty --auth/XERJ_AUTH must fall through to discovery"
+        );
+    }
+
+    /// A server that has not finished writing its key, or a file truncated
+    /// by hand, must not become `Authorization: ApiKey ` — the same 401 with
+    /// none of the diagnosis.
+    #[test]
+    fn empty_key_files_are_skipped_not_turned_into_empty_headers() {
+        let sandbox = Sandbox::new();
+        sandbox.write("data/admin.key", "  \n\t\n");
+        sandbox.write("xerj-data/admin.key", "");
+        let (auth, from) = resolve_auth(None, None, "http://localhost:9200");
+        assert!(
+            auth.is_none() && from.is_none(),
+            "whitespace-only and zero-byte files are not credentials"
+        );
+
+        sandbox.write("home/.xerj/admin.key", "real-key\n");
+        let (auth, _) = resolve_auth(None, None, "http://localhost:9200");
+        assert_eq!(
+            auth.as_deref(),
+            Some("ApiKey real-key"),
+            "an empty candidate must be skipped over, not stop the search"
+        );
     }
 }

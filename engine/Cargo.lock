@@ -7403,6 +7403,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -7561,6 +7562,7 @@ dependencies = [
  "anyhow",
  "reqwest",
  "serde_json",
+ "tempfile",
  "tokio",
  "xerj-common",
  "xerj-rerank",
