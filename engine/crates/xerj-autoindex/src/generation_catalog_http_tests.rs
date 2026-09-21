@@ -256,6 +256,14 @@ fn junk_only_add_change_and_delete_converge_without_hiding_unchanged_data() {
     );
     let base = committed(base_generation);
     let mut endpoint = CatalogEndpoint::default();
+    // #971: the endpoint already holds generation 1's publication. An
+    // unchanged file's document is no longer re-sent by later generations —
+    // it must survive every one of them untouched, keeping the run_id of the
+    // generation that last wrote it.
+    endpoint.documents.insert(
+        "file:ax:keep".into(),
+        json!({"doc_kind": "file", "file_key": "keep", "prefix": "ax", "run_id": "g1"}),
+    );
 
     let added = generation(
         2,
@@ -275,9 +283,10 @@ fn junk_only_add_change_and_delete_converge_without_hiding_unchanged_data() {
         &prior_managed_ids(&base),
     )
     .unwrap();
+    assert!(!projection.documents.contains_key("file:ax:keep"));
     endpoint.publish(&projection, &BTreeSet::new()).unwrap();
     assert_eq!(endpoint.documents["file:ax:junk-a"]["status"], "junk");
-    assert_eq!(endpoint.documents["file:ax:keep"]["run_id"], "g2");
+    assert_eq!(endpoint.documents["file:ax:keep"]["run_id"], "g1");
 
     let base = committed(added);
     let changed = generation(
@@ -323,7 +332,8 @@ fn junk_only_add_change_and_delete_converge_without_hiding_unchanged_data() {
     assert!(projection.stale_ids.contains("file:ax:junk-a"));
     endpoint.publish(&projection, &BTreeSet::new()).unwrap();
     assert!(!endpoint.documents.contains_key("file:ax:junk-a"));
-    assert_eq!(endpoint.documents["file:ax:keep"]["run_id"], "g4");
+    // Still generation 1's document, never re-sent by g2..g4.
+    assert_eq!(endpoint.documents["file:ax:keep"]["run_id"], "g1");
 }
 
 #[test]
