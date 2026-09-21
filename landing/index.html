@@ -11,6 +11,196 @@
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230b0b0d'/><text x='50' y='68' font-size='60' font-family='Big Shoulders Display,sans-serif' font-weight='900' fill='%23ffc400' text-anchor='middle'>X</text></svg>">
 <link rel="stylesheet" href="/style.css?v=if10">
+<style>
+  /* page-local — JEV verdict banner + install card (2026-09-21). All new CSS
+     lives here, not in style.css, so the shared sheet needs no cache-buster
+     bump. Brand rules hold: 1px lines, no icons, no shadows, no filled
+     shapes (the .prompt-card gradient border is the site's sole exception).
+     Figures are verbatim from /blog/does-xerj-beat-jev — the two must not
+     drift; nothing here may tell the broken-then-fixed pilot story (that
+     narrative lives in the post). */
+  .jev-banner {
+    max-width: 880px;
+    margin: var(--sp-8) auto var(--sp-8);
+    padding: var(--sp-5) var(--sp-6) var(--sp-6);
+    border: 1px solid var(--z-line);
+    text-align: left;
+  }
+  .jev-banner .jev-kicker {
+    margin: 0 0 var(--sp-3);
+    font-family: var(--font-data);
+    font-size: var(--fs-11);
+    font-weight: 600;
+    letter-spacing: var(--track-label);
+    text-transform: uppercase;
+    color: var(--z-mute);
+  }
+  .jev-banner h2 {
+    margin: 0 0 var(--sp-2);
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: var(--fs-32);
+    line-height: 1.05;
+    color: var(--z-ink);
+  }
+  .jev-banner .jev-sub {
+    margin: 0 0 var(--sp-2);
+    font-family: var(--font-prose);
+    font-size: var(--fs-16);
+    line-height: 1.55;
+    color: var(--z-mute);
+  }
+  .jev-banner .jev-foot {
+    margin: var(--sp-3) 0 0;
+    font-family: var(--font-data);
+    font-size: var(--fs-11);
+    line-height: 1.7;
+    color: var(--z-mute);
+  }
+  .jev-banner .jev-link {
+    font-family: var(--font-data);
+    font-size: var(--fs-11);
+    font-weight: 700;
+    letter-spacing: var(--track-label);
+    text-transform: uppercase;
+    color: var(--z-accent);
+    text-decoration: none;
+    border-bottom: 1px solid var(--z-accent);
+    padding-bottom: 1px;
+  }
+  .jev-banner .jev-link:hover, .jev-banner .jev-link:focus-visible {
+    color: var(--z-ink);
+    border-color: var(--z-ink);
+  }
+  .jev-banner .jev-hub {
+    display: block;
+    margin-top: var(--sp-2);
+    font-family: var(--font-data);
+    font-size: var(--fs-11);
+    color: var(--z-mute);
+  }
+  .jev-banner .jev-hub a { color: var(--z-mute); border-bottom: 1px solid var(--z-line); padding-bottom: 1px; text-decoration: none; }
+  .jev-banner .jev-hub a:hover, .jev-banner .jev-hub a:focus-visible { color: var(--z-accent); border-color: var(--z-accent); }
+  .jev-banner .jev-link-row { margin: var(--sp-4) 0 0; }
+
+  /* comparison series, page-local: XERJ is always .cmp-a (accent); the
+     Jev-in-the-loop series is always --z-cmp — accent never marks a Jev-side
+     win (same recolor rule as the wordpress-security-audit page). */
+  .jev-banner .cmp-b .cmp-bar { background: var(--z-cmp); opacity: 1; }
+  .jev-banner .cmp-bars-head .cmp-b { color: var(--z-cmp); font-weight: 700; }
+  .jev-banner .cmp-b .cmp-num { color: var(--z-cmp); }
+  .jev-banner .cmp-b .cmp-ratio { color: var(--z-cmp); }
+  .jev-banner .cmp-val i {
+    font-style: normal;
+    font-family: var(--font-data);
+    font-size: var(--fs-11);
+    color: var(--z-mute);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .jev-banner .cmp-label .cmp-sub {
+    display: block;
+    white-space: normal;
+    font-family: var(--font-data);
+    font-size: var(--fs-11);
+    color: var(--z-mute);
+  }
+  .cmp-tag {
+    font-family: var(--font-data);
+    font-size: var(--fs-11);
+    font-weight: 700;
+    letter-spacing: var(--track-label);
+    text-transform: uppercase;
+    margin-left: 4px;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .cmp-tag.x { color: var(--z-accent); }
+  .cmp-tag.j { color: var(--z-cmp); }
+
+  /* Desktop chip line (2026-09-21 fix round): the FIQA verdict chip
+     ("JEV WINS · BIGGEST LIFT WE MEASURED") does not fit its ~337px value
+     cell beside bar + number + delta + arm label — the cell clipped
+     internally (scrollWidth > clientWidth, chip 96px past the cell edge)
+     and the blue bar crushed to its 2px minimum, which reads as a cut-off
+     loss marker. That one cell wraps its chip onto a second line; the bar
+     recovers its measured width. Wrap is NOT applied banner-wide on
+     desktop because wide bars (width:100% cells) would force every number
+     onto a second line — only the cells that carry a long chip need it.
+     The <=720px blocks below already wrap every cell, so this class is a
+     no-op there. */
+  .jev-banner .cmp-val.chip-line { flex-wrap: wrap; row-gap: 2px; }
+
+  /* Fold recovery (2026-09-21 fix round): at 1440x900 the banner's title sat
+     18px below the fold, 91px at 1280x800 — only the kicker broke it. The
+     reclaim is vertical air ONLY (hero top padding, the H1 clamp at laptop
+     widths, the sp-10 gap above the prompt card, the card's own padding and
+     the banner's top margin/padding): title + verdict sub-line now land
+     inside a 900px fold at 1440 and inside 800px at 1280. Scoped to
+     .hero-center and min-width 721px so no other page and no phone layout
+     moves; the shared sheet is untouched. */
+  @media (min-width: 721px) {
+    .hero-center { padding-top: var(--sp-3); }
+    .hero-center .hero { font-size: clamp(38px, 7.5vw, 140px); }
+    .hero-center .prompt-stage { margin-top: var(--sp-8); }
+    .hero-center .prompt-card { padding: var(--sp-5) var(--sp-6) var(--sp-3); }
+  }
+
+  /* install card — reuses the shared .hero-install family, adapted to the
+     centered hero: left-aligned inside the column, 1px accent rule kept. */
+  .hero-center .hero-install {
+    max-width: 880px;
+    margin: 0 auto var(--sp-8);
+    text-align: left;
+    border-left: 1px solid var(--z-accent);
+    padding: var(--sp-3) 0 var(--sp-3) var(--sp-6);
+  }
+  .hero-center .hero-install-cmd code { font-size: clamp(var(--fs-13), 1.4vw, 20px); }
+  .hero-center .hero-install-alt code { font-size: var(--fs-13); }
+  .hero-center .hero-install .hero-install-agent-line { margin-top: var(--sp-4); }
+
+  @media (max-width: 720px) {
+    .jev-banner { margin: var(--sp-8) auto var(--sp-6); padding: var(--sp-4); }
+    .jev-banner h2 { font-size: var(--fs-20); }
+    /* Verdict chips must not clip off-screen: the value cell lets them wrap
+       onto their own full-width line (order 9 = after bar+number+arm), and
+       they may wrap internally — a clipped loss marker is an invisible loss
+       marker, which the honesty rules forbid. Numbers and arm labels wrap
+       at spaces only (dataset scores carry no spaces, so no mid-number
+       break is possible); the bill figure needs it at this width. */
+    .jev-banner .cmp-val { flex-wrap: wrap; row-gap: 2px; }
+    .jev-banner .cmp-tag { flex-basis: 100%; order: 9; margin-left: 0; white-space: normal; line-height: 1.5; }
+    .jev-banner .cmp-num, .jev-banner .cmp-val i { flex-shrink: 1; min-width: 0; white-space: normal; }
+  }
+
+  /* Phone layout (≤560px), 2026-09-21 fix round: at 390px the shared
+     3-column grid starves each value column to 62px — the FiQA loss chip
+     wrapped into a six-line sliver and its cell clipped internally
+     (scrollWidth > clientWidth), which reads as a cut-off loss marker.
+     Stack instead: dataset label on its own line, then each arm at full
+     column width (~326px at 390px) so bar, number, arm label and chip sit
+     on one readable line. The head row collapses to its two series names;
+     its empty first cell is hidden. Scoped to .jev-banner on this page —
+     the shared sheet and other pages are untouched. */
+  @media (max-width: 560px) {
+    .jev-banner .cmp-bars-head { grid-template-columns: 1fr; gap: 2px; }
+    .jev-banner .cmp-bars-head span:first-child { display: none; }
+    .jev-banner .cmp-bars-row { grid-template-columns: 1fr; gap: var(--sp-1) 0; padding: var(--sp-3) 0; }
+    .jev-banner .cmp-label { white-space: normal; }
+    .jev-banner .cmp-val { overflow: visible; }
+    .jev-banner .cmp-tag { flex-basis: auto; order: 0; }
+  }
+  @media (max-width: 720px) {
+    .hero-center .hero-install { padding-left: var(--sp-4); }
+    .hero-center .hero-install-cmd,
+    .hero-center .hero-install-alt { flex-direction: column; align-items: stretch; gap: var(--sp-2); }
+    .hero-center .hero-install .hero-install-copy {
+      align-self: stretch;
+      text-align: center;
+      padding: 6px 8px;
+    }
+  }
+</style>
 <!-- seo:begin — generated by scripts/seo/fix_heads.py · do not hand-edit -->
 <link rel="canonical" href="https://xerj.org/">
 <meta property="og:site_name" content="XERJ.ai">
@@ -92,6 +282,7 @@
   </span>
   <a href="/case-studies">CASE STUDIES</a>
   <a href="/benchmarks/">BENCHMARKS</a>
+  <a href="/blog/">BLOG</a>
   <span class="spacer"></span>
   <a href="/for-agents">FOR AGENTS</a>
   <a href="/docs/">DOCS</a>
@@ -118,16 +309,101 @@
     </div>
   </div>
 
-  <!-- Benchmark strip — every figure is a measured run, sourced verbatim
-       from /benchmarks/decisions (the Jev rerank-stage autopsy + full run). -->
-  <p class="hero-bench">
-    <span class="hb-tag">Measured on TypeSafe AI's Jev judge · our rerank stage</span>
-    <span class="hb-chip">as it shipped <b class="hb-bad">0.3822</b> <span class="hb-arrow">→</span> after our fix <b>0.8299</b> nDCG@10 ·
-      the 0.38 was our own pre-fix stage, same 40 judged SciFact queries</span>
-    <span class="hb-chip">full run <b>1,271</b> judged queries, three public BEIR datasets ·
-      FiQA <b>0.3638</b> nDCG@10, +0.126 over our BM25</span>
-    <a class="hb-link" href="/benchmarks/decisions">Read the measurement →</a>
-  </p>
+  <!-- JEV verdict banner — results only. Every figure is a measured run,
+       verbatim from /blog/does-xerj-beat-jev (the verdict-first write-up).
+       The homepage states results; the broken-then-fixed pilot story lives
+       in the post, not here. nDCG bar widths share ONE global denominator,
+       0.7410 (the max across all rows) — the same convention as the /blog
+       index preview and the og card, so the three visuals are mutually
+       comparable; the judge-bill row is dollars and scales to itself.
+       XERJ is always .cmp-a (accent); the Jev-in-the-loop series is always
+       --z-cmp — accent never marks a Jev-side win. -->
+  <aside class="jev-banner">
+    <p class="jev-kicker">MEASURED · TYPESAFE AI'S JEV JUDGE vs XERJ · 1,271 JUDGED QUERIES · 3 BEIR DATASETS · 3 SHUFFLED REPEATS</p>
+    <h2>DOES XERJ BEAT JEV?</h2>
+    <p class="jev-sub">On the bill, outright. On relevance, the hosted judge keeps two of three datasets — and the zero-API-token hybrid keeps NFCorpus.</p>
+    <div class="cmp-bars">
+      <div class="cmp-bars-head">
+        <span></span>
+        <span class="cmp-a">XERJ · LOCAL, ZERO API TOKENS</span>
+        <span class="cmp-b">OUR BM25 TOP-30 + JEV JUDGE</span>
+      </div>
+      <div class="cmp-bars-row">
+        <span class="cmp-label">SCIFACT · 300 QUERIES</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:94.4%;"></span>
+          <span class="cmp-num">0.6993</span> <i>hybrid RRF</i>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:100%;"></span>
+          <span class="cmp-num">0.7410</span> <i>BM25+Jev</i>
+          <span class="cmp-tag j">JEV WINS</span>
+        </span>
+      </div>
+      <div class="cmp-bars-row">
+        <span class="cmp-label">NFCORPUS · 323 QUERIES</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:46.5%;"></span>
+          <span class="cmp-num">0.3448</span> <i>hybrid RRF</i>
+          <span class="cmp-tag x">XERJ WINS</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:44.7%;"></span>
+          <span class="cmp-num">0.3312</span> <i>BM25+Jev</i>
+        </span>
+      </div>
+      <div class="cmp-bars-row">
+        <span class="cmp-label">FIQA · 648 QUERIES</span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:32.1%;"></span>
+          <span class="cmp-num">0.2382</span> <i>BM25 — hybrid not run</i>
+        </span>
+        <span class="cmp-val cmp-b chip-line">
+          <span class="cmp-bar" style="width:49.1%;"></span>
+          <span class="cmp-num">0.3638 <span class="cmp-ratio">+0.126</span></span> <i>BM25+Jev</i>
+          <span class="cmp-tag j">JEV WINS · BIGGEST LIFT WE MEASURED</span>
+        </span>
+      </div>
+      <div class="cmp-bars-row">
+        <span class="cmp-label">FIQA RUN · JUDGE BILL<span class="cmp-sub">at $0.042/Mtok, input only</span></span>
+        <span class="cmp-val cmp-a">
+          <span class="cmp-bar" style="width:0%;"></span>
+          <span class="cmp-num">$0 · 0 tokens</span>
+          <span class="cmp-tag x">XERJ WINS</span>
+        </span>
+        <span class="cmp-val cmp-b">
+          <span class="cmp-bar" style="width:100%;"></span>
+          <span class="cmp-num">$0.6375 · 15,178,758 tokens</span>
+        </span>
+      </div>
+    </div>
+    <p class="jev-foot">AG News, all 7,600 test items: 0.9182 accuracy with no model and no tokens — no JEV row exists there and none is claimed. Jev's FiQA probabilities order well but calibrate badly (ECE 0.3109). Provider non-determinism: gaps tighter than ±0.01 nDCG@10 are noise. Bars: one shared scale, 0.7410 = full width (the bill row is dollars, its own scale); the XERJ side is our best measured local arm per dataset — hybrid not run on FiQA.</p>
+    <p class="jev-link-row"><a class="jev-link" href="/blog/does-xerj-beat-jev">THE FULL VERDICT — WINS, LOSSES, AND THE BILL &rarr; /blog/does-xerj-beat-jev</a>
+      <span class="jev-hub">Benchmarks hub: <a href="/benchmarks/">/benchmarks</a></span></p>
+  </aside>
+
+  <!-- Install card — the visible one-line install, plus the Windows and
+       glibc variants. Commands are VERBATIM from /docs/install (the two
+       must not drift); every button is auto-wired by interact.js
+       ([data-copy]; the &quot; escaping restores the double quotes). -->
+  <div class="hero-install" id="get">
+    <p class="hero-install-label">GET XERJ · ONE LINE · STATIC MUSL BINARY · SHA-256 VERIFIED, FAIL-CLOSED</p>
+    <div class="hero-install-cmd">
+      <code>curl -fsSL https://xerj.org/get | sh</code>
+      <button type="button" class="hero-install-copy" data-copy="curl -fsSL https://xerj.org/get | sh">COPY</button>
+    </div>
+    <div class="hero-install-alt">
+      <span>Windows (PowerShell):</span>
+      <code>powershell -ExecutionPolicy Bypass -c "irm https://xerj.org/get.ps1 | iex"</code>
+      <button type="button" class="hero-install-copy" data-copy="powershell -ExecutionPolicy Bypass -c &quot;irm https://xerj.org/get.ps1 | iex&quot;">COPY</button>
+    </div>
+    <div class="hero-install-alt">
+      <span>glibc hosts:</span>
+      <code>curl -fsSL https://xerj.org/get | XERJ_LIBC=gnu sh</code>
+      <button type="button" class="hero-install-copy" data-copy="curl -fsSL https://xerj.org/get | XERJ_LIBC=gnu sh">COPY</button>
+    </div>
+    <p class="hero-install-agent-line">Linux/macOS x86_64 + arm64 · Windows x64 + ARM64. Static musl by default — any distro, incl. Alpine; glibc is the explicit opt-in. Eight release targets, each with a .sha256. Overrides: XERJ_VERSION · XERJ_INSTALL_DIR · XERJ_REPO. <a href="/docs/install">Full install guide →</a></p>
+  </div>
 
   <p class="hero-sub">One paste — your agent installs XERJ, indexes your project and
     the open-source repos worth learning from, and looks implementations up
@@ -363,7 +639,7 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
   </div>
 </section>
 
-<a href="#top" class="cta" id="ctaCopy" data-prompt="Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.">
+<a href="#get" class="cta">
   <span>GET XERJ</span>
   <span class="arrow">↑</span>
 </a>
@@ -417,6 +693,7 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
   <div class="fm-col">
     <span class="fm-h">RESOURCES</span>
     <a href="/resources/">SALES KIT</a>
+    <a href="/blog/">BLOG</a>
     <a href="/brand">BRAND</a>
     <a href="/brandbook/">BRAND BOOK</a>
     <a href="/llms.txt">LLMS.TXT</a>
@@ -431,25 +708,6 @@ $ curl -sXPOST localhost:9200/_memory/agent-demo/_recall \
 </footer>
 
 <script src="/interact.js"></script>
-<script>
-  (function () {
-    const cta = document.getElementById('ctaCopy');
-    if (cta) {
-      cta.addEventListener('click', () => {
-        const label = cta.querySelector('span');
-        const done = () => {
-          const orig = label.textContent;
-          label.textContent = 'PROMPT COPIED ✓';
-          setTimeout(() => { label.textContent = orig; }, 1600);
-        };
-        const text = cta.getAttribute('data-prompt');
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(text).then(done).catch(done);
-        } else { done(); }
-      });
-    }
-  })();
-</script>
 
 <script>
   // Hero demo: click the frameless stage to play, then hand off to native controls.
