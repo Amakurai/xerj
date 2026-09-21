@@ -5084,8 +5084,12 @@ fn run_index_report_inner(
             .clone();
         pin_pending_embedding_identity(&es, &mut journal, &pending)?;
         pr.phase("replay", 0, 0);
+        // #933: the durable replay window is the run's --workers, the same
+        // number that bounds bulk admission, so overlapped operations share
+        // one AIMD gate with the bulks they send.
         let mut backend =
-            sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20, &pr);
+            sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20, &pr)
+                .with_replay_workers(cfg.workers);
         sync_executor::replay_pending_operations_reporting(
             &state_dir,
             &mut journal,
@@ -5410,8 +5414,12 @@ fn run_index_report_inner(
             &pr,
             plan,
         )?;
+        // #933: the durable replay window is the run's --workers, the same
+        // number that bounds bulk admission, so overlapped operations share
+        // one AIMD gate with the bulks they send.
         let mut backend =
-            sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20, &pr);
+            sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20, &pr)
+                .with_replay_workers(cfg.workers);
         sync_executor::replay_pending_operations_reporting(
             &state_dir,
             &mut journal,
@@ -6124,8 +6132,12 @@ fn run_index_report_inner(
             &pr,
             plan,
         )?;
+        // #933: the durable replay window is the run's --workers, the same
+        // number that bounds bulk admission, so overlapped operations share
+        // one AIMD gate with the bulks they send.
         let mut backend =
             sync_executor::EsSyncBackend::new(&es, &state_dir, cfg.bulk_mb << 20, &pr)
+                .with_replay_workers(cfg.workers)
                 .with_installed_mappings(installed_identity);
         sync_executor::replay_pending_operations_reporting(
             &state_dir,

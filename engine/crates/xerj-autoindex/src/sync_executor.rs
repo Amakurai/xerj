@@ -165,6 +165,17 @@ impl Drop for StagingCleanup {
     }
 }
 
+/// One operation this replay attempt still owes, with the name and byte
+/// weight the progress surface reports for it. Precomputed once by
+/// [`replay_pending_operations`] so the serial loop and the parallel
+/// scheduler (#933) describe every operation identically — and so a worker
+/// thread never needs the group maps the fields were derived from.
+pub struct ReplayItem<'o> {
+    pub operation: &'o SyncOperation,
+    pub rel: String,
+    pub bytes: u64,
+}
+
 /// Remote mutations must be convergent: calling `apply` twice for one
 /// operation after an accepted-but-unrecorded response must produce exactly
 /// the same live state. `validate` is the final generation-wide barrier.
@@ -218,6 +229,170 @@ pub trait SyncOperationBackend {
 
     /// The operation started by [`Self::operation_begins`] has been applied.
     fn operation_applied(&mut self) {}
+
+    /// Apply `items` — the operations this attempt still owes, in operation
+    /// order — journaling each one through `journal`.
+    ///
+    /// The default is the historical serial loop: `Started`, apply,
+    /// `Committed`, one operation at a time. [`EsSyncBackend`] overrides it
+    /// (#933) with a windowed scheduler when the run asked for more than one
+    /// worker: one plan gives every group at most one operation
+    /// (`plan_operations` emits at most one per group id), and an operation's
+    /// writes are keyed by its group's content id, so two operations' writes
+    /// never touch the same documents. The per-operation durable order is
+    /// exactly the serial contract, overlapped — `Started` is journaled
+    /// before the operation is dispatched, `Committed` after its apply
+    /// returned, so a crash mid-window repeats precisely the operations
+    /// whose accepted apply was not recorded, and `apply` stays convergent
+    /// for exactly that retry.
+    fn replay_operations(
+        &mut self,
+        items: &[ReplayItem<'_>],
+        base: &CommittedManifest,
+        desired: &GenerationManifest,
+        snapshot: &SourceSnapshot,
+        journal: &mut Journal,
+    ) -> Result<()> {
+        replay_serial(self, items, base, desired, snapshot, journal)
+    }
+}
+
+/// The historical serial replay: one operation at a time, journaling
+/// `Started` before its apply and `Committed` after it.
+fn replay_serial<B: SyncOperationBackend + ?Sized>(
+    backend: &mut B,
+    items: &[ReplayItem<'_>],
+    base: &CommittedManifest,
+    desired: &GenerationManifest,
+    snapshot: &SourceSnapshot,
+    journal: &mut Journal,
+) -> Result<()> {
+    for item in items {
+        let operation = item.operation;
+        let state = journal
+            .pending_sync
+            .as_ref()
+            .and_then(|sync| sync.operation_states.get(&operation.operation_id))
+            .cloned();
+        if state == Some(SyncOperationState::Committed) {
+            continue;
+        }
+        if state.is_none() {
+            journal.sync_operation_state(&operation.operation_id, SyncOperationState::Started)?;
+        }
+        backend.operation_begins(&item.rel, item.bytes);
+        backend.apply(operation, base, desired, snapshot)?;
+        replay_fail_after_apply()?;
+        journal.sync_operation_state(&operation.operation_id, SyncOperationState::Committed)?;
+        backend.operation_applied();
+    }
+    Ok(())
+}
+
+/// The journal-side callbacks of [`replay_windowed`], one object so the
+/// caller's mutable state — the journal — is borrowed once, not once per
+/// closure.
+pub(crate) trait ReplayHooks<T> {
+    /// Called on the scheduling thread before the item is dispatched.
+    fn begin(&mut self, item: &T) -> Result<()>;
+    /// Called on the scheduling thread, in dispatch order, as each item's
+    /// apply finishes. Returning an error stops all further dispatch.
+    fn applied(&mut self, item: &T, outcome: Result<()>) -> Result<()>;
+}
+
+/// #933: apply `items` through a window at most `width` items wide.
+///
+/// This is the whole concurrency policy of the parallel replay, kept free of
+/// ES, journal and progress detail so it can be unit-tested without a
+/// server. [`ReplayHooks::begin`] runs on the calling thread before an item
+/// is dispatched — where the serial loop journals `Started`; `apply` runs on
+/// worker threads and may overlap with other items' `apply`;
+/// [`ReplayHooks::applied`] runs on the calling thread, in dispatch order,
+/// as each item finishes — where the serial loop journals `Committed`.
+/// Completions are joined head-first, so `applied` sees items in exactly the
+/// order they were begun, which is what keeps the journal a serial reader
+/// can follow.
+///
+/// Failure semantics are the serial loop's plus one honest addition the
+/// overlap forces, and they run through `applied`: the first `applied` that
+/// returns an error stops all further dispatch, everything already
+/// dispatched is drained to completion, and `applied` is still called for
+/// each drained item so the caller can journal the applies the server did
+/// accept. On the serial loop nothing else was in flight when an apply
+/// failed, so its behaviour is unchanged; overlapped, skipping the
+/// `Committed` write for an apply that already landed would only force a
+/// convergent redo of it on resume. A caller that deliberately accepts a
+/// failed outcome by returning `Ok` keeps the run going — the scheduler
+/// trusts `applied`, not the outcome. The first error is the return value;
+/// later errors are handed to `applied` and otherwise dropped, because the
+/// first failure is the one a retry of the same command will meet again.
+pub(crate) fn replay_windowed<T: Sync>(
+    items: &[T],
+    width: usize,
+    hooks: &mut dyn ReplayHooks<T>,
+    apply: &(dyn Fn(&T) -> Result<()> + Sync),
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    if width <= 1 || items.len() == 1 {
+        // No overlap is possible; same callbacks, same order, no threads.
+        for item in items {
+            hooks.begin(item)?;
+            hooks.applied(item, apply(item))?;
+        }
+        return Ok(());
+    }
+    let failure = std::thread::scope(|scope| -> Result<Option<anyhow::Error>> {
+        let mut next = items.iter();
+        let mut in_flight: std::collections::VecDeque<(
+            &T,
+            std::thread::ScopedJoinHandle<'_, Result<()>>,
+        )> = std::collections::VecDeque::new();
+        let mut failure: Option<anyhow::Error> = None;
+        loop {
+            while failure.is_none() && in_flight.len() < width {
+                // `begin` is the Started write: it happens on THIS thread,
+                // before the operation exists remotely, so an operation that
+                // was never dispatched is also never recorded as begun.
+                let Some(item) = next.next() else { break };
+                hooks.begin(item)?;
+                let dispatched = item;
+                in_flight.push_back((item, scope.spawn(move || apply(dispatched))));
+            }
+            let Some((item, handle)) = in_flight.pop_front() else {
+                break;
+            };
+            let outcome = handle.join().unwrap_or_else(|panic| {
+                Err(anyhow::anyhow!(
+                    "replay apply panicked: {}",
+                    panic_message(panic)
+                ))
+            });
+            let reported = hooks.applied(item, outcome);
+            if let (None, Err(error)) = (&failure, reported) {
+                // First failure stops dispatch; the drain still reports.
+                failure = Some(error);
+            }
+        }
+        Ok(failure)
+    })?;
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// The message of a panicking worker, when it carried one — a panic is not an
+/// ES answer and must not look like one.
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else {
+        "no message".to_owned()
+    }
 }
 
 /// Production ES-compatible operation backend for graph-disabled generations.
@@ -246,6 +421,10 @@ pub struct EsSyncBackend<'a> {
     /// The operation the replay loop is inside; dropping it counts the
     /// operation done and clears it from the surface's in-flight table.
     in_flight: Option<crate::progress::FileGuard<'a>>,
+    /// #933: how many operations [`Self::replay_operations`] may have in
+    /// flight at once. `1` — the default — is the historical serial loop,
+    /// and what every run without `--workers` beyond it configures.
+    replay_workers: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -263,12 +442,22 @@ impl<'a> EsSyncBackend<'a> {
             pr,
             installed_index_identity: None,
             in_flight: None,
+            replay_workers: 1,
         }
     }
 
     /// See `installed_index_identity`.
     pub fn with_installed_mappings(mut self, index_identity: String) -> Self {
         self.installed_index_identity = Some(index_identity);
+        self
+    }
+
+    /// Set the replay window width (#933). Production passes the run's
+    /// `--workers` — the same number that already bounds the run's bulk
+    /// admission window, so the operations share one AIMD gate with the
+    /// bulks they send and a 429 shrinks what THIS path offers too.
+    pub fn with_replay_workers(mut self, workers: usize) -> Self {
+        self.replay_workers = workers.max(1);
         self
     }
 
@@ -280,6 +469,57 @@ impl<'a> EsSyncBackend<'a> {
                     "ax_file": &group.content_id
                 }}),
             )?;
+        }
+        Ok(())
+    }
+
+    /// The remote work of one operation, through a shared reference: the
+    /// windowed replay (#933) runs this from several worker threads at once,
+    /// over operations whose groups — and therefore whose documents, selected
+    /// by `ax_file` content id — are disjoint. The body is the serial loop's
+    /// `apply`, unchanged; only the receiver changed.
+    fn apply_shared(
+        &self,
+        operation: &SyncOperation,
+        base: &CommittedManifest,
+        desired: &GenerationManifest,
+        snapshot: &SourceSnapshot,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            desired
+                .execution
+                .as_ref()
+                .is_some_and(|execution| !execution.graph_enabled),
+            "production incremental graph reconciliation is not enabled yet"
+        );
+        let old = base
+            .groups
+            .iter()
+            .find(|group| group.group_id == operation.group_id);
+        let new = desired
+            .groups
+            .iter()
+            .find(|group| group.group_id == operation.group_id);
+        match operation.kind {
+            crate::sync::SyncOperationKind::Delete => self.delete_group(
+                old.context("delete operation has no committed group")?,
+                &base.plan,
+            )?,
+            crate::sync::SyncOperationKind::Upsert => {
+                if let Some(old) = old {
+                    self.delete_group(old, &base.plan)?;
+                }
+                let new = new.context("upsert operation has no desired group")?;
+                // Remove a partial prior retry of the desired identity too.
+                self.delete_group(new, &desired.plan)?;
+                self.replay_prepared(snapshot, &new.content_id)?;
+            }
+            crate::sync::SyncOperationKind::Metadata => {
+                self.replay_metadata(
+                    base,
+                    new.context("metadata operation has no desired group")?,
+                )?;
+            }
         }
         Ok(())
     }
@@ -610,43 +850,77 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
         desired: &GenerationManifest,
         snapshot: &SourceSnapshot,
     ) -> Result<()> {
+        self.apply_shared(operation, base, desired, snapshot)
+    }
+
+    fn replay_operations(
+        &mut self,
+        items: &[ReplayItem<'_>],
+        base: &CommittedManifest,
+        desired: &GenerationManifest,
+        snapshot: &SourceSnapshot,
+        journal: &mut Journal,
+    ) -> Result<()> {
+        let width = self.replay_workers;
+        if width <= 1 || items.len() <= 1 {
+            return replay_serial(self, items, base, desired, snapshot, journal);
+        }
+        // The durability argument of the overlap rests on disjoint groups:
+        // one plan gives a group at most one operation (`plan_operations`
+        // walks base and desired by group id), so no two in-flight
+        // operations ever write the same documents. Refuse here rather
+        // than silently corrupt if a future planner breaks that.
+        let mut groups = std::collections::BTreeSet::new();
         anyhow::ensure!(
-            desired
-                .execution
-                .as_ref()
-                .is_some_and(|execution| !execution.graph_enabled),
-            "production incremental graph reconciliation is not enabled yet"
+            items
+                .iter()
+                .all(|item| groups.insert(item.operation.group_id.as_str())),
+            "parallel replay requires at most one operation per group; this plan needs the \
+             serial loop"
         );
-        let old = base
-            .groups
-            .iter()
-            .find(|group| group.group_id == operation.group_id);
-        let new = desired
-            .groups
-            .iter()
-            .find(|group| group.group_id == operation.group_id);
-        match operation.kind {
-            crate::sync::SyncOperationKind::Delete => self.delete_group(
-                old.context("delete operation has no committed group")?,
-                &base.plan,
-            )?,
-            crate::sync::SyncOperationKind::Upsert => {
-                if let Some(old) = old {
-                    self.delete_group(old, &base.plan)?;
+        let this: &EsSyncBackend<'_> = self;
+        let pr = this.pr;
+        let apply = |item: &ReplayItem<'_>| {
+            // The in-flight entry IS this worker's file: the guard counts the
+            // item done on every exit path, exactly as the serial loop's
+            // `operation_begins`/`operation_applied` pair does (#931).
+            let _guard = pr.file(&item.rel, item.bytes);
+            this.apply_shared(item.operation, base, desired, snapshot)
+        };
+        /// The serial loop's two journal writes, verbatim: Started before
+        /// dispatch, Committed after the apply returned — the durable order
+        /// #933 must not change, only overlap it.
+        struct JournalHooks<'j> {
+            journal: &'j mut Journal,
+        }
+        impl ReplayHooks<ReplayItem<'_>> for JournalHooks<'_> {
+            fn begin(&mut self, item: &ReplayItem<'_>) -> Result<()> {
+                let state = self
+                    .journal
+                    .pending_sync
+                    .as_ref()
+                    .and_then(|sync| sync.operation_states.get(&item.operation.operation_id))
+                    .cloned();
+                if state.is_none() {
+                    self.journal.sync_operation_state(
+                        &item.operation.operation_id,
+                        SyncOperationState::Started,
+                    )?;
                 }
-                let new = new.context("upsert operation has no desired group")?;
-                // Remove a partial prior retry of the desired identity too.
-                self.delete_group(new, &desired.plan)?;
-                self.replay_prepared(snapshot, &new.content_id)?;
+                Ok(())
             }
-            crate::sync::SyncOperationKind::Metadata => {
-                self.replay_metadata(
-                    base,
-                    new.context("metadata operation has no desired group")?,
-                )?;
+
+            fn applied(&mut self, item: &ReplayItem<'_>, outcome: Result<()>) -> Result<()> {
+                let () = outcome?;
+                replay_fail_after_apply()?;
+                self.journal.sync_operation_state(
+                    &item.operation.operation_id,
+                    SyncOperationState::Committed,
+                )
             }
         }
-        Ok(())
+        let mut hooks = JournalHooks { journal };
+        replay_windowed(items, width, &mut hooks, &apply)
     }
 
     fn publish_generation_catalog(
@@ -902,38 +1176,28 @@ pub fn replay_pending_operations(
         .iter()
         .filter(|operation| !committed(journal, operation))
         .collect();
+    // #931: what the loop reports per operation — its source path and its
+    // sealed bytes — resolved once here, so the serial loop and the windowed
+    // scheduler (#933) name and measure every operation identically.
+    let items: Vec<ReplayItem> = remaining
+        .iter()
+        .map(|operation| ReplayItem {
+            operation,
+            rel: desired_by_group
+                .get(operation.group_id.as_str())
+                .or_else(|| base_by_group.get(operation.group_id.as_str()))
+                .map_or(operation.group_id.as_str(), |group| {
+                    group.canonical.rel.as_str()
+                })
+                .to_owned(),
+            bytes: operation_bytes(operation),
+        })
+        .collect();
     backend.replay_begins(
-        remaining.len() as u64,
-        remaining
-            .iter()
-            .map(|operation| operation_bytes(operation))
-            .sum(),
+        items.len() as u64,
+        items.iter().map(|item| item.bytes).sum(),
     );
-
-    for operation in &pending.operations {
-        let state = journal
-            .pending_sync
-            .as_ref()
-            .and_then(|sync| sync.operation_states.get(&operation.operation_id))
-            .cloned();
-        if state == Some(SyncOperationState::Committed) {
-            continue;
-        }
-        if state.is_none() {
-            journal.sync_operation_state(&operation.operation_id, SyncOperationState::Started)?;
-        }
-        let rel = desired_by_group
-            .get(operation.group_id.as_str())
-            .or_else(|| base_by_group.get(operation.group_id.as_str()))
-            .map_or(operation.group_id.as_str(), |group| {
-                group.canonical.rel.as_str()
-            });
-        backend.operation_begins(rel, operation_bytes(operation));
-        backend.apply(operation, &base, &pending.desired, &snapshot)?;
-        replay_fail_after_apply()?;
-        journal.sync_operation_state(&operation.operation_id, SyncOperationState::Committed)?;
-        backend.operation_applied();
-    }
+    backend.replay_operations(&items, &base, &pending.desired, &snapshot, journal)?;
     backend.publish_generation_catalog(&base, &pending.desired, &snapshot)?;
     backend.validate(&base, &pending.desired, &snapshot)?;
     journal.sync_validated()?;
@@ -3104,6 +3368,164 @@ mod tests {
         assert_eq!(backend.applications.len(), 2);
         assert!(journal.pending_sync.is_none());
         assert_eq!(journal.committed_manifest.as_ref().unwrap().generation, 1);
+    }
+
+    /// The concurrency a window of applies actually reached, counted from
+    /// inside `apply` — shared with the worker threads through an `Arc`.
+    #[derive(Default)]
+    struct WindowProbe {
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WindowProbe {
+        fn enter(&self) {
+            let entered = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.max_in_flight
+                .fetch_max(entered, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn leave(&self) {
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn max_seen(&self) -> usize {
+            self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// What the scheduling thread saw, in the order it saw it.
+    #[derive(Default)]
+    struct WindowHooks {
+        begun: Vec<usize>,
+        applied: Vec<(usize, bool)>,
+    }
+
+    impl ReplayHooks<usize> for WindowHooks {
+        fn begin(&mut self, item: &usize) -> Result<()> {
+            self.begun.push(*item);
+            Ok(())
+        }
+
+        fn applied(&mut self, item: &usize, outcome: Result<()>) -> Result<()> {
+            self.applied.push((*item, outcome.is_ok()));
+            outcome
+        }
+    }
+
+    #[test]
+    fn replay_windowed_overlaps_up_to_the_width_and_reports_in_dispatch_order() {
+        let items: Vec<usize> = (0..12).collect();
+        let probe = std::sync::Arc::new(WindowProbe::default());
+        let apply_probe = std::sync::Arc::clone(&probe);
+        let apply = move |_item: &usize| {
+            apply_probe.enter();
+            // Long enough that the whole first window is inside `apply` at
+            // once; short enough that the test stays instant.
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            apply_probe.leave();
+            Ok(())
+        };
+        let mut hooks = WindowHooks::default();
+        replay_windowed(&items, 4, &mut hooks, &apply).unwrap();
+        assert_eq!(hooks.begun, items, "every item begun, in dispatch order");
+        assert_eq!(
+            hooks
+                .applied
+                .iter()
+                .map(|(item, _)| *item)
+                .collect::<Vec<_>>(),
+            items,
+            "completions reported in dispatch order"
+        );
+        assert!(hooks.applied.iter().all(|(_, ok)| *ok));
+        let max = probe.max_seen();
+        assert!(
+            (2..=4).contains(&max),
+            "a 4-wide window over 25 ms applies must overlap; max concurrent was {max}"
+        );
+    }
+
+    #[test]
+    fn replay_windowed_stops_dispatch_on_failure_and_drains_what_was_dispatched() {
+        let items: Vec<usize> = (0..6).collect();
+        let mut hooks = WindowHooks::default();
+        let apply = |item: &usize| {
+            if *item == 1 {
+                // Inside the first window, slow enough that items 0, 2 and
+                // the next dispatch (3) are already in flight when it lands.
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                Err(anyhow::anyhow!("injected apply failure"))
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                Ok(())
+            }
+        };
+        let error = replay_windowed(&items, 3, &mut hooks, &apply)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "injected apply failure");
+        assert_eq!(
+            hooks.begun,
+            vec![0, 1, 2, 3],
+            "dispatch stops at the failure"
+        );
+        assert_eq!(
+            hooks.applied,
+            vec![(0, true), (1, false), (2, true), (3, true)],
+            "in-flight successes after the failure are still reported, so their \
+             Committed writes are not lost; undispatched items are untouched"
+        );
+    }
+
+    #[test]
+    fn replay_windowed_width_one_never_spawns_and_keeps_order() {
+        let items: Vec<usize> = (0..3).collect();
+        let mut hooks = WindowHooks::default();
+        let seen_threads =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let apply_of = std::sync::Arc::clone(&seen_threads);
+        let apply = move |_item: &usize| {
+            apply_of.lock().unwrap().insert(std::thread::current().id());
+            Ok(())
+        };
+        replay_windowed(&items, 1, &mut hooks, &apply).unwrap();
+        assert_eq!(hooks.begun, items);
+        assert_eq!(hooks.applied, vec![(0, true), (1, true), (2, true)]);
+        assert_eq!(
+            seen_threads.lock().unwrap().len(),
+            1,
+            "width 1 runs every apply on the calling thread"
+        );
+    }
+
+    #[test]
+    fn replay_windowed_converts_a_worker_panic_into_the_run_error() {
+        let items: Vec<usize> = (0..4).collect();
+        let mut hooks = WindowHooks::default();
+        let apply = |item: &usize| {
+            if *item == 0 {
+                std::panic::panic_any("worker exploded");
+            }
+            Ok(())
+        };
+        // Keep the injected panic out of the test output; it is the input,
+        // not a failure to report.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let error = replay_windowed(&items, 4, &mut hooks, &apply).unwrap_err();
+        std::panic::set_hook(previous_hook);
+        assert_eq!(error.to_string(), "replay apply panicked: worker exploded");
+        assert_eq!(hooks.begun, vec![0, 1, 2, 3], "the window was dispatched");
+        assert_eq!(
+            hooks.applied,
+            vec![(0, false), (1, true), (2, true), (3, true)],
+            "the drain still reports the applies that did land"
+        );
     }
 
     /// A backend whose Nth `apply` is the server still answering 429 after
