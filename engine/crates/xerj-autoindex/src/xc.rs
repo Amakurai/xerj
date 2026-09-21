@@ -599,11 +599,63 @@ fn chrono_now_stamp() -> String {
 
 // ── xerj corpus index ───────────────────────────────────────────────────────
 
+/// The node operations the corpus lifecycle needs (#1004): one trait so the
+/// build/verify/swap flow can run against a fake in tests, re-pinning the
+/// destructive-operation contracts the retired `test_xc_index_fresh.py`
+/// pinned at the HTTP layer. The trait is deliberately the FOUR operations
+/// the flow performs against the node — listing, counting (tri-state), and
+/// the two scoped deletes — nothing more, so the fake cannot drift from what
+/// a real node is asked to do.
+pub(crate) trait CorpusNode {
+    /// `_cat/indices` under a glob, as index names. `Err` = unreachable.
+    fn list_indices(&self, glob: &str) -> Result<Vec<String>, String>;
+    /// The tri-state `_count` for a `{prefix}-*` glob (DASH form).
+    fn count(&self, dash_glob: &str) -> Count;
+    /// DELETE one index BY EXACT NAME. `false` = the node refused.
+    fn delete_index(&self, name: &str) -> bool;
+    /// `_delete_by_query` on the shared catalog for one corpus scope.
+    fn delete_catalog_scope(&self, scope: &str) -> bool;
+}
+
+impl CorpusNode for Es {
+    fn list_indices(&self, glob: &str) -> Result<Vec<String>, String> {
+        self.cat_indices_json(glob).map_err(|e| format!("{e:#}"))
+    }
+    fn count(&self, dash_glob: &str) -> Count {
+        self.count_endpoint(dash_glob)
+    }
+    fn delete_index(&self, name: &str) -> bool {
+        self.request_json("DELETE", &format!("/{name}"), None)
+            .map(|(s, _)| (200..300).contains(&s))
+            .unwrap_or(false)
+    }
+    fn delete_catalog_scope(&self, scope: &str) -> bool {
+        // The catalog is one global index shared by every corpus on the node,
+        // so its documents are removed by EXACT scope value: `corpus_scope`
+        // is a keyword, and a `term` on a legacy analyzed `prefix` cannot
+        // equal a hyphenated value at all — it under-deletes there, it never
+        // reaches a sibling corpus.
+        let body = json!({
+            "query": { "bool": { "minimum_should_match": 1, "should": [
+                { "term": { "corpus_scope": scope } },
+                { "term": { "prefix": scope } }
+            ]}}
+        });
+        self.request_json(
+            "POST",
+            "/autoindex-catalog/_delete_by_query?refresh=true",
+            Some(&body),
+        )
+        .map(|(s, _)| (200..300).contains(&s))
+        .unwrap_or(false)
+    }
+}
+
 /// `count_under`: patiently. Still `None` when the node never answered —
 /// callers must treat that as UNKNOWN, never as zero. The glob is the DASH
 /// form `{prefix}-*` (verification), pinned against the STAR form the query
 /// path uses — both are load-bearing and they are not interchangeable.
-fn count_under(es: &Es, prefix: &str) -> Option<u64> {
+fn count_under(node: &dyn CorpusNode, prefix: &str) -> Option<u64> {
     let tries = std::env::var("XC_COUNT_TRIES")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
@@ -613,7 +665,7 @@ fn count_under(es: &Es, prefix: &str) -> Option<u64> {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(5);
     for attempt in 1..=tries.max(1) {
-        match es.count_endpoint(&format!("{prefix}-*")) {
+        match node.count(&format!("{prefix}-*")) {
             Count::Number(n) => return Some(n),
             Count::Zero => return Some(0),
             Count::Unknown(_) => {
@@ -631,11 +683,11 @@ fn count_under(es: &Es, prefix: &str) -> Option<u64> {
 /// glob is not enough: `xc-battle-*` also matches the sibling corpus
 /// `battle-terse`, and retiring a sibling's indices is not a mistake this
 /// command gets to make.
-fn corpus_indices(es: &Es, name: &str, root: &Path) -> Vec<String> {
+fn corpus_indices(node: &dyn CorpusNode, name: &str, root: &Path) -> Vec<String> {
     // Any error lists nothing, which errs toward KEEPING an index (nothing is
     // retired that was not listed), never toward deleting one.
-    let rows = es
-        .cat_indices_json(&format!("xc-{name}-*"))
+    let rows = node
+        .list_indices(&format!("xc-{name}-*"))
         .unwrap_or_default();
     let mut siblings: Vec<String> = Vec::new();
     for (folder, strip) in [(root.join("corpora"), ""), (root.join("state"), ".json")] {
@@ -661,47 +713,16 @@ fn corpus_indices(es: &Es, name: &str, root: &Path) -> Vec<String> {
         .collect()
 }
 
-fn delete_indices(es: &Es, names: &[String]) -> usize {
+fn delete_indices(node: &dyn CorpusNode, names: &[String]) -> usize {
     let mut failed = 0;
     for index in names {
         // Exact names only, never a wildcard.
-        let ok = es
-            .request_json("DELETE", &format!("/{index}"), None)
-            .map(|(s, _)| (200..300).contains(&s))
-            .unwrap_or(false);
-        if !ok {
+        if !node.delete_index(index) {
             failed += 1;
             eprintln!("xerj corpus index:   could not delete {index}");
         }
     }
     failed
-}
-
-/// The catalog is one global index shared by every corpus on the node, so its
-/// documents are removed by EXACT scope value: `corpus_scope` is a keyword,
-/// and a `term` on a legacy analyzed `prefix` cannot equal a hyphenated value
-/// at all — it under-deletes there, it never reaches a sibling corpus.
-fn delete_catalog_scope(es: &Es, scope: &str) {
-    let body = json!({
-        "query": { "bool": { "minimum_should_match": 1, "should": [
-            { "term": { "corpus_scope": scope } },
-            { "term": { "prefix": scope } }
-        ]}}
-    });
-    let ok = es
-        .request_json(
-            "POST",
-            "/autoindex-catalog/_delete_by_query?refresh=true",
-            Some(&body),
-        )
-        .map(|(s, _)| (200..300).contains(&s))
-        .unwrap_or(false);
-    if !ok {
-        eprintln!(
-            "xerj corpus index:   could not clean autoindex-catalog for '{scope}' (harmless; \
-             `xerj autoindex map` may list retired datasets)"
-        );
-    }
 }
 
 fn report(name: &str, rc: i32, docs: &str) {
@@ -773,9 +794,36 @@ fn run_corpus_index(args: &[String]) -> i32 {
             return 2;
         }
     };
+    corpus_index_flow(
+        &es,
+        &|prefix, state_dir| crate::run_with_options(&dir, &url, prefix, state_dir, true),
+        &stamp_secs,
+        &root,
+        &url,
+        &name,
+        fresh,
+    )
+}
+
+/// The build/verify/swap flow over an injected node, autoindex runner and
+/// clock (#1004) — the destructive-operation contracts are pinned by the
+/// tests below against a [`FakeNode`](tests::FakeNode), which is why none of
+/// this touches [`Es`] directly. `run_autoindex(prefix, state_dir)` is the
+/// real `crate::run_with_options` in production, with `--no-graph` set
+/// (reference code needs ranked passages, not a relationship map) — and
+/// `--fresh` is NEVER forwarded: this flow owns the swap.
+fn corpus_index_flow(
+    node: &dyn CorpusNode,
+    run_autoindex: &dyn Fn(&str, Option<&Path>) -> i32,
+    now_secs: &dyn Fn() -> i64,
+    root: &Path,
+    url: &str,
+    name: &str,
+    fresh: bool,
+) -> i32 {
     let state_file = root.join("state").join(format!("{name}.json"));
     let state_root = root.join("autoindex-state");
-    let old = state::load_state(&root, &name).ok();
+    let old = state::load_state(root, name).ok();
     let old_build = old.as_ref().and_then(|s| s.build.clone());
     let old_index_prefix = old.as_ref().and_then(|s| s.index_prefix.clone());
     let old_state_dir = old.as_ref().and_then(|s| s.state_dir.clone());
@@ -785,7 +833,7 @@ fn run_corpus_index(args: &[String]) -> i32 {
     // node-does-not-hold), update (reconcile the recorded build in place), or
     // legacy (a corpus indexed before builds existed).
     let mut mode = "legacy";
-    let old_indices = corpus_indices(&es, &name, &root);
+    let old_indices = corpus_indices(node, name, root);
     if fresh {
         mode = "build";
     } else if old_build.is_some()
@@ -793,9 +841,9 @@ fn run_corpus_index(args: &[String]) -> i32 {
         && old_state_dir
             .as_deref()
             .is_some_and(|d| Path::new(d).is_dir())
-        && old_url.as_deref() == Some(url.as_str())
+        && old_url.as_deref() == Some(url)
     {
-        let live = count_under(&es, old_index_prefix.as_deref().unwrap_or(""));
+        let live = count_under(node, old_index_prefix.as_deref().unwrap_or(""));
         match live {
             Some(n) if n > 0 => mode = "update",
             _ => {
@@ -811,42 +859,39 @@ fn run_corpus_index(args: &[String]) -> i32 {
         mode = "build"; // first index of this corpus: same path as --fresh
     }
 
-    println!("indexing corpus '{name}' from {}", dir.display());
-
-    // --no-graph: reference code needs ranked passages, not a relationship
-    // map. --fresh is NEVER forwarded to autoindex: the wrapper owns the swap.
-    let run_autoindex = |prefix: &str, state_dir: Option<&Path>| -> i32 {
-        crate::run_with_options(&dir, &url, prefix, state_dir, true)
-    };
+    println!(
+        "indexing corpus '{name}' from {}",
+        root.join("corpora").join(name).display()
+    );
 
     match mode {
         "build" => {
             // Listed BEFORE the build so "old" can never include what this
             // run creates.
-            let old_indices = corpus_indices(&es, &name, &root);
+            let old_indices = corpus_indices(node, name, root);
             // One-second resolution: a second --fresh inside the same second
             // would reuse the prefix of the build it is replacing. The id
             // must be new — not the recorded build, not a state dir that
             // exists, not a prefix any live index already sits under.
-            let mut build = format!("b{}", stamp_secs());
+            let mut build = format!("b{}", now_secs());
             while old_build.as_deref() == Some(build.as_str())
-                || state_root.join(&name).join(&build).exists()
+                || state_root.join(name).join(&build).exists()
                 || old_indices
                     .iter()
                     .any(|idx| idx.starts_with(&format!("xc-{name}-{build}")))
             {
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                build = format!("b{}", stamp_secs());
+                build = format!("b{}", now_secs());
             }
             let new_prefix = format!("xc-{name}-{build}");
-            let new_state = state_root.join(&name).join(&build);
+            let new_state = state_root.join(name).join(&build);
             // Is there a working index to protect? When the node cannot
             // count it, the answer is YES: presuming "none" is what lets a
             // failed build be kept over it and the old indices be retired.
             let mut has_working_index = false;
             if !old_indices.is_empty() {
                 let counted = count_under(
-                    &es,
+                    node,
                     old_index_prefix.as_deref().unwrap_or(&format!("xc-{name}")),
                 );
                 match counted {
@@ -869,7 +914,7 @@ fn run_corpus_index(args: &[String]) -> i32 {
             let rc = run_autoindex(&new_prefix, Some(&new_state));
 
             // VERIFY: rc in {0,3} AND a count the node actually gave > 0.
-            let docs = count_under(&es, &new_prefix);
+            let docs = count_under(node, &new_prefix);
             let Some(docs) = docs else {
                 // UNKNOWN is not EMPTY: it authorises no delete and no swap.
                 eprintln!(
@@ -883,9 +928,9 @@ fn run_corpus_index(args: &[String]) -> i32 {
                     eprintln!("xerj corpus index: retired by the next build that verifies.");
                 } else {
                     let _ = state::write_state(
-                        &root,
-                        &name,
-                        &url,
+                        root,
+                        name,
+                        url,
                         rc as i64,
                         true,
                         Some(&build),
@@ -923,14 +968,14 @@ fn run_corpus_index(args: &[String]) -> i32 {
                 // Remove only what THIS run created: the set-diff against the
                 // pre-run listing, intersected with this build's prefix, BY
                 // EXACT NAME — never a wildcard, never new_prefix itself.
-                let after = corpus_indices(&es, &name, &root);
+                let after = corpus_indices(node, name, root);
                 let doomed: Vec<String> = after
                     .into_iter()
                     .filter(|idx| !old_indices.contains(idx))
                     .filter(|idx| idx.starts_with(&format!("xc-{name}-{build}-")))
                     .collect();
-                delete_indices(&es, &doomed);
-                delete_catalog_scope(&es, &new_prefix);
+                delete_indices(node, &doomed);
+                node.delete_catalog_scope(&new_prefix);
                 let _ = std::fs::remove_dir_all(&new_state);
                 if !old_indices.is_empty() {
                     eprintln!("xerj corpus index: the existing index was NOT touched and is still what `xerj code` serves.");
@@ -943,9 +988,9 @@ fn run_corpus_index(args: &[String]) -> i32 {
             // Verified. Switch readers first, retire second: a crash between
             // the two leaves a duplicate, never a gap.
             let _ = state::write_state(
-                &root,
-                &name,
-                &url,
+                root,
+                name,
+                url,
                 rc as i64,
                 salvaged,
                 Some(&build),
@@ -959,19 +1004,18 @@ fn run_corpus_index(args: &[String]) -> i32 {
                 .collect();
             if !retire.is_empty() {
                 println!("xerj corpus index: replacement verified ({docs} records) — retiring {} old indices", retire.len());
-                if delete_indices(&es, &retire) > 0 {
+                if delete_indices(node, &retire) > 0 {
                     eprintln!("xerj corpus index: WARNING — some old indices could not be deleted. The corpus is healthy and");
                     eprintln!("xerj corpus index: `xerj code` reads only {new_prefix}-*; delete the leftovers by name when the node allows.");
                 }
-                delete_catalog_scope(
-                    &es,
+                node.delete_catalog_scope(
                     old_index_prefix.as_deref().unwrap_or(&format!("xc-{name}")),
                 );
             }
             // Earlier builds' state directories are dead weight once their
             // indices are gone.
-            if state_root.join(&name).is_dir() {
-                if let Ok(entries) = std::fs::read_dir(state_root.join(&name)) {
+            if state_root.join(name).is_dir() {
+                if let Ok(entries) = std::fs::read_dir(state_root.join(name)) {
                     for e in entries.flatten() {
                         if e.file_name().to_string_lossy() != build {
                             let _ = std::fs::remove_dir_all(e.path());
@@ -979,7 +1023,7 @@ fn run_corpus_index(args: &[String]) -> i32 {
                     }
                 }
             }
-            report(&name, rc, &docs.to_string());
+            report(name, rc, &docs.to_string());
             0
         }
         "update" => {
@@ -992,20 +1036,20 @@ fn run_corpus_index(args: &[String]) -> i32 {
                 eprintln!("xerj corpus index: stays live until the replacement verifies).");
                 return rc;
             }
-            let docs = count_under(&es, &prefix)
+            let docs = count_under(node, &prefix)
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "?".to_string());
             let _ = state::write_state(
-                &root,
-                &name,
-                &url,
+                root,
+                name,
+                url,
                 rc as i64,
                 false,
                 old_build.as_deref(),
                 Some(&prefix),
                 old_state_dir.as_deref(),
             );
-            report(&name, rc, &docs);
+            report(name, rc, &docs);
             0
         }
         _ => {
@@ -1013,13 +1057,13 @@ fn run_corpus_index(args: &[String]) -> i32 {
             // wrote records" apart from "an earlier run's records are still
             // lying around" (salvaging the latter would date stale data to
             // now, which is worse than no index).
-            let before_known = count_under(&es, &format!("xc-{name}"));
+            let before_known = count_under(node, &format!("xc-{name}"));
             let docs_before = before_known.unwrap_or(0);
             let rc = run_autoindex(&format!("xc-{name}"), None);
             let mut salvaged = false;
             let mut docs: Option<u64> = None;
             if rc != 0 && rc != 3 {
-                docs = count_under(&es, &format!("xc-{name}"));
+                docs = count_under(node, &format!("xc-{name}"));
                 if before_known.is_some() && docs.is_some_and(|d| d > docs_before) {
                     salvaged = true;
                     eprintln!("xerj corpus index: WARNING — autoindex exited {rc}, but this run wrote records");
@@ -1033,12 +1077,12 @@ fn run_corpus_index(args: &[String]) -> i32 {
                     return rc;
                 }
             }
-            docs = docs.or_else(|| count_under(&es, &format!("xc-{name}")));
+            docs = docs.or_else(|| count_under(node, &format!("xc-{name}")));
             let docs_s = docs
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "?".to_string());
-            let _ = state::write_state(&root, &name, &url, rc as i64, salvaged, None, None, None);
-            report(&name, rc, &docs_s);
+            let _ = state::write_state(root, name, url, rc as i64, salvaged, None, None, None);
+            report(name, rc, &docs_s);
             0
         }
     }
@@ -1203,6 +1247,10 @@ mod tests {
 
     #[test]
     fn url_resolution_prefers_flag_then_env_then_default() {
+        // under ENV_LOCK: set/remove of process env is global, so any test
+        // mutating env serialises with the others (one unreproduced lib-suite
+        // failure was observed on the merged #977 branch before this lock).
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(resolve_url(Some("http://a:1")), "http://a:1");
         // env-dependent branches covered by the e2e; default pinned here.
         std::env::remove_var("XERJ_URL");
@@ -1211,6 +1259,9 @@ mod tests {
 
     #[test]
     fn count_tries_env_defaults_are_the_scripts_values() {
+        // under the same lock the #1004 tests use: they set the knobs, this
+        // test asserts their absence — run concurrently they would flake.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("XC_COUNT_TRIES");
         std::env::remove_var("XC_COUNT_PAUSE");
         // (6 tries, 5s pause) — pinned by the port; the env knobs still work.
@@ -1275,5 +1326,493 @@ mod tests {
             &resolve_corpus_name(None, "battle-terse", "p").unwrap()
         )
         .is_ok());
+    }
+
+    // ── the --fresh swap contracts (#1004) ──────────────────────────────────
+    //
+    // The retired test_xc_index_fresh.py pinned these against a fake node and
+    // a PATH-shimmed fake binary; they are re-pinned here against a FakeNode
+    // behind the same CorpusNode trait production code uses. Every contract
+    // guards a DELETE or a state-file switch, so every test asserts on the
+    // audit trail (`ops`) and the state file, never on stdout prose.
+
+    /// Serialises tests that touch the count-retry env knobs (the flow reads
+    /// them per call; the default 6x5s would sleep in a Unknown-count test).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_fast_count_retries<T>(f: impl FnOnce() -> T) -> T {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("XC_COUNT_TRIES", "1");
+        std::env::set_var("XC_COUNT_PAUSE", "0");
+        let r = f();
+        std::env::remove_var("XC_COUNT_TRIES");
+        std::env::remove_var("XC_COUNT_PAUSE");
+        r
+    }
+
+    /// A fake node: index listing by glob, tri-state counts per dash-glob,
+    /// and an audit trail of every destructive op (delete / catalog scope)
+    /// and every count read — the ordering assertions need the counts too.
+    struct FakeNode {
+        indices: std::cell::RefCell<Vec<String>>,
+        counts: std::cell::RefCell<HashMap<String, Count>>,
+        /// This exact index name's DELETE fails (once — the flow warns and
+        /// continues; a persistently failing node is the crash-between case).
+        fail_delete: std::cell::RefCell<Option<String>>,
+        ops: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl FakeNode {
+        fn new() -> Self {
+            FakeNode {
+                indices: std::cell::RefCell::new(Vec::new()),
+                counts: std::cell::RefCell::new(HashMap::new()),
+                fail_delete: std::cell::RefCell::new(None),
+                ops: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+        fn seed_count(&self, dash_glob: &str, c: Count) {
+            self.counts.borrow_mut().insert(dash_glob.into(), c);
+        }
+        fn live(&self, name: &str) -> bool {
+            self.indices.borrow().iter().any(|i| i == name)
+        }
+    }
+
+    /// `prefix*` / `a*b` glob matching, the only shape the flow globs with.
+    fn glob_match(names: &[String], glob: &str) -> Vec<String> {
+        let parts: Vec<&str> = glob.split('*').collect();
+        names
+            .iter()
+            .filter(|n| {
+                let mut rest = n.as_str();
+                for (i, p) in parts.iter().enumerate() {
+                    if i == 0 {
+                        if !rest.starts_with(p) {
+                            return false;
+                        }
+                        rest = &rest[p.len()..];
+                    } else if i == parts.len() - 1 && !parts.last().is_some_and(|l| l.is_empty()) {
+                        if !rest.ends_with(p) {
+                            return false;
+                        }
+                    } else if let Some(at) = rest.find(p) {
+                        rest = &rest[at + p.len()..];
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect()
+    }
+
+    impl CorpusNode for FakeNode {
+        fn list_indices(&self, glob: &str) -> Result<Vec<String>, String> {
+            Ok(glob_match(&self.indices.borrow(), glob))
+        }
+        fn count(&self, dash_glob: &str) -> Count {
+            self.ops.borrow_mut().push(format!("count:{dash_glob}"));
+            self.counts
+                .borrow()
+                .get(dash_glob)
+                .cloned()
+                .unwrap_or(Count::Zero)
+        }
+        fn delete_index(&self, name: &str) -> bool {
+            self.ops.borrow_mut().push(format!("delete:{name}"));
+            if self.fail_delete.borrow().as_deref() == Some(name) {
+                return false;
+            }
+            self.indices.borrow_mut().retain(|i| i != name);
+            true
+        }
+        fn delete_catalog_scope(&self, scope: &str) -> bool {
+            self.ops.borrow_mut().push(format!("catalog:{scope}"));
+            true
+        }
+    }
+
+    /// The fake autoindex runner: records (prefix, state_dir) per call, and
+    /// "writes" `shards` indices under the prefix it was given — normally on
+    /// rc 0/3, or on ANY rc when `writes_on_fail` models the #367 shape (an
+    /// abort in finalisation after every document was written). A count the
+    /// test pre-seeded is never overwritten: the fake models what the RUN
+    /// observed, and the node may disagree (that disagreement is the point
+    /// of the tri-state tests).
+    struct FakeAuto<'n> {
+        node: &'n FakeNode,
+        rc: i32,
+        shards: usize,
+        writes_on_fail: bool,
+        calls: std::cell::RefCell<Vec<(String, Option<std::path::PathBuf>)>>,
+    }
+
+    impl<'n> FakeAuto<'n> {
+        fn ok(node: &'n FakeNode) -> Self {
+            FakeAuto {
+                node,
+                rc: 0,
+                shards: 1,
+                writes_on_fail: false,
+                calls: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+        fn with_rc(node: &'n FakeNode, rc: i32) -> Self {
+            let mut a = FakeAuto::ok(node);
+            a.rc = rc;
+            a
+        }
+        /// Fails, but after the documents were written (#367).
+        fn failing_but_writing(node: &'n FakeNode) -> Self {
+            let mut a = FakeAuto::ok(node);
+            a.rc = 1;
+            a.writes_on_fail = true;
+            a
+        }
+        fn runner(&self) -> impl Fn(&str, Option<&Path>) -> i32 + '_ {
+            move |prefix, state_dir| {
+                self.calls
+                    .borrow_mut()
+                    .push((prefix.to_string(), state_dir.map(Path::to_path_buf)));
+                if self.rc == 0 || self.rc == 3 || self.writes_on_fail {
+                    self.node
+                        .indices
+                        .borrow_mut()
+                        .extend((0..self.shards).map(|i| format!("{prefix}-{i:03}")));
+                    self.node
+                        .counts
+                        .borrow_mut()
+                        .entry(format!("{prefix}-*"))
+                        .or_insert(Count::Number(500 * self.shards as u64));
+                }
+                self.rc
+            }
+        }
+        fn prefixes(&self) -> Vec<String> {
+            self.calls.borrow().iter().map(|(p, _)| p.clone()).collect()
+        }
+    }
+
+    /// A corpus root with the corpus cloned and (optionally) a recorded
+    /// build, written through the REAL state writer so the schema is pinned
+    /// on both sides of the flow.
+    fn corpus_root(name: &str) -> std::path::PathBuf {
+        let root = tempfile::tempdir().unwrap().keep();
+        std::fs::create_dir_all(root.join("corpora").join(name)).unwrap();
+        root
+    }
+
+    fn record_build(root: &Path, name: &str, build: &str, state_dir: Option<&str>) -> String {
+        let prefix = format!("xc-{name}-{build}");
+        state::write_state(
+            root,
+            name,
+            "http://x",
+            0,
+            false,
+            Some(build),
+            Some(&prefix),
+            state_dir,
+        )
+        .unwrap();
+        prefix
+    }
+
+    fn run_flow(
+        node: &FakeNode,
+        auto: &FakeAuto<'_>,
+        clock: &dyn Fn() -> i64,
+        root: &Path,
+        name: &str,
+        fresh: bool,
+    ) -> i32 {
+        with_fast_count_retries(|| {
+            corpus_index_flow(node, &auto.runner(), clock, root, "http://x", name, fresh)
+        })
+    }
+
+    const T0: i64 = 1_700_000_000;
+
+    #[test]
+    fn a_verified_replacement_switches_state_then_retires_by_exact_name() {
+        let root = corpus_root("kv");
+        let old_prefix = record_build(&root, "kv", "b1", Some("/tmp/s1"));
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push(format!("{old_prefix}-000"));
+        node.seed_count(&format!("{old_prefix}-*"), Count::Number(500));
+
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", true);
+
+        assert_eq!(rc, 0);
+        let new_prefix = format!("xc-kv-b{T0}");
+        // the replacement is what the ledger now names…
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.index_prefix.as_deref(), Some(new_prefix.as_str()));
+        // …the old index is gone, deleted BY EXACT NAME (never a wildcard)…
+        assert!(!node.live(&format!("{old_prefix}-000")));
+        assert!(node.live(&format!("{new_prefix}-000")));
+        assert!(node
+            .ops
+            .borrow()
+            .iter()
+            .filter(|o| o.starts_with("delete:"))
+            .all(|o| !o.contains('*')));
+        // …and the retire ran only AFTER the replacement's count was read.
+        let ops = node.ops.borrow();
+        let first_delete = ops.iter().position(|o| o.starts_with("delete:")).unwrap();
+        let new_count = ops
+            .iter()
+            .position(|o| *o == format!("count:{new_prefix}-*"))
+            .unwrap();
+        assert!(new_count < first_delete, "count before any delete: {ops:?}");
+        // the old build's catalog scope was cleaned too
+        assert!(ops.iter().any(|o| *o == format!("catalog:{old_prefix}")));
+    }
+
+    #[test]
+    fn a_build_that_never_verifies_touches_nothing_old() {
+        let root = corpus_root("kv");
+        let old_prefix = record_build(&root, "kv", "b1", Some("/tmp/s1"));
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push(format!("{old_prefix}-000"));
+        node.seed_count(&format!("{old_prefix}-*"), Count::Number(500));
+        // the new build "succeeds" (rc 0) but the node reports ZERO records
+        node.seed_count(&format!("xc-kv-b{T0}-*"), Count::Zero);
+
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", true);
+
+        assert_eq!(rc, 1, "a zero-count build fails even on exit 0");
+        // old index untouched, old state untouched
+        assert!(node.live(&format!("{old_prefix}-000")));
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.index_prefix.as_deref(), Some(old_prefix.as_str()));
+        assert_eq!(st.autoindex_exit, Some(serde_json::json!(0)));
+        // the new build's shards were removed (its OWN catalog scope cleaned),
+        // and NO delete ever named the old index
+        assert!(!node.live(&format!("xc-kv-b{T0}-000")));
+        assert!(node
+            .ops
+            .borrow()
+            .iter()
+            .all(|o| *o != format!("delete:{old_prefix}-000")));
+    }
+
+    #[test]
+    fn a_count_the_node_does_not_answer_never_retires_a_working_index() {
+        let root = corpus_root("kv");
+        let old_prefix = record_build(&root, "kv", "b1", Some("/tmp/s1"));
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push(format!("{old_prefix}-000"));
+        node.seed_count(&format!("{old_prefix}-*"), Count::Number(500));
+        // every count for the NEW prefix 503s — "did not say", not zero
+        node.seed_count(&format!("xc-kv-b{T0}-*"), Count::Unknown("HTTP 503".into()));
+
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", true);
+
+        assert_eq!(rc, 1);
+        // UNKNOWN authorises no delete and no switch: everything still stands
+        assert!(node.live(&format!("{old_prefix}-000")));
+        assert!(
+            node.live(&format!("xc-kv-b{T0}-000")),
+            "unverified build kept"
+        );
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.index_prefix.as_deref(), Some(old_prefix.as_str()));
+        assert!(node.ops.borrow().iter().all(|o| !o.starts_with("delete:")));
+    }
+
+    #[test]
+    fn an_unknown_old_count_is_presumed_a_working_index_not_an_empty_one() {
+        let root = corpus_root("kv");
+        let old_prefix = record_build(&root, "kv", "b1", Some("/tmp/s1"));
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push(format!("{old_prefix}-000"));
+        // the OLD index's count is unknown too: a failed build must not be
+        // kept over it
+        node.seed_count(
+            &format!("{old_prefix}-*"),
+            Count::Unknown("HTTP 503".into()),
+        );
+        // the new build FAILS (rc 1) but claims records
+        node.seed_count(&format!("xc-kv-b{T0}-*"), Count::Number(500));
+        let auto = FakeAuto::with_rc(&node, 1);
+
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", true);
+
+        assert_eq!(rc, 1);
+        // the failed build was not salvaged over an (unknowably) working index
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.index_prefix.as_deref(), Some(old_prefix.as_str()));
+        assert_ne!(st.salvaged, Some(true));
+        assert!(!node.live(&format!("xc-kv-b{T0}-000")));
+    }
+
+    #[test]
+    fn a_failed_first_build_that_wrote_records_is_kept_and_marked_salvaged() {
+        let root = corpus_root("kv");
+        let node = FakeNode::new();
+        // no state file, no live indices: this is a FIRST build, and the
+        // runner models #367 — abort in finalisation, documents already written
+        let auto = FakeAuto::failing_but_writing(&node);
+
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", true);
+
+        assert_eq!(rc, 0, "a salvaged first build is still queryable");
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.salvaged, Some(true));
+        assert_eq!(st.autoindex_exit, Some(serde_json::json!(1)));
+        assert_eq!(
+            st.index_prefix.as_deref(),
+            Some(format!("xc-kv-b{T0}").as_str())
+        );
+        assert!(node.live(&format!("xc-kv-b{T0}-000")));
+    }
+
+    #[test]
+    fn a_plain_rerun_resumes_the_recorded_build_under_the_same_prefix_and_state_dir() {
+        let root = corpus_root("kv");
+        let state_dir = root.join("autoindex-state/kv/b1");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let old_prefix = record_build(&root, "kv", "b1", state_dir.to_str());
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push(format!("{old_prefix}-000"));
+        node.seed_count(&format!("{old_prefix}-*"), Count::Number(500));
+
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 0);
+        // the re-run reconciled the RECORDED build: same prefix, same state
+        // directory, nothing deleted, nothing retired
+        assert_eq!(auto.prefixes(), vec![old_prefix.clone()]);
+        let (p, sd) = &auto.calls.borrow()[0];
+        assert_eq!(sd.as_deref(), Some(state_dir.as_path()));
+        assert!(p.starts_with("xc-kv-b1"));
+        assert!(node.live(&format!("{old_prefix}-000")));
+        assert!(node.ops.borrow().iter().all(|o| !o.starts_with("delete:")));
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.index_prefix.as_deref(), Some(old_prefix.as_str()));
+        assert_eq!(st.salvaged, Some(false));
+    }
+
+    #[test]
+    fn sibling_corpus_indices_are_never_touched_by_a_rebuild() {
+        let root = corpus_root("battle");
+        // the sibling exists as a cloned corpus AND in the ledger
+        std::fs::create_dir_all(root.join("corpora/battle-terse")).unwrap();
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        std::fs::write(
+            root.join("state/battle-terse.json"),
+            "{\"corpus\":\"battle-terse\"}",
+        )
+        .unwrap();
+        let old_prefix = record_build(&root, "battle", "b9", Some("/tmp/s9"));
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push(format!("{old_prefix}-000"));
+        // `xc-battle-*` matches BOTH; only b9 belongs to "battle"
+        node.indices
+            .borrow_mut()
+            .push("xc-battle-terse-b1-000".into());
+        node.seed_count(&format!("{old_prefix}-*"), Count::Number(500));
+        node.seed_count("xc-battle-terse-b1-*", Count::Number(300));
+
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "battle", true);
+
+        assert_eq!(rc, 0);
+        assert!(
+            node.live("xc-battle-terse-b1-000"),
+            "the sibling's index survives a rebuild of 'battle'"
+        );
+        assert!(!node.live(&format!("{old_prefix}-000")));
+        assert!(node
+            .ops
+            .borrow()
+            .iter()
+            .all(|o| !o.contains("battle-terse")));
+    }
+
+    #[test]
+    fn readers_switch_before_the_retire_runs_a_failed_delete_leaves_a_duplicate_not_a_gap() {
+        let root = corpus_root("kv");
+        let old_prefix = record_build(&root, "kv", "b1", Some("/tmp/s1"));
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push(format!("{old_prefix}-000"));
+        node.seed_count(&format!("{old_prefix}-*"), Count::Number(500));
+        // the node refuses to delete the old index (crash-between shape)
+        *node.fail_delete.borrow_mut() = Some(format!("{old_prefix}-000"));
+
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", true);
+
+        assert_eq!(rc, 0, "a failed retire does not fail the corpus");
+        // the SWITCH already happened: readers are on the new build…
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(
+            st.index_prefix.as_deref(),
+            Some(format!("xc-kv-b{T0}").as_str())
+        );
+        assert!(node.live(&format!("xc-kv-b{T0}-000")));
+        // …and the un-retired old index is a duplicate, never a gap
+        assert!(node.live(&format!("{old_prefix}-000")));
+    }
+
+    #[test]
+    fn two_rebuilds_inside_one_second_must_not_retire_the_build_they_just_verified() {
+        let root = corpus_root("kv");
+        let node = FakeNode::new();
+        // a clock that repeats T0 once, then advances — the collision the
+        // one-second stamp cannot otherwise see
+        let tick = std::cell::Cell::new(0);
+        let clock = move || {
+            let t = T0 + tick.get();
+            tick.set(tick.get() + 1);
+            t
+        };
+
+        let auto1 = FakeAuto::ok(&node);
+        assert_eq!(run_flow(&node, &auto1, &clock, &root, "kv", true), 0);
+        let first = auto1.prefixes()[0].clone();
+        assert_eq!(first, format!("xc-kv-b{T0}"));
+
+        // second --fresh in the SAME second: the build id must differ, so it
+        // can never list-and-retire the build it is standing on
+        let auto2 = FakeAuto::ok(&node);
+        assert_eq!(run_flow(&node, &auto2, &clock, &root, "kv", true), 0);
+        let second = auto2.prefixes()[0].clone();
+        assert_ne!(first, second, "build ids must not repeat within a second");
+        // and the retire lists only the FIRST build, by exact name
+        assert!(node.live(&format!("{second}-000")));
+        assert!(!node.live(&format!("{first}-000")));
+    }
+
+    #[test]
+    fn a_legacy_corpus_whose_indices_predate_builds_indexes_under_the_bare_namespace() {
+        let root = corpus_root("kv");
+        let node = FakeNode::new();
+        // no state file, but a live index from before builds existed: WITHOUT
+        // the stray index this would be a first build (same path as --fresh),
+        // and with it the flow must take the legacy arm — the bare namespace,
+        // no build id, no state dir.
+        node.indices.borrow_mut().push("xc-kv-000".into());
+
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec!["xc-kv".to_string()]);
+        assert!(
+            auto.calls.borrow()[0].1.is_none(),
+            "no state dir in legacy mode"
+        );
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.index_prefix, None, "legacy state records no build");
+        assert!(node.live("xc-kv-000"));
+        assert!(node.ops.borrow().iter().all(|o| !o.starts_with("delete:")));
     }
 }
