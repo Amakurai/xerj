@@ -15,7 +15,7 @@ This recipe proves it by running the standard ES request shapes — verbatim —
 
 - **Same wire, same client.** The official `elasticsearch-py`, `@elastic/elasticsearch`, or a raw `curl` all work because XERJ implements the ES REST API surface. XERJ even reports itself as version `8.13.0` at `GET /`, so version-sniffing clients connect cleanly.
 - **Faster on the same workload.** On an identical corpus and machine, XERJ beats a real Elasticsearch 8.13 on both ingest and reads — e.g. bulk ingest ~1.5–1.7× and `match` queries ~2.5× lower p50 latency (see [Benchmarks](#benchmarks)).
-- **Honest scope.** XERJ is *wire-compatible*, not a byte-for-byte fork. As of the last full run it passes **1,325 / 1,326** executed cases of the 1,329-case ES REST conformance suite (3 skipped, 1 known fail). Response *shapes* match; some internal details (exact BM25 float scores, segment-merge timing) are XERJ's own. See [Limitations](#limitations-be-honest).
+- **Honest scope.** XERJ is *wire-compatible*, not a byte-for-byte fork. The ES REST YAML conformance suite runs on every commit and is gated at zero failures; a full run at main on 2026-09-20 passes **1,371 / 1,374** cases (3 skipped) on a curated 202-file subset whose `catch:` error expectations are unasserted — the pass total grows as cases are added, so gate on failures, not on the count. Response *shapes* match; some internal details (exact BM25 float scores, segment-merge timing) are XERJ's own. The full boundary — what is tested, what is deliberately not implemented, the semantic differences — is on one page: [what we test against](https://xerj.org/docs/migration-from-es#what-we-test-against). See [Limitations](#limitations-be-honest).
 
 ## The working solution
 
@@ -162,9 +162,9 @@ green open products 0ddfa388-df97-4b4b-9c9d-b9782b1b493a 1 0 6 0 10901b 10901b
 Two honest deltas from Elasticsearch here:
 
 - **`?v` does not emit a column-header row.** XERJ returns the data rows only, even with `?v`. The column *order* is ES's, so anything parsing by position keeps working; anything that keys off the header line does not.
-- **No per-index `_cat` path.** XERJ serves the whole-cluster `GET /_cat/indices` (which, like ES's own `.security`/`.kibana` dot-indices, also lists XERJ's internal `.xerj_*` system indices). The per-index form `GET /_cat/indices/products` returns **404** in this build, so filter client-side instead — e.g. `curl -s "$ES/_cat/indices?v" | grep ' products '`.
+- **The per-index `_cat` path works** — `GET /_cat/indices/products` returns just that index's row, and an unknown index name is a `404`. The whole-cluster form lists XERJ's internal `.xerj_*` system indices alongside yours, like ES's own `.security`/`.kibana` dot-indices.
 
-(The `uuid` column is a fresh per-response value in this build — treat it as illustrative, not stable.)
+(The `uuid` column is stable across repeated calls in this build — verified identical over consecutive requests — but treat it as opaque rather than a contract.)
 
 ## Reproduce it yourself
 
@@ -201,7 +201,7 @@ Almost nothing:
 
 ## Limitations (be honest)
 
-- **Wire-compatible, not byte-identical.** XERJ passes **1,325 / 1,326** executed cases of the 1,329-case ES REST conformance suite (3 skipped, 1 known fail), last full run. Response *structure* matches ES; validate the specific endpoints and query types your app depends on against your own data before cutting over. Per-suite conformance and caveats are tracked in `demo/playbooks/ES_COMPATIBILITY.md`.
+- **Wire-compatible, not byte-identical.** The ES REST YAML conformance suite runs on every commit and is gated at zero failures — a full run at main on 2026-09-20 passes **1,371 / 1,374** cases (3 skipped) on a curated 202-file subset whose `catch:` error expectations are unasserted. Response *structure* matches ES; validate the specific endpoints and query types your app depends on against your own data before cutting over. The boundary in one page — tested versions, implemented and refused APIs, semantic differences: [`docs/migration-from-es` — what we test against](https://xerj.org/docs/migration-from-es#what-we-test-against).
 - **Relevance scores are XERJ's own BM25.** Ranking order matches ES intent, but exact `_score` float values differ, and can even shift slightly for the *same* query as background segment merges change collection statistics — the same class of internal difference you'd see comparing two ES minor versions. If you assert on exact scores in tests, relax those assertions.
 - **A few query/agg types differ or aren't implemented.** XERJ covers the common set (`match`, `term`, `terms`, `range`, `bool`, `match_phrase`, `multi_match`, `terms`/`stats`/`date_histogram`/... aggs). Some ES features are partial or unsupported (e.g. vector-suite conformance is low). Check the compatibility report for your specific needs.
 

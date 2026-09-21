@@ -6,7 +6,10 @@ The usual answer is to bolt a separate vector database next to your search stack
 XERJ folds that job into the engine you already run: a namespaced, offline
 **agent-memory API** (`/_memory/{ns}`) that stores text + an embedding + metadata
 and recalls the most relevant memories by **vector similarity** or **plain text**,
-with metadata filtering, forgetting, and hard per-agent isolation.
+with metadata filtering, forgetting, and query-level namespace isolation — a
+recall in one namespace never reads another's index. What that does and does not
+guarantee *between callers* is a trust boundary, stated in
+[Isolation](#isolation-what-a-namespace-does-and-does-not-guarantee) below.
 
 This recipe builds a tiny simulated coding-assistant agent (no LLM required) that:
 
@@ -15,8 +18,8 @@ This recipe builds a tiny simulated coding-assistant agent (no LLM required) tha
    lexically (BM25),
 3. does a **metadata-filtered** recall ("only surface team *preferences*"),
 4. **forgets** a memory that is no longer true, and
-5. proves **multi-namespace isolation**: a second agent can never see the first
-   agent's memories.
+5. proves **query-level namespace isolation**: a recall issued in namespace `B`
+   never reads namespace `A`'s backing index.
 
 Everything below was run end-to-end against a live XERJ. No pip installs — the
 example is Python 3 stdlib only.
@@ -33,10 +36,36 @@ paths that serve the rest of the engine. That means:
   vector index consistent with your source of truth.
 - **kNN *and* BM25 in the same store.** Recall by embedding similarity, by keyword,
   or filter both by metadata — no glue code.
-- **Namespaces are physical isolation.** Each agent (or tenant, or user) gets its
-  own backing index; a recall in namespace `A` literally cannot read namespace `B`.
+- **Namespaces are separate physical indices.** Each agent (or tenant, or user)
+  gets its own backing index; a recall in namespace `A` literally cannot read
+  namespace `B`'s index. That is query-level isolation — it becomes privacy
+  between *callers* only with auth on and per-agent scoped keys; see
+  [Isolation](#isolation-what-a-namespace-does-and-does-not-guarantee).
 - **Offline and zero-config.** You supply the vectors (from your own model); XERJ
   never phones out to embed.
+
+## Isolation: what a namespace does and does not guarantee
+
+A namespace is a reserved index — `.xerj-memory-{ns}` — and the isolation lives
+there, at the query level. Two different promises are easy to confuse here:
+
+- **Always true, by construction:** a recall in namespace `A` touches only the
+  `.xerj-memory-A` index. There is no query you can write in one namespace that
+  reads another's data.
+- **Not automatic:** nothing stops *another caller* from naming namespace `A`
+  themselves. On the `--insecure` node this recipe boots, every caller is a
+  superuser — anyone who can reach the port can list, recall and delete every
+  namespace. The same is true for any client holding the admin key, and for a
+  scoped key granted `names: ["*"]`, which deliberately reaches the reserved
+  namespace.
+
+Privacy between callers exists only on an auth-enabled node where each agent
+holds its own scoped API key (`POST /_security/api_key`, role names limited to
+`.xerj-memory-{ns}`): a namespace is exactly as private as the scoped key that
+can reach it. The enforcement details are in
+[`docs/SECURITY_MODEL.md`](../SECURITY_MODEL.md) (§ "The reserved
+`.xerj-memory-*` namespace"), and the operator-facing walkthrough is
+[private agent-memory namespaces](https://xerj.org/answers/private-agent-memory-namespaces).
 
 ---
 
@@ -277,7 +306,8 @@ if __name__ == "__main__":
 
 ## Reproduce it yourself
 
-Start XERJ (single node, no TLS/auth) on its default port and run the script.
+Start XERJ (single node, `--insecure` — no TLS, no auth, every caller a superuser, so
+this demo is for a dev machine) on its default port and run the script.
 Nothing to install — the client is Python 3 **stdlib only**.
 
 ```bash
@@ -391,9 +421,12 @@ Read the run top to bottom:
   the default relevance order. Verified: two same-vector memories tie on relevance;
   with `recency_weight: 1.0` the newer one is returned first. Useful when an agent's
   latest observation should win ties.
-- **Isolation is structural, not a filter.** Namespaces are separate physical
-  indices, so there is no query you can write in one namespace that reads another.
-  Use one namespace per agent/tenant/user.
+- **Isolation is structural at the query level, not a filter — and not a
+  caller boundary by itself.** Namespaces are separate physical indices, so
+  there is no query you can write in one namespace that reads another. Use one
+  namespace per agent/tenant/user, and if those callers must not read each
+  other, give each its own scoped API key on an auth-enabled node — see
+  [Isolation](#isolation-what-a-namespace-does-and-does-not-guarantee).
 - **`GET /_memory/{ns}`** lists up to 100 most-recent entries for debugging/audit;
   it is bounded and recent-first, not a full export.
 - **Wire-compatible.** Because a namespace is a real index, you can inspect or
