@@ -118,6 +118,19 @@
   .cmp-tag.x { color: var(--z-accent); }
   .cmp-tag.j { color: var(--z-cmp); }
 
+  /* Desktop chip line (2026-09-21 fix round): the FIQA verdict chip
+     ("JEV WINS · BIGGEST LIFT WE MEASURED") does not fit its ~337px value
+     cell beside bar + number + delta + arm label — the cell clipped
+     internally (scrollWidth > clientWidth, chip 96px past the cell edge)
+     and the blue bar crushed to its 2px minimum, which reads as a cut-off
+     loss marker. That one cell wraps its chip onto a second line; the bar
+     recovers its measured width. Wrap is NOT applied banner-wide on
+     desktop because wide bars (width:100% cells) would force every number
+     onto a second line — only the cells that carry a long chip need it.
+     The <=720px blocks below already wrap every cell, so this class is a
+     no-op there. */
+  .jev-banner .cmp-val.chip-line { flex-wrap: wrap; row-gap: 2px; }
+
   /* Fold recovery (2026-09-21 fix round): at 1440x900 the banner's title sat
      18px below the fold, 91px at 1280x800 — only the kicker broke it. The
      reclaim is vertical air ONLY (hero top padding, the H1 clamp at laptop
@@ -158,6 +171,26 @@
     .jev-banner .cmp-val { flex-wrap: wrap; row-gap: 2px; }
     .jev-banner .cmp-tag { flex-basis: 100%; order: 9; margin-left: 0; white-space: normal; line-height: 1.5; }
     .jev-banner .cmp-num, .jev-banner .cmp-val i { flex-shrink: 1; min-width: 0; white-space: normal; }
+  }
+
+  /* Phone layout (≤560px), 2026-09-21 fix round: at 390px the shared
+     3-column grid starves each value column to 62px — the FiQA loss chip
+     wrapped into a six-line sliver and its cell clipped internally
+     (scrollWidth > clientWidth), which reads as a cut-off loss marker.
+     Stack instead: dataset label on its own line, then each arm at full
+     column width (~326px at 390px) so bar, number, arm label and chip sit
+     on one readable line. The head row collapses to its two series names;
+     its empty first cell is hidden. Scoped to .jev-banner on this page —
+     the shared sheet and other pages are untouched. */
+  @media (max-width: 560px) {
+    .jev-banner .cmp-bars-head { grid-template-columns: 1fr; gap: 2px; }
+    .jev-banner .cmp-bars-head span:first-child { display: none; }
+    .jev-banner .cmp-bars-row { grid-template-columns: 1fr; gap: var(--sp-1) 0; padding: var(--sp-3) 0; }
+    .jev-banner .cmp-label { white-space: normal; }
+    .jev-banner .cmp-val { overflow: visible; }
+    .jev-banner .cmp-tag { flex-basis: auto; order: 0; }
+  }
+  @media (max-width: 720px) {
     .hero-center .hero-install { padding-left: var(--sp-4); }
     .hero-center .hero-install-cmd,
     .hero-center .hero-install-alt { flex-direction: column; align-items: stretch; gap: var(--sp-2); }
@@ -325,7 +358,7 @@
           <span class="cmp-bar" style="width:32.1%;"></span>
           <span class="cmp-num">0.2382</span> <i>BM25 — hybrid not run</i>
         </span>
-        <span class="cmp-val cmp-b">
+        <span class="cmp-val cmp-b chip-line">
           <span class="cmp-bar" style="width:49.1%;"></span>
           <span class="cmp-num">0.3638 <span class="cmp-ratio">+0.126</span></span> <i>BM25+Jev</i>
           <span class="cmp-tag j">JEV WINS · BIGGEST LIFT WE MEASURED</span>
