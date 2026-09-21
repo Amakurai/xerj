@@ -1,6 +1,6 @@
 # xerj Default Configuration
 # ============================================================
-# This file sets 55 of XERJ's 126 user-facing settings to their
+# This file sets 55 of XERJ's 127 user-facing settings to their
 # production-ready defaults, and describes the rest in comments.
 # Every value here IS the default, so copying this file changes
 # nothing until you edit it (a test enforces that). The complete
@@ -409,6 +409,14 @@ batch_size = 64
 # If the embedding service does not respond within this window, the ingest
 # request fails with a timeout error.
 timeout_ms = 5000
+
+# Neural backend (`--embed-mode neural`): how many scheduling windows of one
+# _bulk request may run through the embedder concurrently. Default 1 keeps the
+# historical strictly-serial window loop. Raise it on a many-core box to let a
+# single _bulk stream keep several BERT forward passes in flight on the shared
+# model instead of one; outputs are unchanged (each window stays its own batch).
+# Range: 1 – 64.
+# neural_window_concurrency = 1
 
 # ── Resource Limits (6 of 14 settings) ────────────────────────────────────────
 

@@ -14855,6 +14855,15 @@ impl Index {
             // windows together, drain both, then consume results in input
             // order. This bounds native work and keeps retry/publication
             // behavior deterministic when one sibling fails.
+            //
+            // Every other backend runs the same windows through a
+            // bounded-concurrency scheduler: the default bound of 1 is the
+            // historical one-window-at-a-time loop, and
+            // `embedding.neural_window_concurrency` raises it so a single
+            // `_bulk` stream can keep several neural forward passes in flight
+            // on the shared model instead of one (#938). Each window is still
+            // embedded as its own batch and reassembled by position, so the
+            // vectors computed per passage are identical to the serial loop.
             let mut window_results = Vec::with_capacity(windows.len());
             if dual_session_scheduler_enabled(
                 onnx_pinned,
@@ -14872,14 +14881,21 @@ impl Index {
                         .map(|(window, result)| (window.0, window.1, window.2, result)),
                 );
             } else {
-                for &(start, end, passages) in &windows {
-                    window_results.push((
-                        start,
-                        end,
-                        passages,
-                        embedder.embed_batch(window_texts(start, end)).await,
-                    ));
-                }
+                let results = collect_ordinal_buffered(
+                    windows.len(),
+                    self.embedding_config.neural_window_concurrency,
+                    |ordinal| {
+                        let (start, end, _passages) = windows[ordinal];
+                        embedder.embed_batch(window_texts(start, end))
+                    },
+                )
+                .await;
+                window_results.extend(
+                    windows
+                        .iter()
+                        .zip(results)
+                        .map(|(window, result)| (window.0, window.1, window.2, result)),
+                );
             }
 
             for (start, end, passages, batch_result) in window_results {
@@ -48172,10 +48188,75 @@ fn dual_session_scheduler_enabled(onnx_pinned: bool, pool_size: usize) -> bool {
     onnx_pinned && pool_size == 2
 }
 
+/// Run at most `bound` futures concurrently and return every result in input
+/// order (#938). With `bound = 1` this is the historical strictly-serial loop;
+/// higher bounds let one `_bulk` request keep several embedding scheduling
+/// windows in flight at once. Like `collect_ordinal_buffered_two`, a future
+/// that resolves with an error (as a value) neither cancels nor reorders its
+/// neighbours — every launched ordinal yields exactly one result, and the
+/// caller keeps per-window failure semantics. Only completed results at the
+/// front of the window are retired, so no ordinal is launched before an
+/// in-flight slot is free and nothing is materialized beyond `bound` windows.
+async fn collect_ordinal_buffered<T, F, Fut>(count: usize, bound: usize, launch: F) -> Vec<T>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    let bound = bound.max(1);
+    let mut next_ordinal = 0usize;
+    // Futures are boxed so the window can shrink and grow without moving a
+    // pinned future; `done` mirrors it slot-for-slot so a finished future is
+    // never polled twice.
+    let mut in_flight: VecDeque<Pin<Box<Fut>>> = VecDeque::new();
+    let mut done: VecDeque<Option<T>> = VecDeque::new();
+    let mut results = Vec::with_capacity(count);
+    while results.len() < count {
+        while in_flight.len() < bound && next_ordinal < count {
+            in_flight.push_back(Box::pin(launch(next_ordinal)));
+            done.push_back(None);
+            next_ordinal += 1;
+        }
+        // Poll the whole window each wakeup; wake when the FRONT is finished,
+        // because results are retired strictly in ordinal order.
+        std::future::poll_fn(|cx| {
+            let mut front_done = false;
+            for (slot, fut) in in_flight.iter_mut().enumerate() {
+                if done[slot].is_some() {
+                    front_done |= slot == 0;
+                    continue;
+                }
+                if let Poll::Ready(value) = fut.as_mut().poll(cx) {
+                    done[slot] = Some(value);
+                    front_done |= slot == 0;
+                }
+            }
+            if front_done {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        // Retire every already-finished future at the front of the window,
+        // freeing slots (this is the only place the bound is enforced).
+        while let Some(value) = done.front_mut().and_then(Option::take) {
+            done.pop_front();
+            in_flight.pop_front();
+            results.push(value);
+        }
+    }
+    results
+}
+
 #[cfg(test)]
 mod semantic_embedding_window_tests {
     use super::{
-        collect_ordinal_buffered_two, dual_session_scheduler_enabled, semantic_embedding_window_end,
+        collect_ordinal_buffered, collect_ordinal_buffered_two, dual_session_scheduler_enabled,
+        semantic_embedding_window_end,
     };
 
     fn windows(counts: &[usize], limit: usize) -> Vec<(std::ops::Range<usize>, usize)> {
@@ -48233,6 +48314,169 @@ mod semantic_embedding_window_tests {
         .await;
         assert_eq!(completed.load(Ordering::SeqCst), 3);
         assert_eq!(results, vec![Err("first failed"), Ok(1), Ok(2)]);
+    }
+
+    /// #938: the bounded scheduler must actually fill its window. Ordinal 0
+    /// yields until `bound` futures have entered, so it can only complete if
+    /// the scheduler truly launched `bound` windows before retiring any — a
+    /// scheduler that ignored the bound and ran serially would spin here
+    /// forever and trip the bounded loop's assertion.
+    #[tokio::test]
+    async fn bounded_scheduler_runs_a_full_window_concurrently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let bound = 4;
+        let count = 10;
+        let entered = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let results = collect_ordinal_buffered(count, bound, |ordinal| {
+            let entered = Arc::clone(&entered);
+            let in_flight = Arc::clone(&in_flight);
+            let max_in_flight = Arc::clone(&max_in_flight);
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(now, Ordering::SeqCst);
+                if ordinal < bound {
+                    // Hold the front of the window open until the whole first
+                    // window is in flight (the gate is one-shot: only the
+                    // first `bound` ordinals wait).
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    for _ in 0..10_000 {
+                        if entered.load(Ordering::SeqCst) >= bound {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    assert!(
+                        entered.load(Ordering::SeqCst) >= bound,
+                        "ordinal {ordinal} released without {bound} windows in flight"
+                    );
+                }
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                ordinal * 2
+            }
+        })
+        .await;
+
+        assert_eq!(results, (0..count).map(|i| i * 2).collect::<Vec<_>>());
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            bound,
+            "the scheduler must reach exactly its bound and never exceed it"
+        );
+    }
+
+    /// #938: reversed completion drains in ordinal order and a window that
+    /// fails as a value neither cancels nor displaces its neighbours — the
+    /// same per-window failure contract the pair scheduler has.
+    #[tokio::test]
+    async fn bounded_scheduler_drains_reversed_completion_in_ordinal_order() {
+        use std::sync::Arc;
+        let front_park = Arc::new(tokio::sync::Notify::new());
+        let results = collect_ordinal_buffered(5, 3, |ordinal| {
+            let front_park = Arc::clone(&front_park);
+            async move {
+                if ordinal == 0 {
+                    // The front window finishes LAST: ordinal 2 must pass it
+                    // through before it can retire.
+                    front_park.notified().await;
+                    Err("first failed")
+                } else {
+                    if ordinal == 2 {
+                        front_park.notify_one();
+                    }
+                    Ok(ordinal)
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            results,
+            vec![Err("first failed"), Ok(1), Ok(2), Ok(3), Ok(4)]
+        );
+    }
+
+    /// #938 golden-vector guard: raising the bound must not change WHAT is
+    /// computed, only how many windows compute at once. Each window is
+    /// embedded as its own batch with its own texts in every configuration,
+    /// and results are reassembled by position.
+    #[tokio::test]
+    async fn bounded_scheduler_output_is_independent_of_the_bound() {
+        use std::sync::{Arc, Mutex};
+
+        // ~120-passage jobs cut into windows of 64 passages, like a `_bulk`
+        // request of 3-4 passage documents through the default window.
+        let counts = [30, 34, 60, 4, 64, 10, 1, 7];
+        let windowed = windows(&counts, 64);
+        assert!(windowed.len() >= 3, "exercise multiple windows");
+
+        for bound in [1usize, 2, 8] {
+            // The launch closure must be `Fn`: share the window table by
+            // reference instead of letting each iteration capture it by move.
+            let windowed = &windowed;
+            let batches: Arc<Mutex<Vec<(usize, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+            let batches_for_launch = Arc::clone(&batches);
+            let results = collect_ordinal_buffered(windowed.len(), bound, |ordinal| {
+                let batches = Arc::clone(&batches_for_launch);
+                async move {
+                    let range = windowed[ordinal].0.clone();
+                    let texts: Vec<String> = range
+                        .map(|job| format!("passages:{}:{}", counts[job], job))
+                        .collect();
+                    let vectors: Vec<Vec<f32>> = texts
+                        .iter()
+                        .map(|t| vec![t.len() as f32, ordinal as f32])
+                        .collect();
+                    // Completion order varies with the bound; the ordinal
+                    // restores the launch order for the comparison below.
+                    batches.lock().unwrap().push((ordinal, texts));
+                    vectors
+                }
+            })
+            .await;
+            let mut batches = batches.lock().unwrap().clone();
+            batches.sort_by_key(|(ordinal, _)| *ordinal);
+
+            // Same window batches, in the same order, at every bound.
+            let expected_texts: Vec<Vec<String>> = windowed
+                .iter()
+                .map(|(range, _)| {
+                    range
+                        .clone()
+                        .map(|job| format!("passages:{}:{}", counts[job], job))
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                batches
+                    .into_iter()
+                    .map(|(_, texts)| texts)
+                    .collect::<Vec<_>>(),
+                expected_texts,
+                "bound={bound} changed the batches"
+            );
+            // Same vectors at the same positions at every bound.
+            let expected_vectors: Vec<Vec<Vec<f32>>> = windowed
+                .iter()
+                .enumerate()
+                .map(|(ordinal, (range, _))| {
+                    range
+                        .clone()
+                        .map(|job| {
+                            let text = format!("passages:{}:{}", counts[job], job);
+                            vec![text.len() as f32, ordinal as f32]
+                        })
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                results, expected_vectors,
+                "bound={bound} changed the vectors"
+            );
+        }
     }
 }
 
