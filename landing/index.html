@@ -118,6 +118,17 @@
     </div>
   </div>
 
+  <!-- Benchmark strip — every figure is a measured run, sourced verbatim
+       from /benchmarks/decisions (the Jev rerank-stage autopsy + full run). -->
+  <p class="hero-bench">
+    <span class="hb-tag">Measured on TypeSafe AI's Jev judge · our rerank stage</span>
+    <span class="hb-chip">as it shipped <b class="hb-bad">0.3822</b> <span class="hb-arrow">→</span> after our fix <b>0.8299</b> nDCG@10 ·
+      the 0.38 was our own pre-fix stage, same 40 judged SciFact queries</span>
+    <span class="hb-chip">full run <b>1,271</b> judged queries, three public BEIR datasets ·
+      FiQA <b>0.3638</b> nDCG@10, +0.126 over our BM25</span>
+    <a class="hb-link" href="/benchmarks/decisions">Read the measurement →</a>
+  </p>
+
   <p class="hero-sub">One paste — your agent installs XERJ, indexes your project and
     the open-source repos worth learning from, and looks implementations up
     instead of re-deriving them.</p>
