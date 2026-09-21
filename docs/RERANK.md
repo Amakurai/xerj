@@ -449,6 +449,14 @@ the lines.
 
 ## Cost and concurrency facts
 
+> Every measurable fact in this section — the 30-doc batch arithmetic
+> (`window: 35` → two calls, `window: 300` → ten), the no-verdict-cache
+> behaviour, the 8/16 in-flight ceilings, the degrade-on-deadline response and
+> the no-key 503 — is reproduced end-to-end, against a local test double, by
+> [`scripts/bench/rerank-stage.sh`](../scripts/bench/rerank-stage.sh) (9
+> contract assertions; last run's output is in
+> [`scripts/bench/README.md`](../scripts/bench/README.md)).
+
 - **30 documents per provider call.** The `hev/jev-rerank` README reports a
   ~32k-token request budget, "~30–50 typical passages per call", and uses 30;
   XERJ uses the same figure and has not measured the provider's limit itself. A
