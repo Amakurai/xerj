@@ -1,6 +1,6 @@
 # xerj Default Configuration
 # ============================================================
-# This file sets 55 of XERJ's 120 user-facing settings to their
+# This file sets 55 of XERJ's 126 user-facing settings to their
 # production-ready defaults, and describes the rest in comments.
 # Every value here IS the default, so copying this file changes
 # nothing until you edit it (a test enforces that). The complete
@@ -602,3 +602,22 @@ access_log = false
 # enabled  = true
 # api_key  = "ts-..."                                  # not a default ("")
 # endpoint = "https://api.typesafe.ai/v1/systemone"    # not a default ("")
+
+# ─────────────────────────────────────────────────────────────────────────
+# Decisions — typed answers from your own labelled history, no model call.
+#
+# Index the examples you already have (one document per example: the text and
+# its label), and POST /v1/systemone answers System One-shaped questions with
+# a weighted nearest-neighbour vote over that index — same interface as a
+# judge model, nothing leaves the node. POST /_decide is the same vote with
+# the evidence in the response: neighbours, labels, weights, and an abstain
+# below min_confidence. Empty `index` (the default) leaves both answering 503.
+# See docs/RERANK.md and benchmarks/decisions-as-retrieval.
+#
+# [decisions]
+# index          = "judgements"   # not a default ("") — an index of labelled examples
+# k              = 10             # neighbours that vote
+# label_field    = "label"
+# text_field     = "text"
+# positive_label = "true"         # the label a noul's probability is the share of
+# min_confidence = 0.0            # /_decide abstains below this

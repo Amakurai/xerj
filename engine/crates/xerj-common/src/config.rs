@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **120 settings** versus
+//! Configuration is intentionally minimal: **126 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -97,9 +97,13 @@ pub struct Config {
     pub wal_tap: WalTapConfig,
     /// Second-stage reranking provider — 3 settings. Inert until a key is set.
     pub rerank: RerankProviderConfig,
+    /// Typed decisions answered from a labelled-history index by
+    /// nearest-neighbour vote — 6 settings. Inert until `decisions.index`
+    /// names an index that exists.
+    pub decisions: DecisionsConfig,
 }
 
-// 22 sub-configs, 120 leaf settings in total. Do not maintain that sum by hand
+// 23 sub-configs, 126 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -463,7 +467,7 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (120 user-facing settings total; counted by
+// Sub-configs  (126 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -2288,6 +2292,45 @@ impl RerankProviderConfig {
     }
 }
 
+/// Typed decisions (`/v1/systemone`, `/_decide`) answered locally by a
+/// weighted nearest-neighbour vote over a labelled-history index — the
+/// retrieval analogue of a judge model, with the evidence staying on the node.
+///
+/// **6 settings.**
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DecisionsConfig {
+    /// Index holding the judgement history: one document per labelled
+    /// example. Empty (the default) disables both endpoints with a 503 that
+    /// names this setting.
+    pub index: String,
+    /// How many nearest examples vote. The published Banking77 / SMS-spam
+    /// measurements used k = 10.
+    pub k: usize,
+    /// Document field holding each example's label.
+    pub label_field: String,
+    /// Document field holding each example's text.
+    pub text_field: String,
+    /// The label that means "true" for a `noul`. For a `choice` the labels
+    /// come from the question's own `criteria` keys.
+    pub positive_label: String,
+    /// `/_decide` abstains below this vote share (0 = never abstain; the
+    /// `/v1/systemone` wire has no abstain field and errors instead).
+    pub min_confidence: f64,
+}
+
+impl Default for DecisionsConfig {
+    fn default() -> Self {
+        Self {
+            index: String::new(),
+            k: 10,
+            label_field: "label".to_string(),
+            text_field: "text".to_string(),
+            positive_label: "true".to_string(),
+            min_confidence: 0.0,
+        }
+    }
+}
 // ═════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═════════════════════════════════════════════════════════════════════════════
@@ -3030,6 +3073,7 @@ mod tests {
         ("lifecycle", 1),
         ("wal_tap", 10),
         ("rerank", 3),
+        ("decisions", 6),
     ];
 
     /// Count the settings by *counting them*.
@@ -3072,7 +3116,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 120,
+            total, 126,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \

@@ -3,14 +3,15 @@
 //!
 //! ```text
 //! POST /v1/systemone
-//! request  { state, model, questions: { id: { type:"noul", instructions, criteria } } }
+//! request  { state: <query string>, model, questions: { id: { type:"noul", instructions: { question, document } } } }
 //! response { model, answers: { id: { type:"noul", noul: 0..1 } }, usage }
 //! ```
 //!
 //! THE STUB IS A TEST DOUBLE, NOT A JUDGE. It scores by a table the test hands
 //! it (or by word overlap), so ordering is checkable. Nothing here says
-//! anything about ranking quality with the real model — that has not been
-//! verified by this project; no provider key was available.
+//! anything about ranking quality with the real model — that is measured in
+//! docs/research/typesafe-skill-2026-09 (NOTES.md, pilot of 2026-09-20), not
+//! by these tests.
 //!
 //! # Why there is no `set_var` in this file
 //!
@@ -199,7 +200,7 @@ async fn systemone(
         _ => {}
     }
 
-    let query = words(parsed["state"]["query"].as_str().unwrap_or_default());
+    let query = words(parsed["state"].as_str().unwrap_or_default());
     let verdicts = stub.verdicts.lock().unwrap().clone();
     let mut answers = serde_json::Map::new();
     if matches!(fault, Fault::WrongKeys) {
@@ -212,13 +213,18 @@ async fn systemone(
         }))
         .into_response();
     }
-    if let Some(docs) = parsed["state"]["documents"].as_object() {
-        for (i, (key, doc)) in docs.iter().enumerate() {
+    if let Some(qs) = parsed["questions"].as_object() {
+        for (i, (key, q)) in qs.iter().enumerate() {
             if matches!(fault, Fault::Partial) && i % 2 == 1 {
                 continue;
             }
-            let title = doc["title"].as_str().unwrap_or_default();
-            let text = doc["text"].as_str().unwrap_or_default();
+            // The candidate rides inside its own question's instructions,
+            // joined "title. text" — the wire shape `build_jev_request` sends.
+            let doc = q["instructions"]["document"].as_str().unwrap_or_default();
+            let (title, text) = match doc.split_once(". ") {
+                Some((t, x)) => (t, x),
+                None => (doc, ""),
+            };
             let p = match &verdicts {
                 Verdicts::Overlap => {
                     let have = words(&format!("{title} {text}"));
@@ -795,7 +801,7 @@ async fn a_bool_query_works_once_the_question_is_spelled_out() {
     assert_eq!(r["_rerank"]["applied"], true);
     assert_eq!(r["_rerank"]["query"], "bone density trial");
     assert_eq!(
-        stub.calls()[0].body["state"]["query"],
+        stub.calls()[0].body["state"],
         "bone density trial",
         "the judge is asked the caller's question, not a guess at the bool tree"
     );
@@ -994,25 +1000,41 @@ async fn wire_shape_bearer_auth_model_and_one_noul_per_document_keyed_identicall
     let call = &calls[0];
     assert_eq!(call.authorization.as_deref(), Some("Bearer test-key"));
     assert_eq!(call.body["model"], "jev-2026-09");
-    assert_eq!(call.body["state"]["query"], Q);
+    // `state` is the question itself, a plain string — not an object. The
+    // candidate a question is about rides inside that question's
+    // `instructions`, pointed at by name; nothing is shared.
+    assert_eq!(call.body["state"], Q);
+    assert!(
+        call.body["state"].is_string(),
+        "the wire format the API documents: state is a string"
+    );
 
-    let documents = call.body["state"]["documents"].as_object().unwrap();
     let questions = call.body["questions"].as_object().unwrap();
-    assert_eq!(documents.len(), 4);
-    let mut dk: Vec<&String> = documents.keys().collect();
-    let mut qk: Vec<&String> = questions.keys().collect();
-    dk.sort();
-    qk.sort();
-    assert_eq!(dk, qk, "one question per document, keyed identically");
+    assert_eq!(questions.len(), 4);
+    assert_eq!(
+        questions.keys().cloned().collect::<Vec<_>>(),
+        ["d0", "d1", "d2", "d3"],
+        "keyed by the caller's ordinals"
+    );
     for (key, question) in questions {
         assert_eq!(question["type"], "noul", "{key}");
-        assert!(question["instructions"].is_string(), "{key}");
-        assert!(question["criteria"]["true"].is_string(), "{key}");
-        assert!(question["criteria"]["false"].is_string(), "{key}");
-    }
-    for (key, doc) in documents {
-        assert!(doc["text"].is_string(), "{key}");
-        assert!(doc["title"].is_string(), "{key}");
+        let instructions = question["instructions"].as_object().unwrap();
+        assert_eq!(
+            instructions.len(),
+            2,
+            "{key}: the question and its data, nothing else"
+        );
+        let text = instructions["question"].as_str().unwrap();
+        assert!(
+            text.contains("`document`"),
+            "{key}: the question must name the field it judges: {text}"
+        );
+        assert!(
+            instructions["document"]
+                .as_str()
+                .is_some_and(|d| !d.is_empty()),
+            "{key}: the candidate itself travels with its question"
+        );
     }
     // The key is a bearer token and nothing else: never in the body.
     assert!(!call.body.to_string().contains("test-key"));
@@ -1031,7 +1053,15 @@ async fn custom_instructions_reach_every_question() {
         .await;
     assert_eq!(st, StatusCode::OK);
     for (_, q) in stub.calls()[0].body["questions"].as_object().unwrap() {
-        assert_eq!(q["instructions"], "Is this a clinical result?");
+        let text = q["instructions"]["question"].as_str().unwrap();
+        assert!(
+            text.starts_with("Is this a clinical result?"),
+            "the caller's instructions lead: {text}"
+        );
+        assert!(
+            text.contains("`document`"),
+            "and the question still names what it judges: {text}"
+        );
     }
 }
 
@@ -1068,9 +1098,9 @@ async fn a_window_larger_than_thirty_is_split_and_ordinals_survive() {
     assert_eq!(calls.len(), 2, "35 documents = 30 + 5");
     let mut keys: Vec<String> = Vec::new();
     for c in &calls {
-        let docs = c.body["state"]["documents"].as_object().unwrap();
-        assert!(docs.len() <= 30, "the provider ceiling is 30 per call");
-        keys.extend(docs.keys().cloned());
+        let qs = c.body["questions"].as_object().unwrap();
+        assert!(qs.len() <= 30, "the provider ceiling is 30 per call");
+        keys.extend(qs.keys().cloned());
     }
     keys.sort();
     keys.dedup();
@@ -1340,10 +1370,14 @@ async fn a_named_field_the_response_does_not_return_is_never_judged_blind() {
         assert_eq!(st, StatusCode::OK, "{r}");
         assert_eq!(r["_rerank"]["applied"], true, "{r}");
         for c in stub.calls() {
-            for (key, doc) in c.body["state"]["documents"].as_object().unwrap() {
+            for (key, q) in c.body["questions"].as_object().unwrap() {
                 assert!(
-                    !doc["text"].as_str().unwrap_or_default().trim().is_empty(),
-                    "document {key} was judged on blank text: {doc}"
+                    !q["instructions"]["document"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .trim()
+                        .is_empty(),
+                    "document {key} was judged on blank text: {q}"
                 );
             }
         }
@@ -1415,24 +1449,25 @@ async fn rerank_fields_is_exhaustive_about_what_is_sent() {
         "vitamin rich vegetables for dinner",
         "bone china has high density",
     ];
+    let titles = [
+        "Bone health basics",
+        "Trial results",
+        "Cooking",
+        "Density of materials",
+    ];
     let calls = stub.calls();
-    let documents = calls[0].body["state"]["documents"].as_object().unwrap();
-    assert_eq!(documents.len(), 4);
-    for (key, doc) in documents {
-        let keys: Vec<&String> = doc.as_object().unwrap().keys().collect();
-        assert_eq!(
-            keys,
-            ["text"],
-            "{key}: `rerank.fields` named only `body`, so not even the title may be sent"
-        );
-        let text = doc["text"].as_str().unwrap();
+    let questions = calls[0].body["questions"].as_object().unwrap();
+    assert_eq!(questions.len(), 4);
+    for (key, q) in questions {
+        let doc = q["instructions"]["document"].as_str().unwrap();
         assert!(
-            bodies.contains(&text),
-            "{key}: the text is exactly the body — no `cat`, no `n`, nothing appended: {text:?}"
+            bodies.contains(&doc),
+            "{key}: `rerank.fields` named only `body`, so the judged text is exactly the \
+             body — no `cat`, no `n`, not even the title: {doc:?}"
         );
     }
 
-    // Naming the title brings it back, in its own slot.
+    // Naming the title puts it back, in front of the body it belongs to.
     let (_, _) = node
         .search(
             "/kb/_search",
@@ -1440,11 +1475,16 @@ async fn rerank_fields_is_exhaustive_about_what_is_sent() {
         )
         .await;
     let last = stub.calls().last().unwrap().body.clone();
-    for (key, doc) in last["state"]["documents"].as_object().unwrap() {
-        assert!(doc["title"].is_string(), "{key}: {doc}");
+    for (key, q) in last["questions"].as_object().unwrap() {
+        let doc = q["instructions"]["document"].as_str().unwrap();
+        let joined: Vec<String> = titles
+            .iter()
+            .zip(bodies.iter())
+            .map(|(t, b)| format!("{t}. {b}"))
+            .collect();
         assert!(
-            bodies.contains(&doc["text"].as_str().unwrap()),
-            "{key}: {doc}"
+            joined.contains(&doc.to_string()),
+            "{key}: title and body, joined as one document: {doc:?}"
         );
     }
 }
@@ -1469,10 +1509,7 @@ async fn hits_with_no_prose_are_skipped_not_sent_blank() {
     assert_eq!(r["_rerank"]["judged"], 4);
     assert_eq!(r["_rerank"]["skipped_no_text"], 1);
     assert_eq!(
-        stub.calls()[0].body["state"]["documents"]
-            .as_object()
-            .unwrap()
-            .len(),
+        stub.calls()[0].body["questions"].as_object().unwrap().len(),
         4
     );
     // Unjudged is not a verdict of irrelevant: it sorts after the judged hits.
@@ -2147,16 +2184,16 @@ async fn the_matching_passage_is_judgeable_and_goes_first() {
     assert_eq!(r["_rerank"]["applied"], true, "{r}");
     assert!(r["_rerank"].get("fields_without_text").is_none(), "{r}");
     let sent = stub.calls().last().unwrap().body.clone();
-    for (key, doc) in sent["state"]["documents"].as_object().unwrap() {
+    for (key, q) in sent["questions"].as_object().unwrap() {
+        let doc = q["instructions"]["document"].as_str().unwrap();
+        assert!(!doc.trim().is_empty(), "{key}: {q}");
         assert!(
-            doc.get("title").is_none(),
-            "{key}: the title was not named: {doc}"
+            bodies.iter().any(|b| b.contains(doc.trim())),
+            "{key}: a passage is a slice of the body it came from: {doc:?}"
         );
-        let text = doc["text"].as_str().unwrap();
-        assert!(!text.trim().is_empty(), "{key}: {doc}");
         assert!(
-            bodies.iter().any(|b| b.contains(text.trim())),
-            "{key}: a passage is a slice of the body it came from: {text:?}"
+            !doc.contains(". ") || bodies.iter().any(|b| b.starts_with(doc.trim())),
+            "{key}: the title was not returned, so it was not prefixed: {doc:?}"
         );
     }
 
@@ -2174,12 +2211,26 @@ async fn the_matching_passage_is_judgeable_and_goes_first() {
         .await;
     assert_eq!(st, StatusCode::OK, "{r}");
     let sent = stub.calls().last().unwrap().body.clone();
-    for (key, doc) in sent["state"]["documents"].as_object().unwrap() {
-        let text = doc["text"].as_str().unwrap();
-        let first_line = text.lines().next().unwrap_or_default();
+    for (key, q) in sent["questions"].as_object().unwrap() {
+        let text = q["instructions"]["document"].as_str().unwrap();
+        // The document is one string now: `<title>. <passage>` then the other
+        // returned `_source` strings — so a clip at `max_doc_chars` cuts the
+        // tail and never the part that matched.
+        let (title, rest) = text.split_once(". ").unwrap_or(("", text));
+        assert!(
+            [
+                "Bone health basics",
+                "Trial results",
+                "Cooking",
+                "Density of materials"
+            ]
+            .contains(&title),
+            "{key}: the returned title joins its document: {text:?}"
+        );
+        let first_line = rest.lines().next().unwrap_or_default();
         assert!(
             bodies.iter().any(|b| b.contains(first_line.trim())) && !first_line.trim().is_empty(),
-            "{key}: the passage comes first: {text:?}"
+            "{key}: the passage comes first after it: {text:?}"
         );
         assert!(
             ["health", "trial", "food", "materials"].contains(&text.lines().last().unwrap()),
@@ -2926,8 +2977,8 @@ async fn text_returned_only_through_fields_is_judged_without_naming_it() {
         .await;
     assert_eq!(st, StatusCode::OK, "{r}");
     for call in stub3.calls() {
-        for (_, doc) in call.body["state"]["documents"].as_object().unwrap() {
-            let text = doc["text"].as_str().unwrap_or_default();
+        for (_, q) in call.body["questions"].as_object().unwrap() {
+            let text = q["instructions"]["document"].as_str().unwrap_or_default();
             assert!(
                 text.matches("vitamin rich vegetables").count() <= 1
                     && text.matches("bone china").count() <= 1,

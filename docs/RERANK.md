@@ -28,14 +28,18 @@ but has no absolute meaning: a `_score` of 7.2 is not comparable across queries
 and cannot be used as a cut-off. A calibrated probability can, so
 `rerank.min_score` is a threshold that means the same thing on every query.
 
-> **Not verified: ranking quality with the real model.** No provider key was
-> available to this project, so XERJ has **not** measured how well the Jev model
-> ranks. Every test of this stage runs against a test double that scores by a
-> table the test supplies. What is verified is the mechanism — the wire format,
-> the reorder, paging, pruning, the failure policy, and what is and is not sent.
-> The quality figures published by the provider's ecosystem are quoted in
-> [Quality numbers](#quality-numbers-and-what-we-did-not-measure) with that
-> caveat attached.
+> **Measured with the real model (2026-09-20, pilot).** Over the first 40
+> judged SciFact test queries, BM25 shortlists (default lexical embedder, no
+> vectors), model pinned `jev-1.13.0`: this stage scored **0.8299 nDCG@10
+> against BM25's 0.7750**. Until this change the stage put every candidate in
+> shared `state` and asked an untargeted "does this document answer the query"
+> per key — the model read that as one question about the pile and answered
+> near-uniformly, which scored **0.3822**; each candidate now rides inside its
+> own question's `instructions`, the shape the provider's own docs prescribe.
+> The test suite still runs against test doubles, and verifies the mechanism:
+> the wire format, the reorder, paging, pruning, the failure policy, and what
+> is and is not sent. All numbers and method:
+> [Quality numbers](#quality-numbers-and-what-we-did-not-measure).
 
 The stage is in `engine/crates/xerj-api/src/rerank_stage.rs`; the provider
 client, the request parser and the failure policy are the leaf crate
@@ -488,11 +492,12 @@ the same fields. `true` or `{}` means defaults.
 
 ## Quality numbers, and what we did not measure
 
-XERJ has not run the Jev model. The figures below for Jev, Voyage and Cohere are
-**published in the [`hev/jev-rerank`](https://github.com/hev/jev-rerank) README,
-were not run by this project, and rerank that project's own first-stage
+XERJ has run the Jev model through this stage — once, as a pilot (2026-09-20;
+rows below). The figures for Jev, Voyage and Cohere in the first table are
+still **published in the [`hev/jev-rerank`](https://github.com/hev/jev-rerank)
+README, were not run by this project, and rerank that project's own first-stage
 shortlist, which is not XERJ's.** Same datasets, same metric, not a controlled
-comparison.
+comparison — the second table is.
 
 nDCG@10 on the BEIR `test` split:
 
@@ -505,6 +510,23 @@ nDCG@10 on the BEIR `test` split:
 | XERJ MiniLM vectors only | 0.6764 | 0.3291 | us, `--embed-mode neural` |
 | XERJ BM25 top-30, reordered by MiniLM | 0.6855 | 0.3323 | us, `--embed-mode neural` |
 | XERJ hybrid RRF | 0.6993 | 0.3448 | us, `--embed-mode neural` |
+
+Pilot run by this project (2026-09-20): first 40 judged SciFact test queries,
+BM25 top-30 shortlists from the default lexical embedder (no vectors), model
+pinned `jev-1.13.0`, scoring byte-identical to `benchmarks/beir-hybrid`:
+
+| | SciFact (40 queries) | Run by |
+|---|---:|---|
+| XERJ BM25 shortlist | 0.7750 | us, controlled |
+| XERJ BM25 → this stage, `jev-1.13.0` | **0.8299** | us, controlled |
+| the same, request shape as shipped before this change | 0.3822 | us, controlled |
+| raw provider API, fixed shape, same shortlists | 0.8389 | us, controlled |
+
+Paired vs BM25: 9 wins / 6 losses / 25 ties; 1,200/1,200 documents judged, no
+degrades; stage latency p50 399 ms. The provider is not deterministic
+(re-asking the same window moves probabilities by up to ±0.05), which is why
+the stage and raw-API rows need not agree to the digit. Per-query logs and the
+runner: `benchmarks/beir-hybrid/results/2026-09-20-rerank-pilot/`.
 
 **Our rows were measured with `--embed-mode neural` and the
 `all-MiniLM-L6-v2` model, not with the default embedder.** XERJ's default
@@ -526,7 +548,7 @@ Two things those runs do say:
 ## Credits
 
 - The one-`noul`-per-document request shape:
-  [`hev/jev-rerank`](https://github.com/hev/jev-rerank), Apache-2.0.
+  [`hev/jev-rerank`](https://github.com/hev/jev-rerank), MIT.
 - The degrade-on-deadline, surface-on-contract failure policy, and the retry
   back-off shape (exponential in the attempt, a flat extra pause after a 429):
   Meilisearch's personalization module (MIT, not part of its Enterprise
