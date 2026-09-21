@@ -1247,6 +1247,10 @@ mod tests {
 
     #[test]
     fn url_resolution_prefers_flag_then_env_then_default() {
+        // under ENV_LOCK: set/remove of process env is global, so any test
+        // mutating env serialises with the others (one unreproduced lib-suite
+        // failure was observed on the merged #977 branch before this lock).
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(resolve_url(Some("http://a:1")), "http://a:1");
         // env-dependent branches covered by the e2e; default pinned here.
         std::env::remove_var("XERJ_URL");
