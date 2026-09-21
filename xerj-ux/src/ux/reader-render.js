@@ -432,7 +432,7 @@ export function renderGraphPanel(g = {}) {
       return h('div', { class: 'rd-empty' },
         g.guest
           ? 'This share does not include the knowledge graph.'
-          : ['The graph API refused this console session (', mono(str(g.error) || 'HTTP 401'), '). On an auth-enabled engine the graph needs an engine API key; records and search still work.']);
+          : ['The graph API refused this console session (', mono(str(g.error) || 'HTTP 401'), '). Brain reads need a session whose role may read brains; records and search still work.']);
     case 'error':
       return h('div', { class: 'rd-empty' }, 'Graph unavailable: ', mono(str(g.error) || 'unknown error'));
     case 'ok': {

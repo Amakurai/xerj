@@ -2,23 +2,25 @@
 // Xerj Console — "does at least one brain exist?" probe
 //
 // The Second Brain dashboard only earns a nav entry once the engine
-// actually holds a brain — a console pointed at an engine nobody ever
-// ran `xerj brain <folder>` against should not advertise an empty
-// dashboard. This module answers exactly that yes/no question.
+// actually holds a brain — a console pointed at an engine nobody ever ran
+// `xerj brain <folder>` against should not advertise an empty dashboard.
+// This module answers exactly that yes/no question.
 //
-// It wraps the same discovery pattern second-brain-api.js uses
-// (`_cat/indices/.xerj-memory-*` — PREFIX wildcard only: this
-// engine's index-pattern matcher silently returns empty for an infix
-// wildcard like `.xerj-memory-*-edges`, live-verified 2026-07-30, so
-// the `-edges` cut happens client-side).
+// It asks the console's own brains listing
+// (`/_xerj-console/api/v1/graph/brains`), authenticated by the console
+// session. The old direct `_cat/indices/.xerj-memory-*` call 401s a session
+// on an auth-enabled engine (the default), which kept the nav entry hidden
+// for a signed-in operator exactly when the dashboard finally had a
+// session-authorized way to read the graph (issue #936).
 //
-// Honesty stance: `false` on ANY transport failure. An unreachable
-// engine means we cannot claim a brain exists, so the nav entry stays
-// hidden — the deep-link route still resolves (app.js never filters
-// the route table, only the nav list), so nothing is lost.
+// Honesty stance: `false` on ANY transport failure. An unreachable engine
+// — or a role that may not read brains (403) — means we cannot claim a
+// brain exists, so the nav entry stays hidden; the deep-link route still
+// resolves (app.js never filters the route table, only the nav list), so
+// nothing is lost.
 //
 // Results are cached per baseUrl with a short TTL, so:
-//   - the boot probe + periodic re-probes don't hammer `_cat`,
+//   - the boot probe + periodic re-probes don't hammer the listing,
 //   - switching backend/base-URL naturally misses the cache and
 //     re-probes the new target without an explicit invalidation hook.
 // ============================================================
@@ -35,11 +37,12 @@ export function invalidateBrainsProbe() {
 }
 
 /**
- * True iff the engine at `baseUrl` holds at least one brain
- * (a reserved `.xerj-memory-{brain}-edges` index).
+ * True iff this engine holds at least one brain (a reserved
+ * `.xerj-memory-{brain}-edges` index) that the console session may read.
  *
- * Never throws; returns false on transport failure, non-OK status,
- * or an empty/absent baseUrl.
+ * Never throws; returns false on transport failure, non-OK status, or an
+ * empty/absent baseUrl. The graph listing is same-origin (the console
+ * serves the SPA), so `baseUrl` only keys the cache.
  */
 export async function sbBrainsPresent(baseUrl, signal) {
   const base = (baseUrl || '').replace(/\/+$/, '');
@@ -50,18 +53,16 @@ export async function sbBrainsPresent(baseUrl, signal) {
 
   let present = false;
   try {
-    const r = await fetch(`${base}/_cat/indices/.xerj-memory-*`, {
+    const r = await fetch('/_xerj-console/api/v1/graph/brains', {
       signal,
-      headers: { accept: 'text/plain, application/json' },
+      credentials: 'same-origin',
+      headers: { accept: 'application/json' },
     });
-    // A wildcard matching nothing is 200 with an EMPTY body on this
-    // engine (live-verified; only a concrete name 404s), which parses
-    // to zero brains below. Any non-OK status (404 from an older build
-    // without the pattern route, 5xx, auth) is treated as "cannot
-    // prove a brain exists", so we do not claim one.
+    // 403 = this console role may not read brains; 401 = no session. Both
+    // are "cannot prove a brain exists", so we do not claim one.
     if (r.ok) {
-      const text = await r.text();
-      present = parseBrainIndices(text).length > 0;
+      const j = await r.json();
+      present = ((j && j.data && j.data.brains) || []).length > 0;
     }
   } catch {
     present = false; // engine down / CORS / abort — no claim
@@ -69,26 +70,4 @@ export async function sbBrainsPresent(baseUrl, signal) {
 
   cache.set(base, { at: Date.now(), value: present });
   return present;
-}
-
-/**
- * Parse a `_cat/indices` body into the list of brain names. `_cat` on
- * this engine emits plain text lines (`health status NAME uuid …`);
- * tolerate a JSON array in case a later build adds format=json.
- * Exported for the node self-test.
- */
-export function parseBrainIndices(text) {
-  const trimmed = (text || '').trim();
-  let names = [];
-  if (trimmed.startsWith('[')) {
-    try { names = JSON.parse(trimmed).map((i) => i.index).filter(Boolean); } catch { names = []; }
-  } else if (trimmed) {
-    names = trimmed.split('\n')
-      .map((l) => l.trim().split(/\s+/)[2])
-      .filter(Boolean);
-  }
-  return names
-    .filter((n) => n.startsWith('.xerj-memory-') && n.endsWith('-edges'))
-    .map((n) => n.slice('.xerj-memory-'.length, -'-edges'.length))
-    .filter((b) => b.length > 0);
 }

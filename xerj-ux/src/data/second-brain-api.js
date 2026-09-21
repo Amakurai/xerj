@@ -1,11 +1,25 @@
 // ============================================================
 // Xerj Console — SECOND BRAIN data layer + interaction controller
 //
-// This dashboard reads the LIVE graph endpoints ONLY:
+// This dashboard reads the LIVE graph through the console's own
+// session-authorized endpoints (issue #936) — same-origin, session
+// cookie, no engine key. The old direct data-plane calls
+// (`/_cat/indices/.xerj-memory-*`, `/_graph/{brain}/ego|overview`,
+// `/{edges}/_search`, `/{nodes}/_search`) 401 a console session on an
+// auth-enabled engine, which is the default posture:
 //
-//   GET /_cat/indices/.xerj-memory-*-edges   → discover brains
-//   GET /_graph/{brain}/overview             → §4.4 of the contract
-//   GET /_graph/{brain}/ego                  → §4.3 of the contract
+//   GET  /_xerj-console/api/v1/graph/brains           → discover brains
+//   GET  /_xerj-console/api/v1/graph/{brain}/overview → §4.4 of the contract
+//   GET  /_xerj-console/api/v1/graph/{brain}/ego      → §4.3 of the contract
+//   POST /_xerj-console/api/v1/graph/{brain}/edges/_search → recent
+//        retirements, file-type crossings (the brain's links index)
+//   POST /_xerj-console/api/v1/graph/{brain}/nodes/_search → note
+//        tallies, name hydration, FIND (ONE of the brain's own indices)
+//
+// The one remaining direct call is `/v1/metrics` (the searches-per-index
+// tile): the metrics surface stays a data-plane, engine-key read by
+// decision, and the tile shows the refusal honestly rather than an
+// invented number.
 //
 // There is deliberately NO mock fallback: a fake brain would defeat
 // the product ("what does my agent believe?" answered with invented
@@ -209,12 +223,12 @@ function saveBrainState() {
 // ----- HTTP ---------------------------------------------------------
 
 async function getJson(url, signal) {
-  const r = await fetch(url, { signal, headers: { accept: 'application/json' } });
+  const r = await fetch(url, { signal, credentials: 'same-origin', headers: { accept: 'application/json' } });
   const text = await r.text();
   let body = null;
   try { body = text ? JSON.parse(text) : null; } catch { /* non-JSON error page */ }
   if (!r.ok) {
-    // The graph API 404s an unknown brain WITH a shaped body
+    // The graph read path 404s an unknown brain WITH a shaped body
     // (`exists: false`) — that is a valid answer, not an error.
     if (body && body.exists === false) return body;
     const reason = body && body.error && body.error.reason
@@ -225,43 +239,79 @@ async function getJson(url, signal) {
   return body;
 }
 
+/** The console's graph read path — same-origin, session-authenticated
+ *  (see xerj-console-api/src/graph.rs). The `baseUrl` the backend passes
+ *  is deliberately unused as a request target: these endpoints are served
+ *  by the same Console instance that served the SPA, exactly like the
+ *  panel-search proxy (data/backends/xerj.js#rawSearch). */
+const GRAPH = '/_xerj-console/api/v1/graph';
+
+const enc = encodeURIComponent;
+
 /**
- * Brains = the reserved `.xerj-memory-{brain}-edges` indices. `_cat`
- * on this engine emits plain text (no format=json), so parse lines;
- * tolerate a JSON array in case a later build adds it. A wildcard
- * matching nothing is an empty 200 — an engine with no brains is a
- * normal state, not an error.
+ * Brains = what the console's brains listing returns (the reserved
+ * `.xerj-memory-{brain}-edges` indices this session's role may read,
+ * each with its meta-doc `nodes_index`). An empty listing is a normal
+ * state (no brains), not an error; a transport failure is.
  *
- * The fetch pattern is `.xerj-memory-*` (prefix only): live-verified
- * 2026-07-30 that this engine's index-pattern matcher supports a
- * single leading or trailing `*` but NOT an infix wildcard —
- * `.xerj-memory-*-edges` returns an empty 200 even when the index
- * exists. The `-edges` cut happens in the client filter below either
- * way, so the result set is identical.
+ * A 401/403 listing is a REFUSAL, not "no brains": no session / a role
+ * that may not read brains means the page cannot know whether brains
+ * exist, and must say the read was refused — never teach `xerj brain`
+ * over a refusal, and never let the status pill claim LIVE for a read
+ * that did not run (liveSecondBrain's catch shapes this into the
+ * refused envelope; ux/ego-ledger.js#EmptyBrainNote renders it).
  */
-async function discoverBrains(baseUrl, signal) {
-  const r = await fetch(`${baseUrl}/_cat/indices/.xerj-memory-*`, { signal });
-  if (r.status === 404) return [];
-  if (!r.ok) throw new Error(`_cat/indices HTTP ${r.status}`);
-  const text = await r.text();
-  let names = [];
-  const trimmed = text.trim();
-  if (trimmed.startsWith('[')) {
-    try { names = JSON.parse(trimmed).map((i) => i.index).filter(Boolean); } catch { names = []; }
-  } else if (trimmed) {
-    // cat line: `health status NAME uuid pri rep docs deleted size size`
-    names = trimmed.split('\n')
-      .map((l) => l.trim().split(/\s+/)[2])
-      .filter(Boolean);
-  }
-  return names
-    .filter((n) => n.startsWith('.xerj-memory-') && n.endsWith('-edges'))
-    .map((n) => n.slice('.xerj-memory-'.length, -'-edges'.length))
-    .filter((b) => b.length > 0)
+async function discoverBrains(_baseUrl, signal) {
+  const r = await fetch(`${GRAPH}/brains`, { signal, credentials: 'same-origin', headers: { accept: 'application/json' } });
+  if (r.status === 401 || r.status === 403) throw new Error(`graph/brains HTTP ${r.status}`);
+  if (r.status === 404) return []; // a console without the graph routes proves no brain either way
+  if (!r.ok) throw new Error(`graph/brains HTTP ${r.status}`);
+  const j = await r.json();
+  return (((j && j.data && j.data.brains) || [])
+    .map((b) => (b && typeof b.name === 'string' ? b.name : null)))
+    .filter(Boolean)
     .sort();
 }
 
-const enc = encodeURIComponent;
+/** The concrete nodes indices this brain reads — the meta doc's
+ *  `nodes_index`, comma-joined when `xerj brain` indexed a multi-dataset
+ *  folder ("ax-mail,ax-pdfs"). */
+function nodesNames() {
+  const o = S.overview;
+  if (!o || o.exists === false || !o.nodes_index) return [];
+  return String(o.nodes_index).split(',').map((x) => x.trim()).filter(Boolean);
+}
+
+/** One ES `_search` against ONE of the brain's own nodes indices, through
+ *  the console's brain-scoped endpoint (the index set is pinned server-side
+ *  to the meta doc's names — this can never name a foreign index). */
+async function nodesSearch(index, body, signal) {
+  const names = nodesNames();
+  const qs = names.length > 1 ? `?index=${enc(index)}` : '';
+  const r = await fetch(`${GRAPH}/${enc(S.brain)}/nodes/_search${qs}`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!r.ok) throw new Error(`nodes search HTTP ${r.status}`);
+  return r.json();
+}
+
+/** One ES `_search` against this brain's links index (edges), through the
+ *  console's brain-scoped endpoint. */
+async function edgesSearch(body, signal) {
+  const r = await fetch(`${GRAPH}/${enc(S.brain)}/edges/_search`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!r.ok) throw new Error(`links search HTTP ${r.status}`);
+  return r.json();
+}
 
 /**
  * Hub lists and focus crumbs come back from the overview as raw node
@@ -271,9 +321,10 @@ const enc = encodeURIComponent;
  * resolve keeps rendering as its (shortened) id, never as a guess.
  */
 async function hydrateNames(signal) {
-  const o = S.overview;
-  if (!o || o.exists === false || !o.nodes_index) return;
+  const names = nodesNames();
+  if (!names.length) return;
   const ids = new Set();
+  const o = S.overview;
   for (const h of (o.hubs && o.hubs.in) || []) ids.add(h.id);
   for (const h of (o.hubs && o.hubs.out) || []) ids.add(h.id);
   for (const t of S.trail) ids.add(t);
@@ -283,31 +334,29 @@ async function hydrateNames(signal) {
   if (!want.length) return;
   try {
     logRead('notes index', `${want.length} note name${want.length === 1 ? '' : 's'}`, 'turning ids into titles');
-    const r = await fetch(`${S.baseUrl}/${enc(o.nodes_index)}/_search`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        query: { ids: { values: want } },
-        size: want.length,
-        // ax_path/path: the real file behind a note — a truthful label
-        // for the focus card and the map, never derived from the id.
-        _source: ['title', 'text', 'body', 'ax_path', 'path'],
-      }),
-      signal,
-    });
-    if (!r.ok) return; // cosmetic enrichment only — ids still render
-    const j = await r.json();
-    for (const h of (j.hits && j.hits.hits) || []) {
-      const src = h._source || {};
-      const title = typeof src.title === 'string' && src.title.trim()
-        ? src.title.trim()
-        : (typeof src.text === 'string' && src.text.trim()
-          ? src.text.trim().slice(0, 60)
-          : (typeof src.body === 'string' && src.body.trim() ? src.body.trim().slice(0, 60) : null));
-      const path = (typeof src.ax_path === 'string' && src.ax_path.trim())
-        ? src.ax_path.trim()
-        : (typeof src.path === 'string' && src.path.trim() ? src.path.trim() : null);
-      if (title || path) S.names[h._id] = { title, path };
+    const body = {
+      query: { ids: { values: want } },
+      size: want.length,
+      // ax_path/path: the real file behind a note — a truthful label
+      // for the focus card and the map, never derived from the id.
+      _source: ['title', 'text', 'body', 'ax_path', 'path'],
+    };
+    for (const name of names) {
+      // A failed hydration is cosmetic — ids still render — so per-index
+      // failures fall through to the shared catch below.
+      const j = await nodesSearch(name, body, signal);
+      for (const h of (j.hits && j.hits.hits) || []) {
+        const src = h._source || {};
+        const title = typeof src.title === 'string' && src.title.trim()
+          ? src.title.trim()
+          : (typeof src.text === 'string' && src.text.trim()
+            ? src.text.trim().slice(0, 60)
+            : (typeof src.body === 'string' && src.body.trim() ? src.body.trim().slice(0, 60) : null));
+        const path = (typeof src.ax_path === 'string' && src.ax_path.trim())
+          ? src.ax_path.trim()
+          : (typeof src.path === 'string' && src.path.trim() ? src.path.trim() : null);
+        if (title || path) S.names[h._id] = { title, path };
+      }
     }
   } catch { /* names are sugar; the ids remain the truth */ }
 }
@@ -316,7 +365,7 @@ function fetchOverview(signal) {
   const qs = new URLSearchParams({ top: '10', histogram_interval: 'day' });
   if (S.asOf != null) qs.set('as_of', String(S.asOf));
   logRead('link counts', 'one overview read', 'the tiles on this page');
-  return getJson(`${S.baseUrl}/_graph/${enc(S.brain)}/overview?${qs}`, signal);
+  return getJson(`${GRAPH}/${enc(S.brain)}/overview?${qs}`, signal);
 }
 
 /** The focus note's display name for the read log — hydrated title if
@@ -341,19 +390,12 @@ async function fetchRecentRetired(signal) {
   if (!inval) { S.recentRetired = []; return; }
   try {
     logRead('links index', 'three newest retirements', 'the retired tile');
-    const r = await fetch(`${S.baseUrl}/${enc(`.xerj-memory-${S.brain}-edges`)}/_search`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        query: { exists: { field: 'invalid_at' } },
-        sort: [{ invalid_at: { order: 'desc' } }],
-        size: 3,
-        _source: ['src', 'dst', 'type', 'detector', 'evidence', 'valid_at', 'invalid_at'],
-      }),
-      signal,
-    });
-    if (!r.ok) { S.recentRetired = null; return; }
-    const j = await r.json();
+    const j = await edgesSearch({
+      query: { exists: { field: 'invalid_at' } },
+      sort: [{ invalid_at: { order: 'desc' } }],
+      size: 3,
+      _source: ['src', 'dst', 'type', 'detector', 'evidence', 'valid_at', 'invalid_at'],
+    }, signal);
     S.recentRetired = (((j.hits && j.hits.hits) || []))
       .map((h) => ({ edge_id: h._id, ...(h._source || {}) }));
   } catch { S.recentRetired = null; }
@@ -373,7 +415,7 @@ function fetchBelief(signal) {
   });
   if (S.asOf != null) qs.set('as_of', String(S.asOf));
   logRead('the ledger', `one 2-hop walk from “${focusLabel()}”`, 'you focused this note');
-  return getJson(`${S.baseUrl}/_graph/${enc(S.brain)}/ego?${qs}`, signal);
+  return getJson(`${GRAPH}/${enc(S.brain)}/ego?${qs}`, signal);
 }
 
 /**
@@ -388,7 +430,7 @@ function fetchTimeline(signal) {
     include_expired: 'true', include_evidence: 'false',
   });
   logRead('belief strip', `one 1-hop walk from “${focusLabel()}”`, 'drawing every link’s lifetime');
-  return getJson(`${S.baseUrl}/_graph/${enc(S.brain)}/ego?${qs}`, signal);
+  return getJson(`${GRAPH}/${enc(S.brain)}/ego?${qs}`, signal);
 }
 
 // ----- statistics-row fetches (all best-effort, never throw) --------
@@ -400,35 +442,44 @@ function fetchTimeline(signal) {
  * only when this tally failed (see NotesPanel's rationale).
  */
 async function fetchNodeStats(signal) {
-  const o = S.overview;
-  if (!o || o.exists === false || !o.nodes_index) { S.nodeStats = null; return; }
+  const names = nodesNames();
+  if (!names.length) { S.nodeStats = null; return; }
   try {
     logRead('notes index', 'one tally by file type', 'the notes tile');
-    const r = await fetch(`${S.baseUrl}/${enc(o.nodes_index)}/_search`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        size: 0,
-        // Exact, not the engine's 10,000 'gte' floor: the tile's
-        // headline is the note count, and this brain's own per-type
-        // rows summed to 2.1M under a "10,000 NOTES" headline before
-        // this flag (live-caught on `repo`, 2026-07-30).
-        track_total_hits: true,
-        aggs: { formats: { terms: { field: 'ax_format', size: 12 } } },
-      }),
-      signal,
-    });
-    if (!r.ok) { S.nodeStats = { error: `HTTP ${r.status}` }; return; }
-    const j = await r.json();
-    const t = j.hits && j.hits.total;
-    let total = t == null ? null : (typeof t === 'object' ? t.value : t);
-    // A 'gte' floor is not a count — refuse it rather than print it.
-    if (t && typeof t === 'object' && t.relation === 'gte') total = null;
-    const agg = (j.aggregations && j.aggregations.formats) || {};
+    const body = {
+      size: 0,
+      // Exact, not the engine's 10,000 'gte' floor: the tile's
+      // headline is the note count, and this brain's own per-type
+      // rows summed to 2.1M under a "10,000 NOTES" headline before
+      // this flag (live-caught on `repo`, 2026-07-30).
+      track_total_hits: true,
+      aggs: { formats: { terms: { field: 'ax_format', size: 12 } } },
+    };
+    // A multi-dataset brain reads each of its nodes indices and merges
+    // client-side (the console endpoint is pinned to ONE index per call).
+    let total = 0;
+    let exact = true;
+    const byFormat = new Map();
+    let otherFormats = 0;
+    for (const name of names) {
+      const j = await nodesSearch(name, body, signal);
+      const t = j.hits && j.hits.total;
+      let v = t == null ? null : (typeof t === 'object' ? t.value : t);
+      // A 'gte' floor is not a count — refuse it rather than print it.
+      if (t && typeof t === 'object' && t.relation === 'gte') v = null;
+      if (Number.isFinite(v)) total += v; else exact = false;
+      const agg = (j.aggregations && j.aggregations.formats) || {};
+      for (const b of agg.buckets || []) {
+        byFormat.set(b.key, (byFormat.get(b.key) || 0) + b.doc_count);
+      }
+      otherFormats += agg.sum_other_doc_count || 0;
+    }
     S.nodeStats = {
-      total: Number.isFinite(total) ? total : null,
-      formats: (agg.buckets || []).map((b) => ({ format: b.key, count: b.doc_count })),
-      otherFormats: agg.sum_other_doc_count || 0,
+      total: exact ? total : null,
+      formats: [...byFormat.entries()]
+        .map(([format, count]) => ({ format, count }))
+        .sort((a, b) => b.count - a.count || (a.format < b.format ? -1 : a.format > b.format ? 1 : 0)),
+      otherFormats,
     };
   } catch (e) {
     if (e && e.name === 'AbortError') return;
@@ -446,27 +497,20 @@ async function fetchCrossings(signal) {
   if (!S.brain) { S.crossings = null; return; }
   try {
     logRead('links index', 'one file-type crossing tally', 'the crossings tile');
-    const r = await fetch(`${S.baseUrl}/${enc(`.xerj-memory-${S.brain}-edges`)}/_search`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        size: 0,
-        // Exact, not the engine's 10,000 'gte' floor — the tile prints
-        // this as "N stamped links tallied" and a floor there is a
-        // false number (live-caught at 20,930 links, 2026-07-30).
-        track_total_hits: true,
-        query: { exists: { field: 'src_format' } },
-        aggs: {
-          src: {
-            terms: { field: 'src_format', size: 20 },
-            aggs: { dst: { terms: { field: 'dst_format', size: 20 } } },
-          },
+    const j = await edgesSearch({
+      size: 0,
+      // Exact, not the engine's 10,000 'gte' floor — the tile prints
+      // this as "N stamped links tallied" and a floor there is a
+      // false number (live-caught at 20,930 links, 2026-07-30).
+      track_total_hits: true,
+      query: { exists: { field: 'src_format' } },
+      aggs: {
+        src: {
+          terms: { field: 'src_format', size: 20 },
+          aggs: { dst: { terms: { field: 'dst_format', size: 20 } } },
         },
-      }),
-      signal,
-    });
-    if (!r.ok) { S.crossings = { error: `HTTP ${r.status}` }; return; }
-    const j = await r.json();
+      },
+    }, signal);
     const t = j.hits && j.hits.total;
     const total = (t == null ? 0 : (typeof t === 'object' ? t.value : t)) || 0;
     const srcAgg = (j.aggregations && j.aggregations.src) || {};
@@ -593,7 +637,7 @@ export async function liveSecondBrain(baseUrl, _ctx, signal) {
   S.baseUrl = (baseUrl || '').replace(/\/+$/, '');
   S.uiError = null;
   try {
-    logRead('brain list', 'one index listing', 'finding your brains');
+    logRead('brain list', 'one brains listing', 'finding your brains');
     S.brains = await discoverBrains(S.baseUrl, signal);
     S.connected = true;
     S.error = null;
@@ -1300,40 +1344,41 @@ async function runFind(q) {
   const slot = document.querySelector('[data-sb-findresults]');
   if (!slot) return;
   if (!q) { slot.hidden = true; slot.innerHTML = ''; return; }
-  const o = S.overview;
-  if (!o || o.exists === false || !o.nodes_index) return;
+  const names = nodesNames();
+  if (!names.length) return;
   const seq = ++findSeq;
   try {
     logRead('notes index', `one text search “${q.slice(0, 24)}${q.length > 24 ? '…' : ''}”`, 'you typed in FIND');
-    const r = await fetch(`${S.baseUrl}/${enc(o.nodes_index)}/_search`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        query: {
-          bool: {
-            should: [
-              { match: { title: q } },
-              { match: { text: q } },
-              { match: { body: q } },
-            ],
-          },
+    const body = {
+      query: {
+        bool: {
+          should: [
+            { match: { title: q } },
+            { match: { text: q } },
+            { match: { body: q } },
+          ],
         },
-        size: 7,
-        _source: ['title'],
-      }),
-    });
-    if (seq !== findSeq) return; // a newer keystroke owns the slot
-    if (!r.ok) {
-      slot.innerHTML = `<span class="sb-sidenote mono faint">FIND FAILED · HTTP ${r.status}</span>`;
-      slot.hidden = false;
-      return;
+      },
+      size: 7,
+      _source: ['title'],
+    };
+    // A multi-dataset brain queries each of its nodes indices and merges
+    // by score (the same order a multi-index ES search would return).
+    const found = [];
+    for (const name of names) {
+      const j = await nodesSearch(name, body, undefined);
+      if (seq !== findSeq) return; // a newer keystroke owns the slot
+      for (const h of (j.hits && j.hits.hits) || []) {
+        found.push({
+          id: h._id,
+          score: typeof h._score === 'number' ? h._score : 0,
+          title: (h._source && typeof h._source.title === 'string' && h._source.title.trim())
+            ? h._source.title.trim() : null,
+        });
+      }
     }
-    const j = await r.json();
-    const hits = ((j.hits && j.hits.hits) || []).map((h) => ({
-      id: h._id,
-      title: (h._source && typeof h._source.title === 'string' && h._source.title.trim())
-        ? h._source.title.trim() : null,
-    }));
+    found.sort((a, b) => b.score - a.score);
+    const hits = found.slice(0, 7).map(({ id, title }) => ({ id, title }));
     slot.innerHTML = FindResults({ hits, names: S.names });
     slot.hidden = false;
   } catch (e) {

@@ -329,6 +329,193 @@ an inference, not profiled. Server VmHWM after the passes: ~13.5 GB in both
 configurations, for a 760 MB index. The seconds are upper bounds (shared
 box); the ~1000× split is not a load effect. Engine-side, appended to #948.
 
+## The engine fix for #948 — base vs fixed, measured on this box
+
+Everything above documents the problem, on the mbox-branch binaries. This
+section is the engine-side fix, measured as a strict pair: **base** =
+`origin/main` at `9c64a7c6`, **fixed** = that commit plus this branch's engine
+changes, both built `cargo build --profile ci-test -p xerj-server`, both run
+through the same harness with the same flags, sequentially, on this box
+(2026-09-21, 1-min load 0.2–3.2 during the runs below). Result files:
+[`results/fix-*.json`](./results/) and [`results/fix-atrest-bisect.txt`](./results/).
+
+What changed in the engine (details in the commit):
+
+1. **The leak** — `IndexStore::memtable_shards` retained one parsed
+   `Arc<serde_json::Value>` per explicit-id write for the life of the process:
+   the engine's flush path drains the FTS memtable and finalises from *that*,
+   so the storage-side shards were never emptied. `prune_published_memtable()`
+   now runs at the end of every successful flush finalise and drops entries the
+   version map has repointed at a real segment.
+2. **The accounting lie** — a raw-bytes (turbo `_bulk`) memtable entry charged
+   a flat 800 bytes regardless of payload (a ~10 KB mailbox doc counted as
+   800), and the explicit-id path charged a full JSON re-serialisation. Both
+   now charge what the entry retains; the 800-byte floor keeps the compressed
+   log-doc cadence byte-for-byte (the M5.17 regression stays fixed).
+3. **Merge batches are bounded by input bytes** (`clamp(cap/64, 32, 512) MiB`,
+   `XERJ_MERGE_BATCH_MAX_INPUT_MB` overrides) — the executor materialises
+   decoded + re-encoded copies of every input doc, measured 5–9× input bytes,
+   so a count-chunked batch of large segments is an unbounded spike. Forcemerge
+   chunking obeys the same cap. Peers bound the same thing by memory
+   (quickwit `quickwit-parquet-engine/src/storage/streaming_writer.rs:378`,
+   `…/merge/streaming.rs:148`; tantivy sizes candidates before batching,
+   `src/indexer/log_merge_policy.rs:22,94`).
+4. **The breaker now drains, not just rejects** — when the parent RSS breaker
+   engages, the sampler requests a drain of every loaded index (flush +
+   release rebuildable caches + a jemalloc `arena.4096.purge` hook installed by
+   the server), rate-limited to one per 2 s while engaged; publish-warming is
+   skipped while it is engaged. A breaker that only 429s frees nothing.
+5. **The ingest-memory ledger now sees the caches and merges** — the segment
+   hydration cache is charged at admission, the merge executor charges its
+   decoded/survivor/json-buffer/parsed/encoded buffers, so the ledger's view
+   and RSS agree where they used to diverge by gigabytes.
+
+### At-rest retention — the leak, isolated ([raw](./results/fix-atrest-bisect.txt))
+
+[`atrest_bisect.sh`](./atrest_bisect.sh) loads mailbox-shaped docs straight
+through ES `_bulk` ([`synth_bulk_ingest.py`](./synth_bulk_ingest.py) — the
+record shape without autoindex's catalog/brain/edge traffic), flushes, waits
+45 s, and reads the node's `VmRSS`/`VmHWM` from `/proc`. Variant A: 20,000
+docs × 10 KB body ≈ 210 MB of source, cap lifted (`65536`) so the breaker
+never gates the load.
+
+| variant A, 20k × 10 KB | base | fixed |
+|---|---|---|
+| idle before load | 135.5 MiB | 131.4 MiB |
+| post-flush RSS | 1,361.3 MiB | 860.7 MiB |
+| **settled RSS (45 s after flush)** | **972.8 MiB** | **481.4 MiB** |
+| VmHWM over the whole run | 1,944.1 MiB | 1,941.7 MiB |
+| RSS after DELETE of the index | 226.9 MiB | 199.0 MiB |
+| **settled retention** (settled − after-delete) | **~764 MB** | **~289 MB** |
+
+The ledger explains the difference exactly: at settle, the base run's RSS is
+~935 MB of which the ledger can account for ~272 MB (the segment-hydration
+cache) — **~533 MB is invisible to every category**, which is the storage
+memtable's per-doc `Arc<Value>` trees (~2.5× the 210 MB source). On the fixed
+binary the unattributed remainder is **~3 MB**; what is left at rest is the
+rebuildable hydration cache, which a drain or a delete releases. The fixed
+side's settled figure reproduced across three independent runs (481.4, 481
+and 488.2 MiB; the third, on 2026-09-21, had its load pacing shaped by the
+box's disk-flood retry grind — see the note under variant C — and settled
+within 7 MiB of the others). The **peak** barely moves (1.94 GiB both
+sides): the leak was retention, not the transient working set.
+
+### Variant C — the same leak, per document ([raw](./results/fix-atrest-bisect.txt))
+
+Variant C holds the source at ~10 MB but raises the count: 100,000 docs ×
+100 B bodies. This isolates the per-document component of the retention
+(variant A isolates the per-byte one).
+
+| variant C, 100k × 100 B (~10 MB source) | base | fixed |
+|---|---|---|
+| idle before load | 127.7 MiB | 126.4 MiB |
+| post-flush RSS | 1,575.0 MiB | 1,352.9 MiB |
+| **settled RSS (45 s after flush)** | **883.0 MiB** | **280.8 MiB** |
+| VmHWM over the whole run | 1,973.8 MiB | 1,570.9 MiB |
+| RSS after DELETE of the index | 205.9 MiB | 172.8 MiB |
+| **settled retention** (settled − after-delete) | **~677 MB** | **~108 MB** |
+
+A 10 MB source leaving ~677 MB resident at rest is ~7 KB retained per
+100-byte document on the base — the parsed per-doc `Arc<Value>` trees again,
+this time counted per head instead of per byte. At this document count the
+leak is big enough to move the peak too (−403 MiB VmHWM). Both sides landed
+exactly 100,000 documents (the loader reports `docs_sent` = `node_count` =
+requested; the base side needed 8 retry rounds, the fixed side 2).
+
+A note on the 2026-09-21 re-runs: the shared box's root filesystem sat at
+97–98 % (other tenants' data), which crosses the node's 95 %
+`disk.watermark.flood_stage` at boot and puts it in `read_only_allow_delete`.
+The throwaway nodes for these re-runs were unblocked with the documented
+transient cluster setting
+(`PUT _cluster/settings {"transient":{"cluster.routing.allocation.disk.watermark.flood_stage":"99%"}}`),
+which changes no retention behaviour — only which writes are admitted. The
+variant A re-run's wall time (1,472 s, 147 retry rounds) is that grind and is
+not comparable to anything; every RSS/retention figure above is measured
+after the load had fully landed.
+
+Merge-side attribution, same run, fixed binary only (the wiring is part of the
+fix; base reports the categories `unavailable`): for a ~290 MB-on-disk index
+the biggest merge batch peaked at 135.4 MB survivors + 134.6 MB re-encoded
+JSON buffer + 155.0 MB parsed FTS input + 12.9 MB decoded stored + 33.2 MB
+compressed output — a few hundred MB of working set, which is what change 3
+now bounds by input bytes instead of leaving to segment count.
+
+### 300 MB at a laptop's 8 GiB cap ([base](./results/fix-mixed-300M-cap8g-base.json), [fixed](./results/fix-mixed-300M-cap8g-fixed.json))
+
+`XERJ_MAX_PROCESS_MEMORY_MB=8192`, same tree (seed 42, 30,403 documents),
+every planted needle checked.
+
+| | base | fixed |
+|---|---|---|
+| exit | 3 (complete) | 3 (complete) |
+| wall | 66.5 s | 73.0 s |
+| documents | 30,403 | 30,403 |
+| server VmHWM | **14,766.6 MiB (1.8× the cap)** | **7,963.6 MiB (under the 8,192 MiB cap)** |
+| breaker engagements | **178** | **2** |
+| memtable flushes / merges | 140 / 10 | 129 / 9 |
+| verify | 735/735 needles, 0 missing; `replies_to` 5,992 = truth; `attachment_of` 11,169 = attachment docs; sender 40/40; subject-in-body 40/40 | identical, figure for figure |
+
+The fixed node still touches the watermark once (RSS 8,027 MB as the node logs
+it) — but the drain fires, RSS comes back down, and the run finishes inside
+its cap instead of 1.8× outside it. On a real 16 GiB laptop the base numbers
+mean swap or an OOM kill; the fixed numbers fit.
+
+### 1 GB at the default 16 GiB cap — the run from the issue ([base](./results/fix-mixed-1G-capped16g-base.json), [fixed](./results/fix-mixed-1G-capped16g-fixed.json))
+
+Same tree as run B above (seed 42, 40,799 mbox entries, 2,530 planted needles,
+21,544 resolvable replies), same harness, run sequentially on 2026-09-20
+(1-min load 1.5–5.5). This is the pair that answers #948's title.
+
+| | base (`9c64a7c6`) | fixed |
+|---|---|---|
+| exit | **1 — aborted** (breaker 429 after the 600 s re-offer budget) | **3 — complete** |
+| wall | 817.1 s (the 600 s patience, then the abort) | **407.7 s** |
+| documents on node | 85,722 of ~107k (the tail was never sent) | **107,698** (107,668 mbox records, 39,619 attachment docs) |
+| server VmHWM | 25,356.9 MiB | **21,405.3 MiB — still 1.3× the 16,384 MiB cap** |
+| breaker engagements | 31 | 24 |
+| needles | 2,020 of 2,530 (510 missing, 0 wrong) | **2,530 of 2,530, 0 missing, 0 duplicated, 0 wrong** (1 in overlapping sections) |
+| `replies_to` / `attachment_of` | **0 / 0** (edges are written after a file's nodes land) | **21,544 = truth / 39,619 = attachment docs** |
+| subjects in `body` | 40/40 | 40/40 |
+| verify latency | median 6.5 ms, p95 7.5 ms, 2 requests over 10 s | median 9.2 ms, **p95 5.54 s, 509 over 1 s, max 71.5 s** |
+
+**The capped 1 GB mailbox now completes, and its content is complete and
+correct.** The fixed node crossed the finish line with every needle, every
+edge, and both index-level checks green, in half the base's wall time (the
+base number is 600 s of waiting plus the abort). The `sender_filter` row is
+absent from the table on purpose: on the fixed run it reports `sampled: 0`
+while the base reported 40/40 — investigated, and it is a verify-time
+artifact, not data loss. `verify.py` samples senders with a terms aggregation
+on `email_from_address`, the single most expensive request it makes (47.5 s
+cold, server-side `timed_out: true`, on this index with the cap lifted and the
+node otherwise idle); during the run's verify the node was under the cap and
+draining every ~2 s, the aggregation request failed, and `verify.py`'s
+`post()` swallows errors, so `buckets()` read `[]`. Re-booted on a byte copy
+of the fixed run's data dir with the cap lifted, the same aggregation returns
+40 buckets and **all 40 sender checks pass** (`term` count = display-form
+count, 0 mismatches). The data was on disk the whole time.
+
+### What the fix does not fix — measured, not guessed
+
+- **The 1 GB run's peak still exceeds its own cap.** 21,405 MiB VmHWM against
+  a 16,384 MiB cap. The drain keeps the run *completing* (the base aborted at
+  87 % with 25,357 MiB); it does not make the ingest fit inside 16 GiB. The
+  remaining peak is the read/merge working set under pressure, not the leak
+  (see the at-rest table: the leak was retention, and the transient peak
+  barely moves).
+- **Verify-time reads under the cap thrash.** p95 5.54 s and 509 of 2,619
+  requests over 1 s on the fixed 1 GB node (base: p95 7.5 ms), because the
+  drain that frees memory also drops the segment-hydration cache that reads
+  were relying on, and the next read re-hydrates it. Median latency is still
+  9.2 ms; the tail is the cost. This is the #948 read-side story
+  (`segment_loop` first-query latency) wearing the drain's clothes.
+- **At-rest VmHWM for a 210 MB load is unchanged** (~1.94 GiB both sides):
+  the fix recovered the *settled* floor (972.8 → 481.4 MiB), not the
+  high-water mark the load passes through.
+- **The sender `sampled: 0` above** — a `verify.py` robustness gap (it
+  swallows request errors and reports empties) triggered by real drain
+  pressure. The index was correct; the verifier could not tell the
+  difference. Not fixed here.
+
 ## What this says, plainly
 
 - **The extractor is correct on this corpus and cheap.** Under 300 MiB of

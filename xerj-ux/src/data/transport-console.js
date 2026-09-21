@@ -2,35 +2,37 @@
 // XERJ Console — reader transport for the signed-in operator
 //
 // A console session is NOT an engine credential. Everything the reader can
-// get through the session-authenticated console API, it gets there, so it
-// works the same on an auth-enabled engine (the default) as on `--insecure`:
+// get, it gets through the session-authenticated console API, so it works
+// the same on an auth-enabled engine (the default) as on `--insecure`:
 //
 //   search   the panel proxy (one exact index; the proxy refuses patterns,
 //            system indices and the reserved brain namespace — see
 //            xerj-console-api/src/data_sources.rs).
 //   mapping  the console's field list for the index, reshaped to the
 //            `_mapping` wire form data/reader-api.js reads.
+//   ego      the console's graph read path
+//            (`/_xerj-console/api/v1/graph/{brain}/ego`) — session-authorized
+//            for the operator roles (owner/admin), same §4.3 contract as the
+//            data plane (xerj-console-api/src/graph.rs, issue #936).
+//   discoverBrains
+//            one call to the console's brains listing
+//            (`/_xerj-console/api/v1/graph/brains`), which returns each
+//            brain's `nodes_index` — this replaces the old direct
+//            `_cat/indices/.xerj-memory-*` walk plus per-brain meta-doc
+//            reads, both of which 401 for a session.
 //
-// The graph has no such path, on purpose (the proxy cannot read a brain —
-// RC10 B1), so these two are direct same-origin calls:
-//
-//   ego            `GET /_graph/{brain}/ego`
-//   discoverBrains `_cat/indices` + each brain's meta document
-//
-// On an auth-enabled engine they answer 401. The reader then says exactly
-// that — "the graph API refused this console session" — instead of claiming
-// the record has no links. Records, search and attachments still work.
+// A role that may not read brains (editor/viewer) gets the same 404 an
+// unknown brain gets, so the reader says "no brain for this index" — the
+// honest user-facing statement for that role — and never a leak.
 // ============================================================
 
-import { parseBrainIndices } from './brains-probe.js';
 import { fieldTypes } from './console-index-api.js';
 
 const PROXY = '/_xerj-console/api/v1/data-sources/connections/built-in/indices';
-const BRAIN_META_ID = '__xerj-brain-meta';
-/** Brains scanned for a meta document, and how many matching brains a record's
- *  graph panel walks. Two `xerj brain` runs over different folders land in
- *  the same `ax-docs` index with two brains that both list it. */
-const BRAINS_SCANNED = 32;
+const GRAPH = '/_xerj-console/api/v1/graph';
+/** How many of the discovered brains a record's graph panel walks. Two
+ *  `xerj brain` runs over different folders land in the same `ax-docs`
+ *  index with two brains that both list it. */
 export const BRAINS_WALKED = 4;
 const enc = encodeURIComponent;
 
@@ -80,33 +82,31 @@ export function makeConsoleTransport() {
     },
     async ego(brain, params, signal) {
       const qs = new URLSearchParams(params);
-      const r = await request(`/_graph/${enc(brain)}/ego?${qs}`, { signal, credentials: 'same-origin', headers: { accept: 'application/json' } });
+      const r = await request(`${GRAPH}/${enc(brain)}/ego?${qs}`, { signal, credentials: 'same-origin', headers: { accept: 'application/json' } });
       let body = null;
       try { body = await r.json(); } catch { body = null; }
       return { status: r.status, body };
     },
     /**
      * EVERY brain whose meta doc lists `index` in `nodes_index` (what
-     * `xerj brain` writes), in `_cat` order, at most BRAINS_WALKED of them.
+     * `xerj brain` writes), in listing order, at most BRAINS_WALKED of them.
      * `[]` when none does or nothing can be read. Best-effort; never throws.
      *
      * A list, not the first match: after `xerj brain casefile` and
      * `xerj brain vendors` on one node both brains list `ax-docs`, and each
      * holds links only for its own files. Returning the first brain made the
      * reader say "records no links for this record" for half the corpus,
-     * with which half depending on `_cat` order (PR #945 review).
+     * with which half depending on listing order (PR #945 review).
      */
     async discoverBrains(index, signal) {
       const out = [];
       try {
-        const r = await fetch('/_cat/indices/.xerj-memory-*', { signal, credentials: 'same-origin', headers: { accept: 'text/plain, application/json' } });
+        const r = await fetch(`${GRAPH}/brains`, { signal, credentials: 'same-origin', headers: { accept: 'application/json' } });
         if (!r.ok) return out;
-        for (const b of parseBrainIndices(await r.text()).slice(0, BRAINS_SCANNED)) {
-          const m = await fetch(`/${enc(`.xerj-memory-${b}-edges`)}/_doc/${enc(BRAIN_META_ID)}`, { signal, credentials: 'same-origin', headers: { accept: 'application/json' } });
-          if (!m.ok) continue;
-          const doc = await m.json();
-          const ni = String((doc && doc._source && doc._source.nodes_index) || '');
-          if (ni.split(',').map((x) => x.trim()).includes(index)) out.push(b);
+        const j = await r.json();
+        for (const b of (j && j.data && j.data.brains) || []) {
+          const ni = String((b && b.nodes_index) || '');
+          if (ni.split(',').map((x) => x.trim()).includes(index)) out.push(b.name);
           if (out.length >= BRAINS_WALKED) break;
         }
       } catch (e) {

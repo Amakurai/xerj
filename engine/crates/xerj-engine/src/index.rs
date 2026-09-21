@@ -11326,6 +11326,42 @@ impl Index {
         Ok(total)
     }
 
+    /// Upper bound on the total INPUT bytes of one merge batch.  Issue #948.
+    ///
+    /// The merge executor materialises decoded and re-encoded copies of
+    /// every input document (measured 5-9x input bytes on mailbox-shaped
+    /// docs: `merge_parsed` alone held 191 MB current on a 20k-doc index),
+    /// so batch heap cost scales with bytes, not segment count.  Peers
+    /// bound the same thing by memory, not count: Quickwit caps the bytes
+    /// buffered by pending merge writers
+    /// (`quickwit-parquet-engine/src/storage/streaming_writer.rs:378`
+    /// `pending_writers_memory_size`) and streams segment files
+    /// (`quickwit-parquet-engine/src/merge/streaming.rs:148`); tantivy's
+    /// `LogMergePolicy` filters candidates by size before batching
+    /// (`max_docs_before_merge`, `src/indexer/log_merge_policy.rs:22,94`).
+    ///
+    /// Derived: `clamp(process cap / 64, 32 MiB, 512 MiB)` — at #948's
+    /// 16 GiB auto-cap that is a 256 MiB batch, i.e. a worst-case merge
+    /// working set of ~1.5-2.4 GiB at the measured multipliers.
+    /// `XERJ_MERGE_BATCH_MAX_INPUT_MB` overrides (0 disables the bound).
+    /// A non-numeric cap (`auto`, `off`) falls back to the 512 MiB
+    /// default.
+    fn merge_batch_cap_bytes() -> u64 {
+        const MB: u64 = 1024 * 1024;
+        if let Ok(raw) = std::env::var("XERJ_MERGE_BATCH_MAX_INPUT_MB") {
+            if let Ok(mb) = raw.trim().parse::<u64>() {
+                return mb * MB;
+            }
+        }
+        match std::env::var("XERJ_MAX_PROCESS_MEMORY_MB")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+        {
+            Some(limit_mb) if limit_mb > 0 => (limit_mb / 64).clamp(32, 512) * MB,
+            _ => 512 * MB,
+        }
+    }
+
     /// One merge pass.  Caller MUST hold `merge_in_progress` (and clear it
     /// after — see `MergeFlagClear`).
     ///
@@ -11370,6 +11406,7 @@ impl Index {
             max_merge_count: mc.max_merge_count as usize,
             tier_floor_bytes: mc.tier_floor_mb * 1024 * 1024,
             max_merged_segment_bytes: mc.max_segment_mb * 1024 * 1024,
+            max_batch_input_bytes: Self::merge_batch_cap_bytes(),
         };
 
         let segments_snapshot_init = {
@@ -11379,15 +11416,37 @@ impl Index {
         let batches: Vec<Vec<SegmentId>> = match force_max_segments {
             // Forcemerge: chunk every segment (smallest first) into
             // max_merge_count-sized batches, ignoring tier/size caps.
+            // #948 — the byte cap still applies: an explicit forcemerge
+            // on a mailbox index used to build one count-sized batch of
+            // ~100 MB segments and hold ~16 GiB of decoded docs at once.
+            // Multiple capped batches still converge to `target`
+            // segments (the caller loops passes).
             Some(target) if segments_snapshot_init.len() > target => {
+                let cap = Self::merge_batch_cap_bytes();
                 let mut segs: Vec<&xerj_storage::segment::SegmentMeta> =
                     segments_snapshot_init.iter().collect();
                 segs.sort_by_key(|s| s.size_bytes);
+                let sizes: Vec<u64> = segs.iter().map(|s| s.size_bytes).collect();
                 let ids: Vec<SegmentId> = segs.into_iter().map(|s| s.id.clone()).collect();
-                ids.chunks((mc.max_merge_count as usize).max(2))
-                    .filter(|c| c.len() >= 2)
-                    .map(|c| c.to_vec())
-                    .collect()
+                let chunk_len = (mc.max_merge_count as usize).max(2);
+                let mut chunks: Vec<Vec<SegmentId>> = Vec::new();
+                let mut batch: Vec<SegmentId> = Vec::new();
+                let mut batch_bytes = 0u64;
+                for (id, size) in ids.into_iter().zip(sizes) {
+                    if !batch.is_empty()
+                        && (batch.len() >= chunk_len || (cap > 0 && batch_bytes + size > cap))
+                    {
+                        chunks.push(std::mem::take(&mut batch));
+                        batch_bytes = 0;
+                    }
+                    batch_bytes = batch_bytes.saturating_add(size);
+                    batch.push(id);
+                }
+                if !batch.is_empty() {
+                    chunks.push(batch);
+                }
+                chunks.retain(|c| c.len() >= 2);
+                chunks
             }
             Some(_) => Vec::new(),
             None => policy.select_merges(&segments_snapshot_init),
@@ -11634,6 +11693,24 @@ impl Index {
                         };
                     let merge_postings = merge_readers.is_some();
 
+                    // Ingest-memory attribution (#948): the replay path holds
+                    // every input's decompressed postings + norms for the whole
+                    // batch, and the same bytes bound the writer's in-memory
+                    // rebuild (a merged posting list is the inputs' lists
+                    // remapped, not re-derived). `retained_bytes` charges only
+                    // what the reader OWNS (an mmap'd `.post` contributes 0),
+                    // matching what this batch adds to the heap.
+                    let merge_reader_retained = merge_readers.as_ref().map(|readers| {
+                        let bytes: u64 = readers
+                            .iter()
+                            .map(|reader| reader.retained_bytes())
+                            .sum();
+                        crate::ingest_memory::Retained::new(
+                            crate::ingest_memory::Category::MergeDecoded,
+                            bytes as usize,
+                        )
+                    });
+
                     // Per-phase attribution of one merge batch, gated on
                     // XERJ_PROF, matching the flush path's `XERJ_PROF
                     // flush-sidecar` line. The #876 A/B is read off `fts_us`.
@@ -11698,6 +11775,10 @@ impl Index {
                     // doc ids, and the global `_seq_no` sort below scrambles the
                     // per-input order, so the pair has to ride along.
                     let mut survivors: Vec<(u64, String, String, u32, u32)> = Vec::new();
+                    // #948 attribution: running estimate of the survivor
+                    // set's retained bytes (raw JSON + id + tuple), observed
+                    // once per input segment as a sampled checkpoint.
+                    let mut survivor_bytes: usize = 0;
                     // One entry per document in each input segment, in that
                     // segment's own ordinal order: the merged ordinal it becomes,
                     // or `None` if it does not survive.
@@ -11826,6 +11907,15 @@ impl Index {
                                     return None;
                                 }
                             };
+                        // Ingest-memory attribution (#948): one guard per
+                        // input for its decompressed stored section, held
+                        // until this iteration ends (the RawValue parse and
+                        // the survivor scan both read it; the buffer drops
+                        // with the iteration scope).
+                        let _stored_guard = crate::ingest_memory::Retained::new(
+                            crate::ingest_memory::Category::MergeDecoded,
+                            stored_bytes.len(),
+                        );
                         // `Box<RawValue>` uses a serde-private newtype tag that
                         // simd_json's serde adapter does not recognise — the
                         // deserialiser fails with "invalid type: newtype struct,
@@ -11893,8 +11983,21 @@ impl Index {
                                 source_index as u32,
                                 source_ordinal as u32,
                             ));
+                            survivor_bytes = survivor_bytes.saturating_add(
+                                raw_str.len()
+                                    + id_seq.id.len()
+                                    + std::mem::size_of::<(u64, String, String, u32, u32)>(),
+                            );
                         }
                         // raw_docs + stored_bytes drop here — segment RAM reclaimed.
+                        // One sampled checkpoint per input segment: the
+                        // survivor set grows monotonically inside the input
+                        // loop, so the trailing edge of the peak is at most
+                        // one input's worth of growth (#948 attribution).
+                        crate::ingest_memory::observe_checkpoint(
+                            crate::ingest_memory::Category::MergeSurvivor,
+                            survivor_bytes,
+                        );
                     }
 
                     // Global insertion-order (_seq_no) sort — see the B1 note
@@ -11905,6 +12008,8 @@ impl Index {
                     // Single sorted stream → all four outputs.  `into_iter`
                     // frees each raw String right after its bytes are copied
                     // into `merged_json_buf`, keeping peak memory ~1× stored.
+                    let mut drain_checkpoint = 0u64;
+                    let mut fts_input_bytes: usize = 0;
                     for (seq_no, id_str, raw_str, source_index, source_ordinal) in survivors {
                         if !first_doc {
                             merged_json_buf.push(b',');
@@ -11951,13 +12056,50 @@ impl Index {
                         } else {
                             extract_fts_fields_excluding(&source, &excluded_fts_fields_for_task)
                         };
+                        // #948 attribution: the Value tree the FTS/DV passes
+                        // hold until the end of the batch. The walk is
+                        // per-document but only when tracing is enabled.
+                        if crate::ingest_memory::enabled() {
+                            fts_input_bytes = fts_input_bytes
+                                .saturating_add(crate::ingest_memory::estimated_json_heap(
+                                    doc_value.get("_source").unwrap_or(&Value::Null),
+                                ));
+                        }
                         fts_input.push((id_str, fields, source));
+                        // Sampled checkpoints every 8192 drained docs: the
+                        // survivor set shrinks as `merged_json_buf` and
+                        // `fts_input` grow, so the crossover IS the batch's
+                        // stored-side peak.
+                        drain_checkpoint += 1;
+                        if drain_checkpoint.is_multiple_of(8192) {
+                            crate::ingest_memory::observe_checkpoint(
+                                crate::ingest_memory::Category::MergeJsonBuffer,
+                                merged_json_buf.len(),
+                            );
+                            crate::ingest_memory::observe_checkpoint(
+                                crate::ingest_memory::Category::MergeParsed,
+                                fts_input_bytes,
+                            );
+                        }
                     }
+                    // Drained: the survivors vec is empty now.
+                    crate::ingest_memory::observe_checkpoint(
+                        crate::ingest_memory::Category::MergeSurvivor,
+                        0,
+                    );
 
                     if live_doc_count == 0 {
                         return None;
                     }
                     merged_json_buf.push(b']');
+                    crate::ingest_memory::observe_checkpoint(
+                        crate::ingest_memory::Category::MergeJsonBuffer,
+                        merged_json_buf.len(),
+                    );
+                    crate::ingest_memory::observe_checkpoint(
+                        crate::ingest_memory::Category::MergeParsed,
+                        fts_input_bytes,
+                    );
 
                     // Write merged stored section using the columnar v2 codec.
                     let mut writer = match SegmentWriter::new(&segments_dir_for_task, 1, 0, 0) {
@@ -11973,8 +12115,19 @@ impl Index {
                         &merged_json_buf,
                         merge_zstd_level,
                     );
+                    // #948 attribution: the compressed output buffer is an
+                    // exact owned length; it coexists with the drained buffer
+                    // for one encode call.
+                    let _encoded_guard = crate::ingest_memory::Retained::new(
+                        crate::ingest_memory::Category::MergeEncoded,
+                        encoded.len(),
+                    );
                     let stored_us = stored_timer.elapsed().as_micros();
                     drop(merged_json_buf);
+                    crate::ingest_memory::observe_checkpoint(
+                        crate::ingest_memory::Category::MergeJsonBuffer,
+                        0,
+                    );
                     if let Err(e) = writer.add_section(SectionType::Stored, &encoded) {
                         tracing::error!("merge ABORTED: failed to add section: {e}");
                         failed_for_task.fetch_add(1, Ordering::Relaxed);
@@ -12127,6 +12280,7 @@ impl Index {
                     // Release the inputs' decompressed postings before the
                     // doc-values build, which is now the batch's memory peak.
                     drop(merge_readers);
+                    drop(merge_reader_retained);
 
                     // Update version_map so doc → segment_id points to the
                     // merged segment, using each doc's REAL seq_no from
@@ -12179,6 +12333,13 @@ impl Index {
                     }
 
                     let dv_us = dv_timer.elapsed().as_micros();
+                    // `fts_input` (raw ids + the per-doc `_source` Value
+                    // trees) survives its last reader here — the batch's
+                    // parsed-side attribution ends with it.
+                    crate::ingest_memory::observe_checkpoint(
+                        crate::ingest_memory::Category::MergeParsed,
+                        0,
+                    );
                     if prof {
                         eprintln!(
                             "XERJ_PROF merge-batch inputs={} docs={live_doc_count} \
@@ -15894,10 +16055,14 @@ impl Index {
             }
         }
 
-        // Apply fusion.
+        // Apply fusion. A tied fused score is broken by arrival order, the
+        // same `seq_no ASC, _id ASC` every other score-ranked page uses
+        // (#270/#940) — resolved through the version map once per distinct
+        // fused document, which is at most `legs × per_query_topk` lookups.
+        let seq_no_of = |id: &str| self.lookup_seq_no(id).unwrap_or(u64::MAX);
         let fused = match fusion {
-            xerj_query::ast::FusionStrategy::Rrf { k } => fuse_rrf(&sub_results, k),
-            xerj_query::ast::FusionStrategy::Linear => fuse_linear(&sub_results),
+            xerj_query::ast::FusionStrategy::Rrf { k } => fuse_rrf(&sub_results, k, &seq_no_of),
+            xerj_query::ast::FusionStrategy::Linear => fuse_linear(&sub_results, &seq_no_of),
             // Defense in depth: the parser already rejects `fusion: learned`
             // with a 400 (see xerj-query parser.rs::parse_hybrid), so this
             // arm is unreachable via the ES API. Fail loud rather than
@@ -22963,6 +23128,14 @@ impl Index {
         self.memtable.size_bytes()
     }
 
+    /// #948 — entries currently resident in the STORAGE memtable
+    /// (`IndexStore::memtable_shards`).  Diagnostic twin of
+    /// [`Self::memtable_bytes`]: the FTS memtable drains on every flush,
+    /// the storage one used to never drain at all.
+    pub fn resident_memtable_entries(&self) -> usize {
+        self.store.resident_memtable_entries()
+    }
+
     pub fn flush_threshold(&self) -> usize {
         self.flush_byte_threshold
     }
@@ -29944,14 +30117,20 @@ async fn do_flush_shard(
 
             let storage_entries: Vec<xerj_storage::index_store::MemEntry> = raw
                 .into_iter()
-                .map(
-                    |(seq_no, doc_id, arc, raw_bytes)| xerj_storage::index_store::MemEntry {
+                .map(|(seq_no, doc_id, arc, raw_bytes)| {
+                    let charge = if !raw_bytes.is_empty() {
+                        raw_bytes.len() as u64
+                    } else {
+                        xerj_storage::index_store::estimate_value_bytes(&arc)
+                    };
+                    xerj_storage::index_store::MemEntry {
                         seq_no,
                         doc_id,
                         source: Some(arc),
                         source_bytes: raw_bytes,
-                    },
-                )
+                        charge,
+                    }
+                })
                 .collect();
             let storage_drained = xerj_storage::index_store::DrainedMemtable {
                 entries: storage_entries,
@@ -37096,64 +37275,152 @@ fn replace_direct_knn_with_pinned(q: &QueryNode, pinned: &QueryNode) -> QueryNod
 // ── Hybrid fusion helpers ────────────────────────────────────────────────────
 //
 // Both fuse_rrf and fuse_linear take a slice of (hits, weight) pairs and
-// return a single Vec<Hit> sorted by combined score descending. The same
-// doc_id appearing across multiple lists collapses to one Hit; the source
-// is taken from the first list that produced it (sub-lists may differ on
-// what they materialise, e.g. a kNN list returns the full source while
-// a BM25 list with `_source: false` returns null — first non-null wins).
+// return a single Vec<Hit> in the fused order below. The same doc_id
+// appearing across multiple lists collapses to one Hit; the source is taken
+// from the first list that produced it (sub-lists may differ on what they
+// materialise, e.g. a kNN list returns the full source while a BM25 list
+// with `_source: false` returns null — first non-null wins).
+//
+// THE FUSED ORDER (#940) is the ONE total order every score-ranked page in
+// this engine uses (#270, `Index::sort_hits_page_order`):
+//
+//     fused score DESC, seq_no ASC (arrival — ES `_doc`), _id ASC
+//
+// Ties are structural under RRF, not an edge case: a document found only by
+// leg A at rank r and one found only by leg B at rank r both score exactly
+// `w/(k+r)`, and two documents at swapped ranks (1,2)/(2,1) both score
+// `1/(k+1) + 1/(k+2)`. The accumulator used to be a `HashMap` drained
+// straight into a score-only stable sort, so every such tie came out in
+// hash-iteration order — and `std`'s `RandomState` is seeded per process,
+// so the same request on the same data returned a different page after a
+// restart. Measured on BEIR SciFact (issue #940): 32 of 40 queries changed
+// order and 21 of 40 changed their top 10, with identical hit sets.
+//
+// Why arrival order and not a rank-derived key. The issue floated "best leg
+// rank, then `_id`". On the commonest tie — the symmetric (1,2)/(2,1) pair —
+// every rank-derived key ties as well, so that rule bottoms out in "the
+// earlier-listed leg wins": reordering the legs of an equal-weight request
+// would reorder its results, and RRF is supposed to be symmetric in its
+// legs. Arrival order has no such dependence on how the request is spelled,
+// and it means a caller learns one tie rule for the whole engine, not two.
+//
+// Lucene resolves the same problem the same way. `TopDocs.rrf` has this
+// exact shape — a `HashMap` accumulator copied into a list and sorted — and
+// is deterministic only because its comparator is total: score descending,
+// then doc ID, then shard index
+// (`lucene/core/src/java/org/apache/lucene/search/TopDocs.java:410-422`,
+// Apache-2.0). Lucene's doc ID is its arrival order, i.e. what `seq_no` is
+// here. Approach only; no code is shared.
+
+/// One fused candidate: the accumulated score plus the arrival `seq_no` that
+/// breaks a tied score (see THE FUSED ORDER above).
+struct FusedEntry {
+    score: f32,
+    /// Resolved once per distinct document, when it is first seen — not per
+    /// comparison. `u64::MAX` for a document the version map no longer
+    /// knows, the same "unknown sorts last" `sort_hits_page_order` uses.
+    seq_no: u64,
+    hit: Hit,
+}
+
+/// Shared accumulator for both combiners: folds one leg's contribution for
+/// one document into `entries`.
+///
+/// `entries` is a `Vec` indexed through `slot_by_id` rather than a
+/// `HashMap<String, _>` drained by iteration, so the map is only ever used
+/// for lookup and nothing about the output can depend on hash order.
+fn fuse_accumulate(
+    entries: &mut Vec<FusedEntry>,
+    slot_by_id: &mut HashMap<String, usize>,
+    contrib: f32,
+    h: &Hit,
+    seq_no_of: &dyn Fn(&str) -> u64,
+) {
+    match slot_by_id.get(&h.id) {
+        Some(&slot) => {
+            let existing = &mut entries[slot];
+            existing.score += contrib;
+            // Take a non-null source from a later list if the first had
+            // `_source: false`.
+            if existing.hit.source.is_null() && !h.source.is_null() {
+                existing.hit.source = h.source.clone();
+            }
+        }
+        None => {
+            let mut hit = h.clone();
+            hit.score = 0.0; // overwritten with the fused score on output
+            slot_by_id.insert(h.id.clone(), entries.len());
+            entries.push(FusedEntry {
+                score: contrib,
+                seq_no: seq_no_of(&h.id),
+                hit,
+            });
+        }
+    }
+}
+
+/// Sort fused candidates into THE FUSED ORDER and stamp the fused score.
+///
+/// The score key is NaN-safe on purpose. A NaN can reach `fuse_linear` from
+/// a scripted leg (`(NaN - lo) / span`), and `partial_cmp(..).unwrap_or(Equal)`
+/// over a slice containing one is not a total order — `sort_by` is allowed to
+/// panic on that, and the release profile is `panic = "abort"`. A NaN score
+/// sorts LAST, as the worst possible score, instead of wherever the sort
+/// happened to leave it. For every other value this is the same comparison
+/// `sort_hits_page_order` makes.
+fn fuse_finish(mut entries: Vec<FusedEntry>) -> Vec<Hit> {
+    fn key(score: f32) -> f32 {
+        if score.is_nan() {
+            f32::NEG_INFINITY
+        } else {
+            score
+        }
+    }
+    entries.sort_by(|a, b| {
+        key(b.score)
+            .total_cmp(&key(a.score))
+            .then_with(|| a.seq_no.cmp(&b.seq_no))
+            .then_with(|| a.hit.id.cmp(&b.hit.id))
+    });
+    entries
+        .into_iter()
+        .map(|e| {
+            let mut h = e.hit;
+            h.score = e.score;
+            h
+        })
+        .collect()
+}
 
 /// RRF (reciprocal-rank-fusion) combiner. Each doc d in list i at
 /// 1-based rank r_i contributes `weight_i / (k + r_i)` to its
 /// combined score. The smoothing constant k defaults to 60 (ES /
 /// OpenSearch / TREC convention) and is small enough that the top
-/// few ranks still dominate.
-fn fuse_rrf(sub_results: &[(Vec<Hit>, f32)], k: u32) -> Vec<Hit> {
+/// few ranks still dominate. Output is in THE FUSED ORDER (#940);
+/// `seq_no_of` resolves a document's arrival `seq_no` for the tie-break.
+fn fuse_rrf(sub_results: &[(Vec<Hit>, f32)], k: u32, seq_no_of: &dyn Fn(&str) -> u64) -> Vec<Hit> {
     let kf = k as f32;
-    // doc_id → (combined_score, picked_hit). Picked Hit is mutated to
-    // carry the fused score on output.
-    let mut accum: HashMap<String, (f32, Hit)> = HashMap::new();
+    let mut entries: Vec<FusedEntry> = Vec::new();
+    let mut slot_by_id: HashMap<String, usize> = HashMap::new();
     for (hits, weight) in sub_results {
         for (rank_zero_based, h) in hits.iter().enumerate() {
             let rank = (rank_zero_based + 1) as f32;
             let contrib = weight / (kf + rank);
-            match accum.get_mut(&h.id) {
-                Some(existing) => {
-                    existing.0 += contrib;
-                    // Take a non-null source from the second list if the
-                    // first had _source: false.
-                    if existing.1.source.is_null() && !h.source.is_null() {
-                        existing.1.source = h.source.clone();
-                    }
-                }
-                None => {
-                    let mut hit = h.clone();
-                    hit.score = 0.0; // will overwrite from combined
-                    accum.insert(h.id.clone(), (contrib, hit));
-                }
-            }
+            fuse_accumulate(&mut entries, &mut slot_by_id, contrib, h, seq_no_of);
         }
     }
-    let mut combined: Vec<Hit> = accum
-        .into_iter()
-        .map(|(_, (score, mut h))| {
-            h.score = score;
-            h
-        })
-        .collect();
-    combined.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    combined
+    fuse_finish(entries)
 }
 
 /// Linear combiner. Within each sub-list, normalise scores to [0,1]
 /// via min-max (constant-score lists collapse to all-zero), then sum
 /// weight × normalised across lists. Cheaper than RRF; sensitive to
-/// score outliers.
-fn fuse_linear(sub_results: &[(Vec<Hit>, f32)]) -> Vec<Hit> {
-    let mut accum: HashMap<String, (f32, Hit)> = HashMap::new();
+/// score outliers. Output is in THE FUSED ORDER (#940) — a constant-score
+/// leg contributes 0.0 to every document it returns, so whole lists tie
+/// here, not just pairs.
+fn fuse_linear(sub_results: &[(Vec<Hit>, f32)], seq_no_of: &dyn Fn(&str) -> u64) -> Vec<Hit> {
+    let mut entries: Vec<FusedEntry> = Vec::new();
+    let mut slot_by_id: HashMap<String, usize> = HashMap::new();
     for (hits, weight) in sub_results {
         // Min-max normalise within this sub-list.
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -37173,34 +37440,10 @@ fn fuse_linear(sub_results: &[(Vec<Hit>, f32)]) -> Vec<Hit> {
                 0.0
             };
             let contrib = weight * norm;
-            match accum.get_mut(&h.id) {
-                Some(existing) => {
-                    existing.0 += contrib;
-                    if existing.1.source.is_null() && !h.source.is_null() {
-                        existing.1.source = h.source.clone();
-                    }
-                }
-                None => {
-                    let mut hit = h.clone();
-                    hit.score = 0.0;
-                    accum.insert(h.id.clone(), (contrib, hit));
-                }
-            }
+            fuse_accumulate(&mut entries, &mut slot_by_id, contrib, h, seq_no_of);
         }
     }
-    let mut combined: Vec<Hit> = accum
-        .into_iter()
-        .map(|(_, (score, mut h))| {
-            h.score = score;
-            h
-        })
-        .collect();
-    combined.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    combined
+    fuse_finish(entries)
 }
 
 /// Detect a semantic query (parser node `QueryNode::SemanticSearch`)
@@ -45209,6 +45452,16 @@ fn warm_segment_at_publish(
         )
     });
     if *NO_WARM {
+        return;
+    }
+    // Issue #948 — publish warming retains ~10-15× the flushed segment's
+    // raw bytes. Doing that while the parent memory breaker is ENGAGED buys
+    // query latency with exactly the memory the process just ran out of,
+    // and the warmer fills the segment-hydration budget with artifacts at
+    // the worst moment (the breaker only rejects; it cannot reclaim what
+    // warming keeps re-adding). Skip when engaged — the next read
+    // re-hydrates on demand, and warming resumes once memory frees up.
+    if crate::governor::global().is_some_and(|g| g.memory_breaker_engaged()) {
         return;
     }
     // 1. Stored slices.
@@ -54426,6 +54679,179 @@ mod pinned_knn_fts_892_tests {
             }),
             Some(vec![("a", 1.0f32), ("b", 1.0f32)])
         );
+    }
+}
+
+/// #940 — the fused order is total, and a function of the leg lists and the
+/// documents' arrival order alone.
+///
+/// These drive `fuse_rrf`/`fuse_linear` directly, so they exercise the
+/// accumulator on every call — the per-index result cache that made repeated
+/// in-process requests look stable in the issue's own runs is not in the way.
+#[cfg(test)]
+mod hybrid_fused_order_tests {
+    use super::*;
+
+    fn hit(id: &str, score: f32) -> Hit {
+        Hit {
+            id: id.to_string(),
+            score,
+            source: serde_json::json!({ "id": id }),
+            seq_no: None,
+            version: None,
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        }
+    }
+
+    fn ids(hits: &[Hit]) -> Vec<&str> {
+        hits.iter().map(|h| h.id.as_str()).collect()
+    }
+
+    /// Arrival order used by every test here: the trailing number of the id,
+    /// scrambled against `_id` order on purpose (`doc-10` arrives before
+    /// `doc-9` but sorts after it as a string) so a test cannot pass by
+    /// tying on `_id` alone.
+    fn arrival(id: &str) -> u64 {
+        id.rsplit('-').next().unwrap().parse().unwrap()
+    }
+
+    /// Two disjoint legs of equal weight: the document at rank r of leg A and
+    /// the one at rank r of leg B both score exactly `1/(60+r)`. Twelve
+    /// structural ties — under the old `HashMap` drain the chance that one
+    /// call returns them all in arrival order is 2^-12, and the chance that
+    /// 64 calls agree with each other is nil.
+    fn disjoint_legs() -> Vec<(Vec<Hit>, f32)> {
+        // Leg A holds the ODD arrivals, leg B the EVEN ones, each already in
+        // rank order. Scores inside a leg are distinct, as a real leg's are.
+        let a: Vec<Hit> = (0..12)
+            .map(|r| hit(&format!("doc-{}", 2 * r + 1), 9.0 - r as f32 * 0.5))
+            .collect();
+        let b: Vec<Hit> = (0..12)
+            .map(|r| hit(&format!("doc-{}", 2 * r), 0.99 - r as f32 * 0.01))
+            .collect();
+        vec![(a, 1.0), (b, 1.0)]
+    }
+
+    #[test]
+    fn rrf_structural_ties_resolve_by_arrival_order_on_every_call() {
+        let legs = disjoint_legs();
+        // Rank r → the even arrival (leg B) precedes the odd one (leg A):
+        // doc-0, doc-1, doc-2, … — NOT the `_id` order, which would put
+        // doc-10 ahead of doc-2.
+        let expected: Vec<String> = (0..24).map(|n| format!("doc-{n}")).collect();
+        for call in 0..64 {
+            let fused = fuse_rrf(&legs, 60, &arrival);
+            assert_eq!(
+                ids(&fused),
+                expected.iter().map(String::as_str).collect::<Vec<_>>(),
+                "call {call}: tied fused scores must come back in arrival order"
+            );
+            // The ties are exact — otherwise this test proves nothing.
+            for pair in fused.chunks(2) {
+                assert_eq!(
+                    pair[0].score.to_bits(),
+                    pair[1].score.to_bits(),
+                    "fixture must produce EXACT ties, got {} vs {}",
+                    pair[0].score,
+                    pair[1].score
+                );
+            }
+        }
+    }
+
+    /// The symmetric pair the issue names: two documents at swapped ranks
+    /// (1,2)/(2,1) both score `1/61 + 1/62`.
+    #[test]
+    fn rrf_swapped_rank_pair_resolves_by_arrival_order() {
+        let legs = vec![
+            (vec![hit("doc-7", 3.0), hit("doc-4", 2.0)], 1.0),
+            (vec![hit("doc-4", 0.9), hit("doc-7", 0.8)], 1.0),
+        ];
+        for _ in 0..64 {
+            let fused = fuse_rrf(&legs, 60, &arrival);
+            assert_eq!(fused[0].score.to_bits(), fused[1].score.to_bits());
+            assert_eq!(ids(&fused), ["doc-4", "doc-7"]);
+        }
+    }
+
+    /// RRF with equal weights is symmetric in its legs, so listing the legs
+    /// in the other order must not change the page. This is the property a
+    /// rank-derived tie-break ("the earlier-listed leg wins") cannot keep.
+    #[test]
+    fn rrf_order_does_not_depend_on_how_the_request_lists_its_legs() {
+        let legs = disjoint_legs();
+        let mut swapped = legs.clone();
+        swapped.reverse();
+        assert_eq!(
+            ids(&fuse_rrf(&legs, 60, &arrival)),
+            ids(&fuse_rrf(&swapped, 60, &arrival))
+        );
+    }
+
+    /// Two documents sharing an arrival key (both unknown to the version map
+    /// → `u64::MAX`) still order — by `_id`.
+    #[test]
+    fn rrf_falls_through_to_id_when_arrival_is_unknown() {
+        let legs = vec![
+            (vec![hit("zeta", 1.0)], 1.0),
+            (vec![hit("alpha", 1.0)], 1.0),
+        ];
+        for _ in 0..64 {
+            let fused = fuse_rrf(&legs, 60, &|_| u64::MAX);
+            assert_eq!(ids(&fused), ["alpha", "zeta"]);
+        }
+    }
+
+    /// `fuse_linear` had the same accumulator and the same score-only sort. A
+    /// constant-score leg normalises to 0.0 for every document it returns, so
+    /// the whole list ties.
+    #[test]
+    fn linear_constant_score_leg_resolves_by_arrival_order_on_every_call() {
+        let constant: Vec<Hit> = [5, 11, 2, 9, 10, 3, 8, 1]
+            .iter()
+            .map(|n| hit(&format!("doc-{n}"), 1.0))
+            .collect();
+        let legs = vec![(constant, 1.0)];
+        for call in 0..64 {
+            let fused = fuse_linear(&legs, &arrival);
+            assert!(fused.iter().all(|h| h.score == 0.0));
+            assert_eq!(
+                ids(&fused),
+                ["doc-1", "doc-2", "doc-3", "doc-5", "doc-8", "doc-9", "doc-10", "doc-11"],
+                "call {call}"
+            );
+        }
+    }
+
+    /// A NaN leg score must neither abort the sort nor float to the top of
+    /// the page (`f32::total_cmp` alone would rank a positive NaN FIRST).
+    #[test]
+    fn linear_nan_score_sorts_last_and_does_not_panic() {
+        let legs = vec![(
+            vec![hit("doc-1", 4.0), hit("doc-2", f32::NAN), hit("doc-3", 1.0)],
+            1.0,
+        )];
+        let fused = fuse_linear(&legs, &arrival);
+        assert_eq!(ids(&fused), ["doc-1", "doc-3", "doc-2"]);
+        assert!(fused[2].score.is_nan());
+    }
+
+    /// Fusion still fuses: a document both legs rank highly beats one that
+    /// only one leg found, and duplicates collapse to one hit.
+    #[test]
+    fn rrf_still_ranks_by_fused_score_first() {
+        let legs = vec![
+            (vec![hit("doc-9", 3.0), hit("doc-1", 2.0)], 1.0),
+            (vec![hit("doc-9", 0.9), hit("doc-2", 0.8)], 1.0),
+        ];
+        let fused = fuse_rrf(&legs, 60, &arrival);
+        assert_eq!(ids(&fused), ["doc-9", "doc-1", "doc-2"]);
+        assert!(fused[0].score > fused[1].score);
+        assert_eq!(fused[1].score.to_bits(), fused[2].score.to_bits());
     }
 }
 

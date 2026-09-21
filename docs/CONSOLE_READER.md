@@ -138,8 +138,11 @@ extracted text, not attachment bytes.
 
 ### The graph panel
 
-The panel is a `GET /_graph/{brain}/ego?node=<id>&hops=1&direction=both` call
-([SECOND_BRAIN.md](./SECOND_BRAIN.md#get-_graphbrainego)). Neighbours are
+The panel is a `GET /_xerj-console/api/v1/graph/{brain}/ego?node=<id>&hops=1&direction=both`
+call through the console's own session-authorized graph read path
+(`xerj-console-api/src/graph.rs`, same `xerj-second-brain/1` contract as the
+data plane's `/_graph/{brain}/ego` in
+[SECOND_BRAIN.md](./SECOND_BRAIN.md#get-_graphbrainego)). Neighbours are
 grouped by edge type, each one a link that opens in the same Reader.
 
 autoindex's file-level detectors (`same_dir`, `mdlink`, `pathcite`, `href`)
@@ -154,16 +157,28 @@ The panel states, in words, which of these is true: no brain for this index, a
 brain with no links for this record, links clipped by the limit, links to ids
 with no document behind them, or a refusal.
 
-**On an auth-enabled engine (the default) the graph panel is refused for a
-signed-in operator.** The console holds a passkey session, not an engine API
-key, and the console's search proxy deliberately cannot read the reserved
-`.xerj-memory-*` namespace
-([SECURITY_MODEL.md](./SECURITY_MODEL.md)). Search, records and attachments go
-through the session-authenticated proxy and work; the graph panel says "the
-graph API refused this console session (HTTP 401)" rather than claiming there
-are no links. On `--insecure` it works. A guest's graph panel works on an
-auth-enabled engine, because a guest *has* a key (below). Tracked as
-[#936](https://github.com/xerj-org/xerj/issues/936).
+**On an auth-enabled engine (the default) the graph panel works for the
+operator tier.** The console holds a passkey session, not an engine API key,
+so the panel cannot read `/_graph/*` (Authorization-header credential) and the
+generic search proxy still deliberately refuses the reserved `.xerj-memory-*`
+namespace ([SECURITY_MODEL.md](./SECURITY_MODEL.md)) — both decisions stand.
+Instead the console exposes brain-scoped, role-gated read endpoints of its own
+(`/_xerj-console/api/v1/graph/brains`, `/{brain}/ego`, `/{brain}/overview`,
+`/{brain}/edges/_search`, `/{brain}/nodes/_search`; issue
+[#936](https://github.com/xerj-org/xerj/issues/936)):
+
+- Console roles `owner` and `admin` may read brains; `editor` and `viewer`
+  may not (the operator tier — the same roles that may issue invites; brains
+  are node-local until a tenant model exists).
+- A role-refused read and a nonexistent brain are **indistinguishable**
+  (byte-identical 404s), so a session that may not read brains cannot
+  enumerate them; the reader then says "no brain for this index".
+- The nodes/edges searches are pinned server-side to the brain's own meta-doc
+  indices — the endpoints cannot be turned into a general search proxy, and
+  the generic proxy's refusal of the reserved namespace is unchanged.
+
+A guest's graph panel works on an auth-enabled engine, because a guest *has* a
+key (below).
 
 ### Discover
 
@@ -304,8 +319,11 @@ skip (CI does).
 - The share link itself — minting, passcodes, claim limits, revocation — is a
   separate surface; this page covers only what the console does with the
   record it is handed.
-- The operator's graph panel needs `--insecure` today (above,
-  [#936](https://github.com/xerj-org/xerj/issues/936)).
+- The Second Brain dashboard's "searches per index" tile reads
+  `/v1/metrics`, which stays a data-plane, engine-key surface by decision;
+  for a signed-in operator the tile shows the refusal honestly rather than an
+  invented number. Everything else on that dashboard reads through the
+  console's graph endpoints (above).
 - The console's passkey sign-in only works when the console is reached at
   `http://localhost:9200`: the WebAuthn relying-party origin is fixed
   (`xerj-console-api/src/state.rs`, `RpConfig::default`), so a node on another

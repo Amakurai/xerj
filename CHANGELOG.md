@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Second Brain dashboard and the reader's graph panel are no longer 401
+  for a signed-in operator on an auth-enabled engine (the default).** The
+  console holds a passkey session, not an engine API key, so the SPA's direct
+  `/_graph/{brain}/*`, `_cat/indices/.xerj-memory-*` and reserved-namespace
+  `_search` reads were refused — while a share-link guest, who holds a key,
+  could read the graph. The console now serves its own brain-scoped,
+  session-authorized graph read path
+  (`GET /_xerj-console/api/v1/graph/brains`, `/{brain}/ego`, `/{brain}/overview`,
+  `POST /{brain}/edges/_search`, `POST /{brain}/nodes/_search`) in the same
+  `xerj-second-brain/1` contract as the data plane: console roles `owner` and
+  `admin` may read brains, a role-refused read and a nonexistent brain are
+  byte-identical 404s (no existence oracle), and the nodes/edges searches are
+  pinned server-side to the brain's own meta-doc indices, so the endpoints
+  cannot become a general search proxy and the generic data-sources proxy
+  still refuses the reserved namespace. `/v1/metrics` (the dashboard's
+  searches-per-index tile) stays key-only by decision; the tile shows the
+  refusal honestly. [#936](https://github.com/xerj-org/xerj/issues/936)
+
 ## [1.0.0-rc.75] - 2026-09-20
 
 ### Added
@@ -417,6 +437,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (~410 ms p50 on 5,183 documents, forward pass ~14 ms), and
   [#940](https://github.com/xerj-org/xerj/issues/940) tied RRF scores change
   order across a restart. All four stay open; nothing is fixed by this entry.
+
+### Fixed
+
+- **A `hybrid` query returns the same page on every run and after a
+  restart** ([#940](https://github.com/xerj-org/xerj/issues/940)).
+  `fusion: "rrf"` and `fusion: "linear"` drained their accumulator from a
+  hash map into a score-only sort, so documents with an identical fused
+  score came back in hash-iteration order, which is seeded per process.
+  Under RRF such ties are structural (one leg's rank *r* and the other
+  leg's rank *r* score the same), and on BEIR SciFact 21 of 40 queries
+  changed their top 10 after a restart on unchanged data. Fused results now
+  use the order every score-ranked page uses since #270: score descending,
+  then arrival (`_seq_no`), then `_id`; a NaN fused score sorts last
+  instead of making the sort panic. Measured on the fixed build, lexical
+  embedder: the 300 SciFact test queries (1,509 tied adjacent pairs in
+  their top 100) returned identical result lists across a flush and two
+  restarts. The hybrid recipe's worked example was also re-run and its
+  numbers reconciled with the current engine.
 
 ## [1.0.0-rc.74] - 2026-09-08
 

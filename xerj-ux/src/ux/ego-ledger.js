@@ -935,9 +935,9 @@ const BrainErrorNote = ({ brain, reason }) => `
     <button type="button" class="text-btn" data-sb-retry>RETRY</button>
   </div>`;
 
-/** A 401/403 from the brain list is a REFUSAL, not an outage: on an
- *  auth-enabled engine a console session cannot read `.xerj-memory-*`
- *  (issue #936). Say that, and point at the views that do work. */
+/** A 401/403 from the console graph read path is a REFUSAL, not an
+ *  outage: no session, or a role that may not read brains (issue #936).
+ *  Say that, and point at the views that do work. */
 export const isRefusal = (error) => /HTTP 40[13]\b/.test(String(error || ''));
 
 /** A brand-new brain: the ONE command that fills it, copyable. */
@@ -947,10 +947,10 @@ export const EmptyBrainNote = ({ brain, connected, error }) => {
   <div class="sb-empty">
     <div class="sb-ftitle">THE GRAPH API REFUSED THIS CONSOLE SESSION</div>
     <div class="mono faint" style="margin:var(--sp-1) 0;">${esc(String(error).slice(0, 120))}</div>
-    <p class="sb-ftext">On an auth-enabled engine the brain views need an engine API key, and a
-    passkey session is not one (issue #936). Nothing here is a guess, so nothing is shown.
-    What was indexed is on CORPUS, and any record opens in the READER — those go through the
-    session and work. On a node started with <span class="mono">--insecure</span> this page works.</p>
+    <p class="sb-ftext">The brain views read the graph through the console session, and this
+    session was refused — there is none, or its role may not read brains (owner and admin
+    may; issue #936). Nothing here is a guess, so nothing is shown. What was indexed is on
+    CORPUS, and any record opens in the READER — those go through the session and work.</p>
     <a class="text-btn" href="#/corpus">OPEN CORPUS</a>
   </div>`;
   }

@@ -19,6 +19,58 @@ use crate::cluster_state::{
 use crate::index::{Index, IndexStats};
 use crate::{EngineError, Result};
 
+// ── Memory-pressure drain plumbing (issue #948) ─────────────────────────────
+//
+// The parent RSS breaker used to only REJECT writes (429). Under a workload
+// whose caches hold gigabytes of re-hydratable state and whose memtable
+// holds raw write payloads, rejection frees nothing: the breaker stays
+// engaged, the client retries forever, and the run never finishes — exactly
+// the #948 mailbox ingest (16 GiB cap, 26.5 GiB demand, 118-147 s engaged
+// stretches, 3-4 s releases). The sampler now also requests a DRAIN: flush
+// every index, release rebuildable caches, purge allocator pages.
+
+/// Minimum spacing between automatic drains while the breaker stays engaged.
+/// The engage edge always fires immediately; repeats are rate-limited so a
+/// long pinned stretch drains progressively (caches refill under continued
+/// reads) without the drain worker competing with ingest for every tick.
+const MEMORY_DRAIN_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Bounded request channel from the sampler thread to the drain worker.
+/// Capacity 1 + try_send ⇒ requests coalesce: one arrives mid-drain is
+/// dropped, and the next sampler tick re-requests if still engaged.
+static MEMORY_DRAIN_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>> =
+    std::sync::OnceLock::new();
+
+/// Allocator page purge hook, installed by the binary that owns the global
+/// allocator (xerj-server installs a jemalloc epoch+purge closure). Freeing
+/// heap is not enough: the RSS breaker keys on resident pages, and jemalloc
+/// keeps freed pages resident until they are purged back to the OS. The
+/// engine crate itself is allocator-agnostic, so the default is a no-op.
+type AllocatorPurgeHook = Arc<dyn Fn() + Send + Sync + 'static>;
+static ALLOCATOR_PURGE_HOOK: std::sync::RwLock<Option<AllocatorPurgeHook>> =
+    std::sync::RwLock::new(None);
+
+/// Install the allocator page-purge hook (see [`ALLOCATOR_PURGE_HOOK`]).
+/// Called once by the server binary during boot, before any drain can fire.
+pub fn set_allocator_purge_hook(hook: AllocatorPurgeHook) {
+    let mut slot = ALLOCATOR_PURGE_HOOK
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    *slot = Some(hook);
+}
+
+/// Run the installed allocator purge, if any. Never panics: a broken hook
+/// must not take the drain (or the process) down — purging is an
+/// optimisation for RSS return, not a correctness step.
+fn purge_allocator_pages() {
+    let hook = ALLOCATOR_PURGE_HOOK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(hook) = hook.as_ref() {
+        hook();
+    }
+}
+
 /// Privacy-safe identity of the embedding execution contract exposed to
 /// remote ingestion clients. The digest is opaque: model paths, provider URLs,
 /// credentials, and model names never cross the API boundary.
@@ -3813,6 +3865,44 @@ impl Engine {
             .sum()
     }
 
+    /// Memory-pressure drain (issue #948): flush every loaded index's
+    /// memtable, then release its rebuildable caches via
+    /// [`crate::index::Index::release_memory`], then hand the freed pages
+    /// back to the OS through the allocator-purge hook (installed by the
+    /// server binary; a no-op elsewhere).
+    ///
+    /// Why the flush comes first: the memtable holds not-yet-published
+    /// writes that no cache release can reclaim, and on the raw-bytes bulk
+    /// path its live heap is the payload itself — the exact bytes a pinned
+    /// breaker needs gone. Caches only ever mirror durable data, so this is
+    /// the same ordering [`Self::close_index`] uses (#463), applied to every
+    /// index without closing anything: reads re-hydrate from disk.
+    ///
+    /// Best-effort by design: an index whose flush fails is still
+    /// cache-released and never aborts the drain — a drain must not become a
+    /// new way to wedge. Returns the number of indexes drained; closed
+    /// indexes are skipped (their caches were already released at close).
+    pub async fn drain_rebuildable_memory(&self) -> usize {
+        let mut drained = 0usize;
+        for entry in self.indices.iter() {
+            let idx = Arc::clone(entry.value());
+            let name = entry.key();
+            if self.closed_indices.contains_key(name.as_str()) {
+                continue;
+            }
+            if idx.flush().await.is_err() {
+                tracing::warn!(
+                    index = name.as_str(),
+                    "memory-pressure drain: flush failed, releasing caches anyway"
+                );
+            }
+            idx.release_memory();
+            drained += 1;
+        }
+        purge_allocator_pages();
+        drained
+    }
+
     /// Spawn the background resource sampler (item 1/3): every
     /// [`crate::governor::SAMPLE_INTERVAL_MS`] it refreshes the governor's
     /// summed-memtable / RSS / disk-usage atomics, which drive the hot-path
@@ -3835,6 +3925,42 @@ impl Engine {
         }
         let period = std::time::Duration::from_millis(crate::governor::SAMPLE_INTERVAL_MS);
 
+        // ── Thread C: memory-pressure drain worker (#948) ─────────────
+        // Thread A (below) must touch no engine lock, so it cannot run the
+        // drain itself: it only requests one over this bounded channel. The
+        // worker owns a single-threaded tokio runtime so the drain's async
+        // flushes work even though this thread lives outside the server
+        // runtime; a capacity-1 channel with try_send makes coalescing
+        // automatic — requests that arrive mid-drain are dropped, and the
+        // next sampler tick re-requests if the breaker is still engaged.
+        // Requires a tokio handle at spawn time so flush internals that
+        // spawn detached work (merge handoff) land on the REAL runtime
+        // instead of dying with this thread's runtime.
+        let drain_handle = tokio::runtime::Handle::try_current().ok();
+        let (drain_tx, drain_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let _ = MEMORY_DRAIN_TX.set(drain_tx);
+        let weak_c = Arc::downgrade(self);
+        let _ = std::thread::Builder::new()
+            .name("xerj-mem-drain".to_string())
+            .spawn(move || {
+                let Some(handle) = drain_handle else {
+                    // Spawned outside a runtime (unit tests): the drain
+                    // method stays directly callable; only the sampler's
+                    // automatic wiring is inert.
+                    return;
+                };
+                while let Ok(()) = drain_rx.recv() {
+                    let Some(engine) = weak_c.upgrade() else {
+                        return; // engine dropped
+                    };
+                    let drained = handle.block_on(engine.drain_rebuildable_memory());
+                    tracing::info!(
+                        indexes = drained,
+                        "memory breaker engaged — drained rebuildable state (flush + cache release + purge)"
+                    );
+                }
+            });
+
         // ── Thread A: memory + disk ──────────────────────────────────────
         // Touches NO engine lock — just `/proc/self/statm` + `statvfs`. Kept
         // on its own thread so a memtable-sum stall (below) can NEVER delay
@@ -3853,6 +3979,10 @@ impl Engine {
                     period_ms = crate::governor::SAMPLE_INTERVAL_MS,
                     "memory/disk sampler thread started (parent circuit breaker)"
                 );
+                // #948 drain bookkeeping: None while the breaker is
+                // disengaged (so the next engage edge fires immediately),
+                // Some(last-drain) while engaged (rate-limited repeats).
+                let mut last_drain_at: Option<std::time::Instant> = None;
                 loop {
                     std::thread::sleep(period);
                     if weak_a.strong_count() == 0 {
@@ -3866,6 +3996,28 @@ impl Engine {
                     let (disk_pct, disk_avail) =
                         crate::governor::disk_used_pct_and_avail(&data_dir);
                     governor.refresh_memory_disk(rss, disk_pct, disk_avail);
+
+                    // Issue #948 — a breaker that only rejects never lets a
+                    // memory-pinned workload finish: caches hold gigabytes
+                    // of re-hydratable state and the memtable holds raw
+                    // write payloads, and 429s free none of it. Request a
+                    // drain on the engage edge and at most once per window
+                    // while engaged. try_send never blocks, so Thread A's
+                    // no-lock/no-block contract above still holds.
+                    if governor.memory_breaker_engaged() {
+                        let fire = match last_drain_at {
+                            None => true,
+                            Some(at) => at.elapsed() >= MEMORY_DRAIN_MIN_INTERVAL,
+                        };
+                        if fire {
+                            last_drain_at = Some(std::time::Instant::now());
+                            if let Some(tx) = MEMORY_DRAIN_TX.get() {
+                                let _ = tx.try_send(());
+                            }
+                        }
+                    } else {
+                        last_drain_at = None;
+                    }
 
                     // Runtime disk flood-stage override, matching ES's
                     // `PUT _cluster/settings` unblock without a restart. A

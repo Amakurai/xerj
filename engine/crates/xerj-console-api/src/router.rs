@@ -30,7 +30,9 @@ use axum::{
     Router,
 };
 
-use crate::{auth, cluster, dashboards, data_sources, prefs, spa, state::ConsoleState, views};
+use crate::{
+    auth, cluster, dashboards, data_sources, graph, prefs, spa, state::ConsoleState, views,
+};
 
 /// Build the full Xerj Console router. Mount at the root of an axum Router
 /// (it owns the `/_xerj-console/*` prefix internally):
@@ -144,6 +146,24 @@ pub fn xerj_console_router(state: ConsoleState) -> Router {
             "/_xerj-console/api/v1/data-sources/connections/:id/indices/:name/search",
             post(data_sources::search),
         )
+        // ── API: Second-Brain graph reads (session-authorized, issue #936) ─
+        // The data plane's /_graph/* routes stay credential-only; these are
+        // the console's own role-gated read paths over the same engine
+        // traversals. See src/graph.rs for the authorization rule.
+        .route("/_xerj-console/api/v1/graph/brains", get(graph::brains))
+        .route("/_xerj-console/api/v1/graph/:brain/ego", get(graph::ego))
+        .route(
+            "/_xerj-console/api/v1/graph/:brain/overview",
+            get(graph::overview),
+        )
+        .route(
+            "/_xerj-console/api/v1/graph/:brain/edges/_search",
+            post(graph::edges_search),
+        )
+        .route(
+            "/_xerj-console/api/v1/graph/:brain/nodes/_search",
+            post(graph::nodes_search),
+        )
         .with_state(state)
 }
 
@@ -178,5 +198,10 @@ pub fn known_routes() -> &'static [&'static str] {
         "/_xerj-console/api/v1/data-sources/connections/:id/indices",
         "/_xerj-console/api/v1/data-sources/connections/:id/indices/:name/fields",
         "/_xerj-console/api/v1/data-sources/connections/:id/indices/:name/search",
+        "/_xerj-console/api/v1/graph/brains",
+        "/_xerj-console/api/v1/graph/:brain/ego",
+        "/_xerj-console/api/v1/graph/:brain/overview",
+        "/_xerj-console/api/v1/graph/:brain/edges/_search",
+        "/_xerj-console/api/v1/graph/:brain/nodes/_search",
     ]
 }

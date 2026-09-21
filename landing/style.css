@@ -2738,11 +2738,13 @@ html[data-theme='night'] .prompt-stage::before { opacity: 0.5; }
   border-color: var(--z-ink);
   color: var(--z-bg);
 }
-/* hero benchmark strip — sits directly under the prompt card. Figures must
-   stay verbatim with /benchmarks/decisions (hand-duplicated constants are
-   what landing-constants-guard.sh exists for; these two pages must not drift).
-   --z-neg is page-local to benchmarks/decisions.html, so the pre-fix number
-   repeats its values here rather than referencing a var that is unset on /. */
+/* hero benchmark strip — UNUSED since 2026-09-21: the hero carries the
+   .jev-banner card (page-local CSS in index.html), which states results
+   only; the broken-then-fixed pilot narrative lives in the post. Figures
+   there must stay verbatim with /blog/does-xerj-beat-jev (hand-duplicated
+   constants are what landing-constants-guard.sh exists for; those two
+   pages must not drift). Rules kept rather than deleted so this stays a
+   comment-only change — no cache-buster bump for the shared sheet. */
 .hero-bench {
   max-width: 880px;
   margin: 0 auto;
