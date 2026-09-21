@@ -15315,21 +15315,20 @@ impl Index {
         // against stored vectors. Filters and aggregations remain exact scans
         // so approximation cannot change filter/analytics membership.
         let result = if filter.is_none() && request.aggs.is_none() {
-            match self
-                .run_knn_hnsw(
-                    request,
-                    deadline,
-                    &knn_field,
-                    &query_vec,
-                    k,
-                    None,
-                    &similarity,
-                )
-                .await
+            match Box::pin(self.run_knn_hnsw(
+                request,
+                deadline,
+                &knn_field,
+                &query_vec,
+                k,
+                None,
+                &similarity,
+            ))
+            .await
             {
                 Some(result) => Ok(result),
                 None => {
-                    self.run_knn_brute_force_with_deadline(
+                    Box::pin(self.run_knn_brute_force_with_deadline(
                         request,
                         deadline,
                         &knn_field,
@@ -15339,12 +15338,12 @@ impl Index {
                         &similarity,
                         None,
                         None,
-                    )
+                    ))
                     .await
                 }
             }
         } else {
-            self.run_knn_brute_force_with_deadline(
+            Box::pin(self.run_knn_brute_force_with_deadline(
                 request,
                 deadline,
                 &knn_field,
@@ -15354,7 +15353,7 @@ impl Index {
                 &similarity,
                 None,
                 None,
-            )
+            ))
             .await
         };
         if trace_phases {
@@ -16060,7 +16059,7 @@ impl Index {
                 && min_similarity.is_none()
                 && request.aggs.is_none();
             let hnsw = if plain {
-                self.run_knn_hnsw(
+                Box::pin(self.run_knn_hnsw(
                     &sub_request,
                     deadline,
                     field,
@@ -16068,7 +16067,7 @@ impl Index {
                     *k,
                     *num_candidates,
                     &similarity,
-                )
+                ))
                 .await
             } else {
                 None
@@ -16076,7 +16075,7 @@ impl Index {
             let leg = match hnsw {
                 Some(result) => result,
                 None => {
-                    self.run_knn_brute_force_with_deadline(
+                    Box::pin(self.run_knn_brute_force_with_deadline(
                         &sub_request,
                         deadline,
                         field,
@@ -16086,7 +16085,7 @@ impl Index {
                         &similarity,
                         *boost,
                         *min_similarity,
-                    )
+                    ))
                     .await?
                 }
             };
@@ -18174,7 +18173,7 @@ impl Index {
                 && min_similarity.is_none()
                 && request.aggs.is_none();
             let hnsw = if plain {
-                self.run_knn_hnsw(
+                Box::pin(self.run_knn_hnsw(
                     request,
                     search_deadline,
                     &field,
@@ -18182,7 +18181,7 @@ impl Index {
                     k,
                     num_candidates,
                     &similarity,
-                )
+                ))
                 .await
             } else {
                 None
@@ -18190,7 +18189,7 @@ impl Index {
             let result = match hnsw {
                 Some(result) => result,
                 None => {
-                    self.run_knn_brute_force_with_deadline(
+                    Box::pin(self.run_knn_brute_force_with_deadline(
                         request,
                         search_deadline,
                         &field,
@@ -18200,7 +18199,7 @@ impl Index {
                         &similarity,
                         boost,
                         min_similarity,
-                    )
+                    ))
                     .await?
                 }
             };
@@ -18220,9 +18219,8 @@ impl Index {
         // — matching ES 8.13 multi-kNN semantics (live-verified 2026-07-12).
         if let Some(clauses) = peel_multi_knn_query(query) {
             let fields: Vec<String> = clauses.iter().map(|c| c.field.clone()).collect();
-            let result = self
-                .run_multi_knn_brute_force(request, search_deadline, clauses)
-                .await?;
+            let result =
+                Box::pin(self.run_multi_knn_brute_force(request, search_deadline, clauses)).await?;
             // #542: each knn clause validates its own field. On an empty,
             // non-timed-out union, reject the first clause naming an
             // unanswerable field — the same execution-truth check the single-knn
