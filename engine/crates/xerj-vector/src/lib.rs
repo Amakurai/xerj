@@ -12,6 +12,7 @@ pub mod distance;
 pub mod hnsw;
 pub mod quantizer;
 pub mod search;
+pub mod sq8_codes;
 
 pub use distance::{compute_distance, cosine, dot_product, l2_squared, DistanceMetric};
 pub use hnsw::{HnswIndex, HnswParams};
@@ -19,5 +20,6 @@ pub use quantizer::{
     NoneQuantizer, QuantizedData, QuantizedVectors, Quantizer, Scalar8Quantizer, Sq8Params,
 };
 pub use search::{SearchResult, VectorSearcher};
+pub use sq8_codes::Sq8CodeStore;
 
 pub use xerj_common::Result;
