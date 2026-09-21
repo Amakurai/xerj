@@ -205,6 +205,10 @@ fn help_text(feedback: bool) -> String {
                                                   flagship path for most agents (see xerj\n\
                                                   autoindex --help)\n\
              xerj autoindex map                  print the discovered data map\n\
+             xerj code <corpus> \"<query>\"        reference-coding retrieval over a corpus\n\
+                                                  of peer projects (see xerj code --help)\n\
+             xerj corpus add|index|list          the corpus lifecycle behind `xerj code`\n\
+                                                  (see xerj corpus --help)\n\
              xerj index [OPTIONS]                direct NDJSON → engine ingest (see xerj\n\
                                                   index --help)\n\
              xerj brain <folder>                 index + browse in one command (see xerj\n\
@@ -281,16 +285,20 @@ fn help_text(feedback: bool) -> String {
                                              query client, no wrapper scripts (see xerj search --help)\n\
              xerj def        \"<symbol>\"       go-to-definition: where is this symbol defined, and\n\
                                              what is its signature (see xerj def --help)\n\
+             xerj code       <corpus> \"<q>\"  reference-coding retrieval: how did peer projects\n\
+                                             solve this (see xerj code --help)\n\
+             xerj corpus     add|index|list   clone + index + list the reference corpora that\n\
+                                             `xerj code` searches (see xerj corpus --help)\n\
              xerj init                       wire XERJ into the coding agents in this project:\n\
                                              MCP + skill files, one command (see xerj init --help)\n\
              xerj gain                       what this node did for you, counted from the audit\n\
                                              log — searches, hit rate, latency (xerj gain --help)\n\
              xerj brain      <folder>        one command: index a folder into a running, browsable\n\
                                              second brain in your browser (see xerj brain --help)\n\
-             xerj mcp        [opts]          Model Context Protocol stdio server: exposes 10 tools\n\
-                                             (search, semantic, vector, hybrid, memory, second-brain)\n\
-                                             to any MCP client. Proxies to a node you already started\n\
-                                             — set XERJ_URL or --url (see xerj mcp --help)\n\
+             xerj mcp        [opts]          Model Context Protocol stdio server: exposes 11 tools\n\
+                                             (search, semantic, vector, hybrid, memory, second-brain,\n\
+                                             code-search) to any MCP client. Proxies to a node you\n\
+                                             already started — set XERJ_URL or --url (see xerj mcp --help)\n\
              xerj feedback   [opts]          draft the agent field report XERJ asks every agent to\n\
                                              file, auto-filling version/OS/what-was-indexed; --open-pr\n\
                                              files it, --dry-run just prints (see xerj feedback --help)\n\
@@ -2001,6 +2009,26 @@ async fn async_main() -> Result<()> {
         // git/gh; fully synchronous internally — run it off the async runtime
         // like `autoindex` and `brain`.
         let code = tokio::task::spawn_blocking(xerj_autoindex::feedback::run_cli)
+            .await
+            .unwrap_or(1);
+        std::process::exit(code);
+    }
+    if matches!(argv1.as_deref(), Some("code")) {
+        // Reference-coding retrieval (issue #977, previously xc.py): blocking
+        // ES-compat client + local state ledger, synchronous — off the
+        // runtime like `def`.
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let code = tokio::task::spawn_blocking(move || xerj_autoindex::xc::run_code_cli(&args))
+            .await
+            .unwrap_or(1);
+        std::process::exit(code);
+    }
+    if matches!(argv1.as_deref(), Some("corpus")) {
+        // Reference-coding corpus lifecycle (issue #977, previously
+        // xc-corpus.sh/xc-index.sh): git + autoindex + ES-compat client, all
+        // synchronous — off the runtime like `autoindex`.
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let code = tokio::task::spawn_blocking(move || xerj_autoindex::xc::run_corpus_cli(&args))
             .await
             .unwrap_or(1);
         std::process::exit(code);

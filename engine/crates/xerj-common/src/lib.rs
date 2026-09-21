@@ -25,6 +25,8 @@
 //! - [`resource`] — The machine-resource policy: cores, memory budget, thread priority
 //! - [`localauth`] — Loopback guard + `<data_dir>/admin.key` discovery for
 //!   same-machine CLI/MCP commands (`xerj mcp`, `xerj autoindex`, `xerj init`)
+//! - [`xccode`]  — the reference-coding semantics shared by `xerj code`,
+//!   `xerj corpus`, and the `xerj_code_search` MCP tool (issue #977)
 
 pub mod config;
 pub mod error;
@@ -37,6 +39,7 @@ pub mod net;
 pub mod resource;
 pub mod schema;
 pub mod types;
+pub mod xccode;
 
 // Convenience re-exports at the crate root
 pub use config::Config;

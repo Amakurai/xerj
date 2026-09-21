@@ -4811,8 +4811,8 @@ fn a_refusal_is_on_the_progress_stream_and_the_terminal_line() {
 /// indexed, and the run must say exactly that — a committed generation with no
 /// documents, exit 3, every file accounted for as refused — rather than panic
 /// on an empty plan or, worse, report an empty corpus as a clean success. A
-/// wrapper that verifies with `_count > 0` (xc-index.sh) then keeps its old
-/// index, which is the right outcome.
+/// wrapper that verifies with `_count > 0` (`xerj corpus index`) then keeps
+/// its old index, which is the right outcome.
 #[test]
 fn refusing_every_dataset_commits_nothing_searchable_and_is_not_a_success() {
     let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());

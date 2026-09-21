@@ -78,50 +78,47 @@ jobs:
   reference-coding:
     name: Reference-coding toolkit
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Shell syntax
+      # Issue #977: the xc.py/xc-index.sh/xc-corpus.sh wrapper scripts are now
+      # `xerj code` + `xerj corpus` + the xerj_code_search MCP tool, so the
+      # toolkit's contracts are gated where the code lives — scoped cargo
+      # tests, same profile as every other engine job.
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cached cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      # The contracts the old script tests pinned, now in Rust:
+      #   xerj-common::xccode        - staleness refusal, RESTRICTED licence
+      #                                warning, exit triangle, hybrid shape,
+      #                                passage selection, state ledger
+      #   xerj-autoindex::xc         - corpus lifecycle, path gate, usage
+      #   xerj-mcp                   - tool schema presence + isError mapping
+      #   xerj-server                - subcommand dispatch + help text
+      - name: Toolkit tests
+        working-directory: engine
         run: |
-          for f in tools/xerj-code/scripts/*.sh tools/xerj-code/tests/*.sh; do
-            bash -n "$f"
-          done
-          python3 -m py_compile tools/xerj-code/scripts/xc.py \
-                                tools/xerj-code/tests/validate_manifest.py \
-                                tools/xerj-code/tests/test_xc_index_fresh.py \
-                                tools/xerj-code/tests/test_state_ledger.py
+          cargo test --profile ci-test -p xerj-common -p xerj-autoindex -p xerj-mcp -p xerj-server \
+            xccode xc_ published_schema help_text
 
       # The corpus manifests are the shareable artifact (issue #319): if they
       # cannot rebuild a corpus, publishing them is worse than not shipping
-      # them. Offline — the fixtures are local git repos served over file://.
-      - name: Corpus manifest round-trip
-        run: tools/xerj-code/tests/test_xc_corpus.sh
-
-      - name: Matching passage window regressions
-        run: python3 tools/xerj-code/tests/test_passage_window.py
-
-      - name: Retrieval output and state-ledger regressions
-        run: python3 tools/xerj-code/tests/test_state_ledger.py
-
+      # them. The same untrusted-input gate `xerj corpus add --from` enforces
+      # now runs as a Rust test (xccode::manifest::hub_manifests_pass_the_untrusted_input_gate).
       - name: Vetted hub manifests validate
-        run: python3 tools/xerj-code/tests/validate_manifest.py --hub tools/xerj-code/hub/*.json
+        working-directory: engine
+        run: cargo test --profile ci-test -p xerj-common xccode::manifest
 
-      # #930: `xc-index.sh <corpus> --fresh` failed on every corpus that had been
-      # indexed before, and nothing ran the script, so nothing noticed. Offline:
-      # a fake node and a fake `xerj` that refuses exactly what the real one
-      # refuses. Pins build-verify-swap: the old index is never deleted before
-      # the replacement has a count > 0, and never by wildcard.
-      - name: xc-index --fresh builds beside, verifies, then swaps
-        run: python3 tools/xerj-code/tests/test_xc_index_fresh.py
-
-      # xc.py's prefix resolution changed with #930 (it queries the verified
-      # build, not the whole namespace), so its ledger guard is gated too.
-      - name: xc.py state-ledger guard
-        run: python3 tools/xerj-code/tests/test_state_ledger.py
-
-      - name: Hybrid retrieval transport fallback
-        run: python3 tools/xerj-code/tests/test_hybrid_fallback.py
+      # The published MCP schema must match the served tools byte-for-byte;
+      # regenerating it is scripts/mcp-schema-check.sh --write.
+      - name: Published MCP schema drift
+        run: ./scripts/mcp-schema-check.sh
 
   # #489: this script existed, worked, and had been failing locally for three
   # releases — the version footer, headline and narrative on landing/index.html

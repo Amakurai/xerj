@@ -174,6 +174,11 @@ pins the exact commits these runs used) → `xc-index.sh` → `xc.py`. It needs 
 `xerj` binary, `git` and `python3`. To point it at **your own** code, index your
 repo instead of a corpus — that is the real use case.
 
+*(As of [#977](https://github.com/xerj-org/xerj/issues/977) these are binary
+subcommands — `xerj corpus add --from`, `xerj corpus index`, `xerj code` — and
+no longer need `python3`; the commands above are what was actually run at the
+time of this study.)*
+
 The **measurement harness** — the three-arm runner, the purpose-built reference
 libraries, the hidden-test task specs — is **not** in this repository; only its
 outputs are (`data/results-*.json`, `generated/`). What it does, if you want to

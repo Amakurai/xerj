@@ -44,6 +44,7 @@ mod sync;
 mod sync_executor;
 pub mod walk;
 pub mod watch;
+pub mod xc;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -1544,6 +1545,62 @@ pub fn run_cli() -> i32 {
         Ok(code) => code,
         Err(e) => {
             let route = route_cli_error(&e, json_output);
+            if let Some(stdout) = route.stdout {
+                println!("{stdout}");
+            }
+            if let Some(stderr) = route.stderr {
+                eprintln!("{stderr}");
+            }
+            route.exit_code
+        }
+    }
+}
+
+/// In-process autoindex for the `xerj corpus` lifecycle (issue #977): builds
+/// the same argv the wrapper script passed and routes it through the same
+/// parse → run → error-route path as `run_cli`, so there is exactly ONE
+/// autoindex behaviour.
+///
+/// The URL is resolved by the WRAPPER (`--url`/`XERJ_URL`) and passed
+/// explicitly because `autoindex` itself deliberately ignores `XERJ_URL` (a
+/// stale var must not redirect a write — see `cli.rs`). `--fresh` is never
+/// forwarded: the build-verify-swap that replaces it lives in `xc.rs`.
+pub fn run_with_options(
+    dir: &std::path::Path,
+    url: &str,
+    prefix: &str,
+    state_dir: Option<&std::path::Path>,
+    no_graph: bool,
+) -> i32 {
+    let mut args = vec![
+        dir.to_string_lossy().to_string(),
+        "--url".to_string(),
+        url.to_string(),
+        "--prefix".to_string(),
+        prefix.to_string(),
+    ];
+    if no_graph {
+        args.push("--no-graph".to_string());
+    }
+    if let Some(sd) = state_dir {
+        args.push("--state-dir".to_string());
+        args.push(sd.to_string_lossy().to_string());
+    }
+    let cmd = match cli::parse(args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
+    let res = match cmd {
+        Cmd::Index(cfg) => run_index(*cfg),
+        _ => return 2,
+    };
+    match res {
+        Ok(code) => code,
+        Err(e) => {
+            let route = route_cli_error(&e, false);
             if let Some(stdout) = route.stdout {
                 println!("{stdout}");
             }
