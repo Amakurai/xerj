@@ -505,6 +505,7 @@ fn measurement(category: Category) -> Measurement {
         | Category::CacheRowSequences
         | Category::CacheDecodedStored
         | Category::CacheFtsReader
+        | Category::CacheVectorColumn
         | Category::MergeDecoded
         | Category::MergeSurvivor
         | Category::MergeParsed => Measurement::Estimated,
