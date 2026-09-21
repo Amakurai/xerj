@@ -36,6 +36,10 @@ faq:
     a: "Use `linear` when you want one signal to dominate and the score scales are comparable. On our 8 judged queries linear scored 0.4583 against 0.4167 for `rrf`."
   - q: "Does RRF find documents neither list returned?"
     a: "No. Reciprocal Rank Fusion reorders the union of the input lists. On the query `car` both judged synonyms were missing from both lists and stayed missing."
+  - q: "In what order does XERJ return documents with the same fused score?"
+    a: "In arrival order. A tie is broken by the order the documents were indexed, then by `_id`, the same rule every score-ranked page uses. The page is the same on every run and after a restart."
+  - q: "Why did my hybrid results change order after a restart?"
+    a: "Before issue #940 a tied fused score followed hash-map iteration order, which changes from one process to the next. On BEIR SciFact that changed the top 10 of 21 of 40 queries. A tie is now ordered by arrival, so the order no longer changes."
   - q: "Can XERJ learn the fusion weights?"
     a: "No. `fusion: \"learned\"` is rejected with an HTTP 400 at parse time. XERJ offers `rrf` and `linear` only."
 ---
@@ -86,7 +90,11 @@ Two documents that hold mirrored positions receive the same fused score. Our cap
 | `d04` | 1 → 1/61 | 2 → 1/62 | 0.0325225 | 0.032522473 |
 | `d10` | deeper than rank 3 | 3 → 1/63 | 0.0312576 | 0.031257633 |
 
-Both tied documents carry the identical fused score in the response, and XERJ placed `d08` first.
+Both tied documents carry the identical fused score in the response, and this capture placed `d08` first. The capture predates issue #940. At that time a tie followed hash-map iteration order, so the same request could return `d04` first after a restart.
+
+A tie is now ordered by arrival. The fused score comes first, then the order the documents were indexed (`_seq_no`, the Elasticsearch `_doc` order), then `_id`. That is the same rule every score-ranked page in XERJ uses. The page is the same on every run, after a restart, and before or after a flush. Listing the sub-queries in another order does not change an equal-weight result.
+
+Ties are frequent under this rule. A document at rank r in only one list and a document at rank r in only the other list both score `weight / (k + r)`. Over the 300 BEIR SciFact test queries on the lexical default, our run of the fixed build returned 1,509 adjacent pairs with identical fused scores in the top 100. The order of all 300 result lists was identical across a flush and two restarts.
 
 The third row is worth reading closely. The score 0.031257633 for `d10` equals 1/63 plus 1/65. Fusion therefore credited a BM25 position deeper than the 3 hits that the size-3 BM25 response showed.
 
