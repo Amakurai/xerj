@@ -26,13 +26,23 @@
 //! The one structural difference from both: XERJ maintains the store
 //! incrementally per document instead of rebuilding it per segment merge, so
 //! the codebook WIDENS whenever an ingested vector falls outside the fitted
-//! range, and widening re-encodes every stored code through a decode/encode
-//! round trip (each stored value moves by at most the new quantization
-//! step). That is the same order of accuracy work a merge-time requantization
-//! does, paid at ingest, and it is what makes clamping structurally
-//! impossible: the codebook always spans every live vector (#371's defect
-//! class cannot recur — a vector written outside the range extends the range
-//! rather than being clamped into it).
+//! range (and narrows when the document holding a per-dimension bound is
+//! replaced or removed), and every live code is re-encoded FROM ITS RETAINED
+//! ORIGINAL VECTOR on each such re-fit. Re-encoding from the original (not
+//! through a decode/encode round trip of the stored bytes — each round trip
+//! drifts by up to the quantization step, and they compound) is what keeps
+//! the codes bit-identical to a one-shot `Sq8Params::fit_borrowed` +
+//! `encode_into` over the live set, which is the arithmetic the exact
+//! scan's per-query codec performs; that bit-identity is pinned by
+//! `codes_are_bit_identical_to_a_one_shot_fit_over_the_live_set` below and
+//! by the engine's exact-scan honesty tests. The price is honesty about
+//! memory: beside the 1 byte/dim codes the store retains the 4 bytes/dim
+//! normalized f32 originals (`originals_bytes`), touched only at ingest and
+//! re-fit — never on the scoring path. Widening at ingest is the same order
+//! of accuracy work a merge-time requantization does, and it is what makes
+//! clamping structurally impossible: the codebook always spans every live
+//! vector (#371's defect class cannot recur — a vector written outside the
+//! range extends the range rather than being clamped into it).
 
 use std::collections::HashMap;
 
@@ -58,6 +68,15 @@ pub struct Sq8CodeStore {
     slot_of: HashMap<String, u32>,
     /// Flat code array, `codes[slot * dim .. slot * dim + dim]`.
     codes: Vec<u8>,
+    /// Flat ORIGINAL vector array, `originals[slot * dim .. slot * dim +
+    /// dim]` — the exact (normalized) f32 each slot was encoded from,
+    /// append-only like `codes`. A codebook re-fit re-encodes every live
+    /// slot from these, never through its own stored bytes: a decode/encode
+    /// round trip moves a value by up to the (new, wider) quantization step
+    /// and the drift compounds over successive widenings, which broke
+    /// bit-identity with the exact scan's per-query codec. Never read on
+    /// the scoring path.
+    originals: Vec<f32>,
     /// Soft delete marks, one per slot (the slab's discipline: append-only,
     /// tombstone on delete, never physically free).
     tomb: Vec<bool>,
@@ -81,6 +100,7 @@ impl Sq8CodeStore {
             ids: Vec::new(),
             slot_of: HashMap::new(),
             codes: Vec::new(),
+            originals: Vec::new(),
             tomb: Vec::new(),
             expected: 0,
             refits: 0,
@@ -137,6 +157,15 @@ impl Sq8CodeStore {
         self.codes.len()
     }
 
+    /// Bytes occupied by the retained original (normalized) f32 vectors —
+    /// 4 bytes/dim/slot beside the 1 byte/dim codes. They exist so a
+    /// codebook re-fit re-encodes from the true vectors instead of drifting
+    /// through decode/encode round trips (see the module docs); they are
+    /// never read on the scoring path.
+    pub fn originals_bytes(&self) -> usize {
+        self.originals.len() * std::mem::size_of::<f32>()
+    }
+
     /// The live codes of one document, `dim` bytes at `slot * dim`.
     pub fn codes_for(&self, doc_id: &str) -> Option<&[u8]> {
         let &slot = self.slot_of.get(doc_id)?;
@@ -159,9 +188,14 @@ impl Sq8CodeStore {
     /// exact paths: the same wrong-dimension document the brute-force scan
     /// skips must not be half-represented here.
     ///
-    /// A vector outside the fitted per-dimension range widens the codebook
-    /// and re-encodes every live code (see the module docs). Re-encoding
-    /// goes decode-old → encode-new, bounded by the new quantization step.
+    /// The invariant after every successful call: `codebook()` is the fit
+    /// over the live originals and every live code is
+    /// `codebook().encode(original)` — bit-identical to a one-shot
+    /// `Sq8Params::fit_borrowed` + `encode_into` over the live set. A
+    /// vector outside the fitted range widens the codebook; a replaced
+    /// vector that held a per-dimension bound may narrow it. Either way the
+    /// affected live codes are re-encoded FROM THEIR ORIGINALS (see the
+    /// module docs), never through a decode/encode round trip.
     pub fn upsert(&mut self, doc_id: &str, vector: &[f32]) -> bool {
         if vector.len() != self.dim {
             // Count the attempt for a NEW id only: an id that never had a
@@ -173,93 +207,139 @@ impl Sq8CodeStore {
             }
             return false;
         }
-        // Snapshot the codebook BEFORE widening: the re-encode decodes each
-        // live code under the range it was encoded with.
-        let old_codebook = self.codebook();
-        if self.extend_codebook_for(vector) {
-            self.refits += 1;
-            self.reencode_all(&old_codebook);
-        }
-        let codebook = self.codebook();
-        match self.slot_of.get(doc_id).copied() {
-            Some(slot) => {
-                let start = slot as usize * self.dim;
-                codebook.encode_into(vector, &mut self.codes[start..][..self.dim]);
-                self.tomb[slot as usize] = false;
-                true
+        let live = self.slot_of.get(doc_id).copied();
+        let had_live = !self.slot_of.is_empty();
+        // Does this write move a per-dimension bound? Widening: the new
+        // vector sits outside the fitted range. Narrowing: a REPLACED live
+        // vector sat exactly on a bound, so removing it may shrink the fit
+        // (a tie with another live vector keeps the bound; the re-fit that
+        // follows decides, and lands back on the same codebook when nothing
+        // moved).
+        let mut refit = false;
+        if had_live {
+            for (d, &x) in vector.iter().enumerate() {
+                if x < self.mins[d] || x > self.maxs[d] {
+                    refit = true;
+                    break;
+                }
             }
+            if !refit {
+                if let Some(slot) = live {
+                    let start = slot as usize * self.dim;
+                    for d in 0..self.dim {
+                        let o = self.originals[start + d];
+                        if o == self.mins[d] || o == self.maxs[d] {
+                            refit = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let slot = match live {
+            Some(slot) => slot,
             None => {
                 let slot = self.ids.len() as u32;
-                let mut code = vec![0u8; self.dim];
-                codebook.encode_into(vector, &mut code);
                 self.ids.push(doc_id.to_string());
-                self.codes.extend_from_slice(&code);
+                self.codes.extend(vec![0u8; self.dim]);
+                self.originals.extend(vec![0.0f32; self.dim]);
                 self.tomb.push(false);
                 self.slot_of.insert(doc_id.to_string(), slot);
                 self.expected += 1;
-                true
+                slot
             }
+        };
+        let start = slot as usize * self.dim;
+        self.originals[start..][..self.dim].copy_from_slice(vector);
+        self.tomb[slot as usize] = false;
+        if !had_live {
+            // The first live vector adopts the degenerate per-dimension
+            // range [v, v]: every code is 0 and decodes back to v exactly,
+            // so the first document carries no quantization error.
+            self.mins = vector.to_vec();
+            self.maxs = vector.to_vec();
         }
+        if refit {
+            self.refits += 1;
+            self.refit_from_originals();
+        } else {
+            // Even without a re-fit the slot's own codes must reflect its
+            // current vector under the CURRENT codebook (an update inside
+            // the range changes nothing else).
+            let codebook = self.codebook();
+            codebook.encode_into(vector, &mut self.codes[start..][..self.dim]);
+        }
+        true
     }
 
     /// Drop a document's live slot (delete, or the document no longer
     /// carries the field). Returns whether a slot was live. The slot is
-    /// tombstoned, not freed — same append-only discipline as the HNSW slab.
+    /// tombstoned, not freed — same append-only discipline as the HNSW
+    /// slab. When the removed vector held a per-dimension bound the
+    /// codebook narrows to the remaining live set and every live code is
+    /// re-encoded from its original, keeping the fit equal to what a
+    /// per-query codec fitted over the (now smaller) live set would
+    /// compute.
     pub fn remove(&mut self, doc_id: &str) -> bool {
         match self.slot_of.remove(doc_id) {
             Some(slot) => {
                 self.tomb[slot as usize] = true;
                 self.expected = self.expected.saturating_sub(1);
+                let start = slot as usize * self.dim;
+                let mut held_bound = false;
+                for d in 0..self.dim {
+                    let o = self.originals[start + d];
+                    if o == self.mins[d] || o == self.maxs[d] {
+                        held_bound = true;
+                        break;
+                    }
+                }
+                if held_bound {
+                    self.refits += 1;
+                    self.refit_from_originals();
+                }
                 true
             }
             None => false,
         }
     }
 
-    /// Widen `mins`/`maxs` to include `vector` where it falls outside.
-    /// Returns whether anything moved. An empty store adopts `vector`'s
-    /// per-dimension values as its initial (degenerate, zero-scale) range —
-    /// `min == max` encodes every value to code 0 and decodes it back to
-    /// `min` exactly, so the first document carries no quantization error.
-    fn extend_codebook_for(&mut self, vector: &[f32]) -> bool {
-        let mut extended = false;
-        if self.ids.is_empty() {
-            self.mins.copy_from_slice(vector);
-            self.maxs.copy_from_slice(vector);
-            return false;
-        }
-        for (d, &x) in vector.iter().enumerate() {
-            if x < self.mins[d] {
-                self.mins[d] = x;
-                extended = true;
-            }
-            if x > self.maxs[d] {
-                self.maxs[d] = x;
-                extended = true;
-            }
-        }
-        extended
-    }
-
-    /// Re-encode every live slot under the current (just widened) codebook,
-    /// decoding under `old`. Each stored value moves by at most the new
-    /// quantization step (see the module docs).
-    fn reencode_all(&mut self, old: &Sq8Params) {
+    /// Recompute `mins`/`maxs` over the live originals and re-encode every
+    /// live code from its original. After this, codes and codebook are
+    /// bit-identical to `Sq8Params::fit_borrowed` over the live vectors
+    /// followed by one `encode_into` per vector — the exact bytes the
+    /// serving paths' per-query fallback produces, which is the bit-identity
+    /// the exact-scan honesty tests pin.
+    fn refit_from_originals(&mut self) {
+        let dim = self.dim;
         if self.slot_of.is_empty() {
+            self.mins = vec![0.0; dim];
+            self.maxs = vec![0.0; dim];
             return;
         }
-        let new = self.codebook();
-        let dim = self.dim;
-        let mut decoded = vec![0.0f32; dim];
-        let mut code = vec![0u8; dim];
-        // Live slots only: tombstoned codes are unreachable through
-        // `slot_of` and re-encoding them would be wasted work.
-        let slots: Vec<u32> = self.slot_of.values().copied().collect();
-        for slot in slots {
+        let mut mins = vec![f32::MAX; dim];
+        let mut maxs = vec![f32::MIN; dim];
+        for &slot in self.slot_of.values() {
             let start = slot as usize * dim;
-            old.decode_into(&self.codes[start..][..dim], &mut decoded);
-            new.encode_into(&decoded, &mut code);
-            self.codes[start..][..dim].copy_from_slice(&code);
+            for d in 0..dim {
+                let x = self.originals[start + d];
+                if x < mins[d] {
+                    mins[d] = x;
+                }
+                if x > maxs[d] {
+                    maxs[d] = x;
+                }
+            }
+        }
+        self.mins = mins;
+        self.maxs = maxs;
+        let codebook = self.codebook();
+        for &slot in self.slot_of.values() {
+            let start = slot as usize * dim;
+            codebook.encode_into(
+                &self.originals[start..][..dim],
+                &mut self.codes[start..][..dim],
+            );
         }
     }
 }
@@ -280,7 +360,7 @@ mod tests {
     fn first_vector_encodes_exactly() {
         // Degenerate range [v, v] per dim → code 0 → decode back to v.
         let v = vec![0.25, -0.5, 1.75];
-        let s = store_with(&[v.clone()]);
+        let s = store_with(std::slice::from_ref(&v));
         let codebook = s.codebook();
         let codes = s.codes_for("0").unwrap();
         assert_eq!(codes, vec![0, 0, 0]);
@@ -391,8 +471,10 @@ mod tests {
     #[test]
     fn codebook_is_order_independent() {
         // The final range spans the same values regardless of ingest order,
-        // so a restart rebuild produces the same codebook (codes may differ
-        // in the last bit through decode/encode re-encode, the ranges do not).
+        // so a restart rebuild produces the same codebook — and, since every
+        // re-fit re-encodes from the retained originals rather than through
+        // decode/encode round trips, the same CODES bit for bit (ids are
+        // positional here, so the comparison is per VECTOR).
         let a: Vec<Vec<f32>> = vec![vec![0.0, 1.0], vec![-2.0, 0.5], vec![3.0, -1.0]];
         let mut b = a.clone();
         b.reverse();
@@ -400,5 +482,83 @@ mod tests {
         let sb = store_with(&b);
         assert_eq!(sa.codebook().mins, sb.codebook().mins);
         assert_eq!(sa.codebook().scales, sb.codebook().scales);
+        for v in &a {
+            let pos_a = a.iter().position(|x| x == v).unwrap();
+            let pos_b = b.iter().position(|x| x == v).unwrap();
+            assert_eq!(
+                sa.codes_for(&pos_a.to_string()),
+                sb.codes_for(&pos_b.to_string()),
+                "codes for {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codes_are_bit_identical_to_a_one_shot_fit_over_the_live_set() {
+        // #392's serving claim, pinned at the codec level: after ANY
+        // sequence of upserts (fresh writes, in-range and out-of-range
+        // updates) and removes, the store's codebook and every live code
+        // are bit-identical to fitting `Sq8Params` over the live vectors
+        // once and encoding each under that fit — the exact bytes the
+        // per-query fallback codec computes. The decode/encode round-trip
+        // re-encode this test guards against drifted by up to the
+        // quantization step per widening, which broke bit-identity between
+        // the codes serving path and the exact scan.
+        let mut s = Sq8CodeStore::new(4);
+        let mut live: Vec<(String, Vec<f32>)> = Vec::new();
+        let upsert =
+            |s: &mut Sq8CodeStore, live: &mut Vec<(String, Vec<f32>)>, id: &str, v: Vec<f32>| {
+                s.upsert(id, &v);
+                if let Some(slot) = live.iter_mut().find(|(i, _)| i == id) {
+                    slot.1 = v;
+                } else {
+                    live.push((id.to_string(), v));
+                }
+            };
+        let v = |a: f32, b: f32, c: f32, d: f32| vec![a, b, c, d];
+        // Fresh writes (several widen the range), then an out-of-range
+        // update, an in-range update, a delete of a bound holder, and a
+        // delete of a non-bound doc.
+        upsert(&mut s, &mut live, "a", v(0.0, 0.5, -0.5, 0.1));
+        upsert(&mut s, &mut live, "b", v(1.0, -1.0, 0.5, -0.9));
+        upsert(&mut s, &mut live, "c", v(-0.7, 0.2, 0.9, 0.3));
+        upsert(&mut s, &mut live, "d", v(0.4, 0.4, 0.4, 0.4));
+        upsert(&mut s, &mut live, "b", v(-3.0, 0.0, 2.0, 0.0)); // out-of-range update
+        upsert(&mut s, &mut live, "c", v(0.1, 0.1, 0.1, 0.1)); // in-range update
+        assert!(s.remove("a")); // held dim-1 max / dim-2 min before its update
+        assert!(s.remove("d")); // interior doc: no bound moves
+        let live_now: Vec<&[f32]> = live
+            .iter()
+            .filter(|(id, _)| id != "a" && id != "d")
+            .map(|(_, v)| v.as_slice())
+            .collect();
+        let fit = Sq8Params::fit_borrowed(live_now.iter().copied(), 4);
+        let book = s.codebook();
+        assert_eq!(
+            book.mins, fit.mins,
+            "codebook mins must equal the one-shot fit"
+        );
+        assert_eq!(
+            book.scales, fit.scales,
+            "codebook scales must equal the one-shot fit"
+        );
+        for (id, _) in live.iter() {
+            if id == "a" || id == "d" {
+                continue;
+            }
+            assert_eq!(
+                s.codes_for(id).map(<[u8]>::to_vec),
+                Some(
+                    fit.encode(
+                        &live
+                            .iter()
+                            .find(|(i, _)| i == id)
+                            .map(|(_, v)| v.clone())
+                            .unwrap()
+                    )
+                ),
+                "codes for {id} must be bit-identical to encode-under-fit"
+            );
+        }
     }
 }

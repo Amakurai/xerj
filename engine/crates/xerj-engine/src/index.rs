@@ -13468,6 +13468,10 @@ impl Index {
                     "serving": handle.serving_fresh(),
                     "refits": store.refits(),
                     "codes_bytes": store.codes_bytes(),
+                    // The retained originals exist so codebook re-fits
+                    // re-encode from the true vectors (see `sq8_codes`);
+                    // reported so the memory story stays honest.
+                    "originals_bytes": store.originals_bytes(),
                 }),
             );
         }
@@ -14263,6 +14267,19 @@ impl Index {
         if !handle.serving_fresh() {
             return None;
         }
+        // The codes quantize vectors normalized per the MAPPING's similarity
+        // (`handle.normalize`). The exact scan normalizes per the QUERY's
+        // similarity (`!matches!(similarity, "l2_norm" | "dot_product" |
+        // "max_inner_product")`); a query that overrides `similarity` to the
+        // other family quantizes differently-SCALED vectors there (raw
+        // magnitudes vs unit), so the codes cannot reproduce its arithmetic
+        // — hand it to the exact path, whose per-query codec follows the
+        // query's own rule.
+        let query_normalizes =
+            !matches!(similarity, "l2_norm" | "dot_product" | "max_inner_product");
+        if query_normalizes != handle.normalize {
+            return None;
+        }
         // Same publication discipline as `run_knn_hnsw`: never serve codes
         // from a window that overlapped a vector publication.
         let publication_generation = self.hnsw_publication_generation.load(Ordering::Acquire);
@@ -14406,8 +14423,9 @@ impl Index {
         // byte-identical to before. A `scalar8` field may take the codes
         // fast path instead (#392). Determined up front so the fast path
         // can skip the candidate collection altogether; a FILTERED
-        // `scalar8` query still runs this scan, scoring from the same
-        // ingest-time codes inside the `use_sq8` branch below.
+        // `scalar8` query always runs this scan on the per-query codec in
+        // the `use_sq8` branch below (bit-identical to the reference
+        // oracle, which fits over the post-filter set).
         let use_sq8 = {
             let schema = self.schema.read().await;
             lookup_vector_quantization(&schema.schema, field).as_deref() == Some("scalar8")
@@ -14417,8 +14435,9 @@ impl Index {
         // Scores every live slot straight out of the code store — no
         // `_source` candidates collected, no per-query quantization — and
         // hydrates only the top k. Any gate miss (store not converged,
-        // coverage broken, publication racing) falls through to the exact
-        // scan below; filtered queries score from the same codes inside
+        // coverage broken, publication racing, a similarity family whose
+        // normalization differs from the mapping's) falls through to the
+        // exact scan below; filtered queries take the per-query codec in
         // the use_sq8 branch further down.
         if use_sq8 && filter.is_none() {
             if let Some(result) = self
@@ -14661,140 +14680,67 @@ impl Index {
                 cand.push((position, doc_vec));
             }
 
-            // ── #392: score from the INGEST-TIME codes when they cover the
-            // candidate set ──────────────────────────────────────────────
+            // ── Per-query fit over the post-filter candidates ───────────
             //
-            // When the field's code store is serving-fresh and every
-            // post-filter candidate holds a live slot, each candidate is
-            // scored by decoding the SAME bytes under the SAME codebook the
-            // unfiltered path (`run_knn_sq8_codes_scan`) scores with. That
-            // is the point of #392: a document's `_score` becomes a
-            // function of the index state alone and stops depending on
-            // which other documents a filter removed. Any miss — store not
-            // converged, coverage broken, a candidate without codes, a dim
-            // mismatch — falls back to the per-query fit below, which is
-            // still correct (it is the pre-#392 behaviour) but
-            // filter-dependent.
-            let mut stored_codes: Option<(Sq8Params, Vec<Vec<u8>>)> = None;
-            if let Some(handle) = self.sq8_store_for(field) {
-                if handle.serving_fresh() {
-                    let store = handle.store.read();
-                    if store.dim() == dim && store.coverage_ok() {
-                        let codebook = store.codebook();
-                        let mut all = Vec::with_capacity(cand.len());
-                        let mut complete = true;
-                        for (at, _) in cand.iter() {
-                            let (id, _) = candidates[*at].id_and_source(&mem_docs, &segment_views);
-                            match store.codes_for(id) {
-                                Some(c) => all.push(c.to_vec()),
-                                None => {
-                                    complete = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if complete {
-                            stored_codes = Some((codebook, all));
-                        }
-                    }
-                }
-            }
+            // Fit this field's SQ8 codebook over the candidate vectors this
+            // query is about to score, and drop it when the query ends. No
+            // codec state survives a query (#371).
+            //
+            // The codebook used to be fitted from the first ≤1000 vectors
+            // the field was ever scanned with and then kept for the life of
+            // the process, which is the same write-once defect as the
+            // per-document code map one level up: a vector written
+            // afterwards outside the fitted per-dimension range is CLAMPED
+            // into it, and when that range is narrow the clamped decode is
+            // indistinguishable from the vector the document used to hold —
+            // a corpus whose dimension 0 never left +1.0 fitted `[1,1]`
+            // there, so overwriting a document with its exact negation
+            // decoded straight back to +1.0 and it stayed top at cosine
+            // 1.000000. Fitting over exactly the set being encoded makes
+            // clamping structurally impossible here: every value passed to
+            // `encode_into` is inside `[min,max]` by construction.
+            //
+            // A FILTERED `scalar8` query deliberately stays on this codec
+            // rather than the ingest-time codes (#392's unfiltered fast
+            // path): the reference this scan is pinned against —
+            // `exact_scan_hydration_tests`' clone-everything oracle, #979 —
+            // fits over the POST-FILTER candidate set, and a filtered
+            // subset's per-dimension bounds are generally NARROWER than the
+            // whole-corpus fit the store holds (measured on that fixture:
+            // three of five filters move at least four of eight bounds), so
+            // corpus-fitted codes cannot reproduce its scores. Quantizing
+            // exactly the set being scored is also the pre-#392 behaviour,
+            // which keeps the filtered path bit-identical to the oracle.
+            // The consequence, documented in #392: a filtered score can
+            // move by up to SQ8's quantization step relative to the
+            // unfiltered codes path when the filter changes the fitted
+            // range — the exactness of the scan is the stronger contract.
+            let params = Sq8Params::fit_borrowed(cand.iter().map(|(_, v)| v.as_slice()), dim);
+            debug!(
+                field,
+                dim,
+                candidates = cand.len(),
+                normalize,
+                "SQ8 codec fitted for this query (filtered or non-serving codes store)"
+            );
 
-            match stored_codes {
-                Some((codebook, codes)) => {
-                    debug!(
-                        field,
-                        dim,
-                        candidates = codes.len(),
-                        "SQ8 filtered kNN scored from ingest-time codes (#392)"
-                    );
-                    // `dim` bytes per candidate were copied out under a
-                    // short read guard, so this loop holds no lock across
-                    // its deadline checkpoints.
-                    let mut decoded = vec![0.0f32; dim];
-                    for (position, ((candidate, _), codes)) in
-                        cand.into_iter().zip(codes).enumerate()
-                    {
-                        if position & 127 == 0
-                            && self.exact_scan_checkpoint(position, deadline).await
-                        {
-                            timed_out = true;
-                            break;
-                        }
-                        codebook.decode_into(&codes, &mut decoded);
-                        let score = compute_vector_similarity(similarity, query_vec, &decoded);
-                        scored.push((candidate, score, None));
-                    }
+            // Score by quantizing each candidate's CURRENT vector and
+            // decoding it straight back — 1 byte/dim, so `scalar8`
+            // keeps its recall profile, and the score describes the
+            // vector the document holds right now. Both buffers are
+            // reused across the scan. `v.len() == dim` was
+            // established when `cand` was built.
+            let mut codes = vec![0u8; dim];
+            let mut decoded = vec![0.0f32; dim];
+            for (position, (candidate, v)) in cand.into_iter().enumerate() {
+                if position & 127 == 0 && self.exact_scan_checkpoint(position, deadline).await {
+                    timed_out = true;
+                    break;
                 }
-                None => {
-                    // ── Legacy per-query fit (pre-#392 fallback) ────────
-                    //
-                    // Fit this field's SQ8 codebook over the candidate vectors
-                    // this query is about to score, and drop it when the query
-                    // ends. No codec state survives a query (#371).
-                    //
-                    // The codebook used to be fitted from the first ≤1000
-                    // vectors the field was ever scanned with and then kept
-                    // for the life of the process, which is the same
-                    // write-once defect as the per-document code map one
-                    // level up: a vector written afterwards outside the
-                    // fitted per-dimension range is CLAMPED into it, and when
-                    // that range is narrow the clamped decode is
-                    // indistinguishable from the vector the document used to
-                    // hold — a corpus whose dimension 0 never left +1.0
-                    // fitted `[1,1]` there, so overwriting a document with
-                    // its exact negation decoded straight back to +1.0 and it
-                    // stayed top at cosine 1.000000.
-                    // Fitting over exactly the set being encoded makes
-                    // clamping structurally impossible here: every value
-                    // passed to `encode_into` is inside `[min,max]` by
-                    // construction.
-                    //
-                    // REMAINING CONSEQUENCE (#392): the fitted codebook
-                    // depends on the candidate set — the trigger is the
-                    // candidate set, not the `filter` keyword — so each score
-                    // moves by up to SQ8's quantization step when unrelated
-                    // documents are added or filtered away, and near-tied
-                    // documents can swap. Measured at the HTTP boundary on a
-                    // 60-document 4-dim cosine field: adding a `filter` that
-                    // removed only unrelated documents returned the same 30
-                    // survivors with max |Δ_score| 1.976e-05 but a different
-                    // order at 19 of 30 positions. Lucene fits per segment at
-                    // INDEX time, so its scores are a function of index state
-                    // alone. This branch is now reached only when the
-                    // ingest-time store cannot serve; #392's codes path is
-                    // what closes the gap.
-                    let params =
-                        Sq8Params::fit_borrowed(cand.iter().map(|(_, v)| v.as_slice()), dim);
-                    debug!(
-                        field,
-                        dim,
-                        candidates = cand.len(),
-                        normalize,
-                        "SQ8 codec fitted for this query (ingest-time codes unavailable)"
-                    );
-
-                    // Score by quantizing each candidate's CURRENT vector and
-                    // decoding it straight back — 1 byte/dim, so `scalar8`
-                    // keeps its recall profile, and the score describes the
-                    // vector the document holds right now. Both buffers are
-                    // reused across the scan. `v.len() == dim` was
-                    // established when `cand` was built.
-                    let mut codes = vec![0u8; dim];
-                    let mut decoded = vec![0.0f32; dim];
-                    for (position, (candidate, v)) in cand.into_iter().enumerate() {
-                        if position & 127 == 0
-                            && self.exact_scan_checkpoint(position, deadline).await
-                        {
-                            timed_out = true;
-                            break;
-                        }
-                        params.encode_into(&v, &mut codes);
-                        params.decode_into(&codes, &mut decoded);
-                        let score = compute_vector_similarity(similarity, query_vec, &decoded);
-                        scored.push((candidate, score, None));
-                    }
-                }
+                params.encode_into(&v, &mut codes);
+                params.decode_into(&codes, &mut decoded);
+                let score = compute_vector_similarity(similarity, query_vec, &decoded);
+                scored.push((candidate, score, None));
             }
         } else {
             // Per-chunk (passage) companion: multi-chunk `semantic_text` docs

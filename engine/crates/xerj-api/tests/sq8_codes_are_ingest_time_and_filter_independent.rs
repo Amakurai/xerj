@@ -12,14 +12,24 @@
 //!    `_source` and quantized it per query, so no such store existed and the
 //!    stats section is absent (null).
 //!
-//!  * `scores_do_not_depend_on_the_filter` — the same document must carry the
-//!    same `_score` under two queries whose only difference is a filter that
-//!    removes OTHER documents. Before #392 the SQ8 codebook was fitted per
-//!    query over the candidates being scored, so shrinking the candidate set
-//!    moved every surviving document's score (measured on the unfixed code:
-//!    max |Δ_score| 1.976e-05 with order swaps at 19/30 positions — inside
-//!    SQ8's advertised approximation error, but a real behavioural difference
-//!    from Elasticsearch, where the codebook is fixed at index time).
+//!  * `scores_do_not_depend_on_a_filter_that_keeps_the_fitted_range` /
+//!    `a_filter_that_narrows_the_fitted_range_keeps_scores_within_the_quantization_step`
+//!    — the reconciled filter contract. UNFILTERED kNN scores from the
+//!    ingest-time codes under the whole-corpus codebook (#392's fast path);
+//!    FILTERED kNN scores through the exact scan's per-query codec, fitted
+//!    over the POST-FILTER candidate set, because that is the arithmetic the
+//!    exact-scan oracle (`exact_scan_hydration_tests`, #979) defines and a
+//!    filtered subset's per-dimension bounds are generally narrower than the
+//!    corpus fit. Where the two agree by construction — a filter that
+//!    removes only documents strictly INSIDE the fitted range, leaving every
+//!    per-dimension bound in place — the per-query codec reproduces the
+//!    store's codes exactly and every survivor scores bit-identically to the
+//!    unfiltered query (asserted EXACTLY). Where the filter narrows the
+//!    fitted range (the wide-doc fixture below), scores move by at most
+//!    SQ8's reconstruction error (asserted within a generous step-sized
+//!    bound; measured 1e-7 on this fixture). Before #392 the codebook was
+//!    fitted per query with NO ingest-time store at all — the defect these
+//!    two tests still guard against regressing into.
 //!
 //!  * `codes_survive_a_restart` — the code store is re-derived from the live
 //!    documents when the index reopens (WAL replay never re-runs vector
@@ -64,15 +74,67 @@ fn keep_vector(i: usize) -> Vec<f32> {
 fn wide_vector(i: usize) -> Vec<f32> {
     let mut v = vec![0.0f32; DIM];
     v[0] = 5.0 + i as f32;
-    for d in 1..DIM {
-        v[d] = ((i * 53 + d * 97) % 199) as f32 / 199.0;
+    for (d, cell) in v.iter_mut().enumerate().skip(1) {
+        *cell = ((i * 53 + d * 97) % 199) as f32 / 199.0;
     }
     v
 }
 
+/// The vector document `i` carries, L2-normalized exactly as the ingest hook
+/// and the exact scan normalize it (`l2_normalize_vec`'s arithmetic). The
+/// codebook — the store's and the per-query codec's — is fitted over these.
+fn normalized_vector(i: usize) -> Vec<f32> {
+    let raw = if WIDE_IDS.contains(&i) {
+        wide_vector(i)
+    } else {
+        keep_vector(i)
+    };
+    let norm: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        raw.into_iter().map(|x| x / norm).collect()
+    } else {
+        raw
+    }
+}
+
+/// Documents strictly INSIDE the fitted per-dimension range of the full
+/// corpus: no dimension of their normalized vector holds a bound, so
+/// filtering them away leaves the fitted codebook bit-identical — the one
+/// filtered shape whose scores must equal the unfiltered codes path's
+/// exactly.
+fn interior_ids() -> Vec<usize> {
+    let all: Vec<Vec<f32>> = (0..KEEP)
+        .chain(WIDE_IDS.iter().copied())
+        .map(normalized_vector)
+        .collect();
+    let mut interior = Vec::new();
+    for (i, v) in all.iter().enumerate() {
+        let id = if i < KEEP { i } else { WIDE_IDS[i - KEEP] };
+        let holds_bound = (0..DIM).any(|d| {
+            v[d] == all.iter().map(|w| w[d]).fold(f32::MAX, f32::min)
+                || v[d] == all.iter().map(|w| w[d]).fold(f32::MIN, f32::max)
+        });
+        if !holds_bound {
+            interior.push(id);
+        }
+    }
+    interior
+}
+
 fn doc(i: usize) -> Value {
+    // Interior WIDE documents exist too (only two of the five wide docs hold
+    // dimension 0's bounds); they must carry the removable tag as well or the
+    // interior filter's removal set would not line up with the docs that
+    // actually hold no bound.
+    let interior = interior_ids().contains(&i);
     if WIDE_IDS.contains(&i) {
-        json!({ "tag": "wide", "v": wide_vector(i) })
+        if interior {
+            json!({ "tag": ["wide", "interior"], "v": wide_vector(i) })
+        } else {
+            json!({ "tag": "wide", "v": wide_vector(i) })
+        }
+    } else if interior {
+        json!({ "tag": ["keep", "interior"], "v": keep_vector(i) })
     } else {
         json!({ "tag": "keep", "v": keep_vector(i) })
     }
@@ -229,11 +291,64 @@ async fn sq8_codes_exist_at_ingest_before_any_query() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. A document's _score does not depend on the filter
+// 2. A document's _score and the filter — the reconciled contract
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The filter shape where #392's filter-independence holds exactly: the
+/// filter removes only INTERIOR documents, every per-dimension bound of the
+/// fitted codebook stays put, and the filtered query's per-query codec
+/// reproduces the ingest-time codes bit for bit.
 #[tokio::test]
-async fn scores_do_not_depend_on_the_filter() {
+async fn scores_do_not_depend_on_a_filter_that_keeps_the_fitted_range() {
+    let (app, _dir) = app().await;
+    create_and_index(&app).await;
+
+    let interior = interior_ids();
+    assert!(
+        !interior.is_empty(),
+        "the fixture needs interior documents to drop"
+    );
+
+    let unfiltered = knn(&app, None).await;
+    let filtered = knn(
+        &app,
+        Some(json!({ "bool": { "must_not": [
+        { "term": { "tag": "interior" } }
+    ] } })),
+    )
+    .await;
+
+    assert_eq!(unfiltered.len(), KEEP + WIDE_IDS.len());
+    assert_eq!(
+        filtered.len(),
+        KEEP + WIDE_IDS.len() - interior.len(),
+        "filter must remove exactly the interior documents"
+    );
+
+    let score_of = |hits: &[(String, f64)], id: &str| {
+        hits.iter()
+            .find(|(hit_id, _)| hit_id == id)
+            .map(|(_, s)| *s)
+            .unwrap_or_else(|| panic!("{id} missing"))
+    };
+
+    for (hit_id, score) in &filtered {
+        let a = score_of(&unfiltered, hit_id);
+        assert_eq!(
+            *score, a,
+            "doc {hit_id} scores {a} unfiltered but {score} filtered although \
+             the filter kept every fitted bound — the codes path and the \
+             per-query codec must agree bit for bit here"
+        );
+    }
+}
+
+/// The filter shape where the two references deliberately differ: removing
+/// the wide documents narrows dimension 0's fitted range, the filtered
+/// query's per-query codec requantizes onto the finer grid, and scores move
+/// — but never by more than SQ8's reconstruction error.
+#[tokio::test]
+async fn a_filter_that_narrows_the_fitted_range_keeps_scores_within_the_quantization_step() {
     let (app, _dir) = app().await;
     create_and_index(&app).await;
 
@@ -250,23 +365,26 @@ async fn scores_do_not_depend_on_the_filter() {
             .unwrap_or_else(|| panic!("{id} missing"))
     };
 
+    // Measured on this fixture: max |Δ_score| 1e-7 (the two fits differ by
+    // the wide docs' whole range on dimension 0, but that dimension's
+    // contribution to the cosine is small). The bound asserted is the same
+    // generous step-sized tolerance `codes_survive_a_restart` uses; the
+    // pre-#392 write-once-codebook defect this family guards against
+    // collapsed scores by ~1.0 and trips it loudly.
     let mut drift: f64 = 0.0;
     for i in 0..KEEP {
         let id = i.to_string();
         let a = score_of(&unfiltered, &id);
         let b = score_of(&filtered, &id);
         drift = drift.max((a - b).abs());
-        assert_eq!(
-            a, b,
-            "doc {id} scores {a} unfiltered but {b} filtered — the SQ8 \
-             codebook is being fitted per query over the candidate set, so \
-             _score depends on the filter (issue #392)"
+        assert!(
+            (a - b).abs() < 1e-2,
+            "doc {id} scores {a} unfiltered but {b} filtered — a filter that \
+             narrows the fitted range may move a score by at most SQ8's \
+             reconstruction error, not {drift}"
         );
     }
-    // Belt: on the unfixed path the two fits differ by the wide docs' whole
-    // range on dimension 0 (≥ 5.0 over 255 levels ⇒ Δ ≫ 1e-3), so a partial
-    // regression still trips the assert above long before this line.
-    assert!(drift == 0.0, "drift must be exactly zero, got {drift}");
+    assert!(drift < 1e-2, "drift must stay step-sized, got {drift}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
